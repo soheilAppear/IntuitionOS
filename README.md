@@ -17,6 +17,95 @@ The first seeds came from day to day research work. Rapid VR and AR prototyping 
 
 Traditional shells are literal. Chat assistants are helpful but detached from your local machine. IntuitionOS tries to land in the middle. It feels like a shell that thinks with you, not for you.
 
+## Intuition, evolution, and how this maps to IntuitionOS
+
+Humans evolved to act under uncertainty with limited time and incomplete data. Intuition is the brain’s fast way to choose useful actions without parsing every detail. It is shaped by three forces: survival pressure for speed, experience that tunes shortcuts, and bodies that constrain how we sense and move. The result is a system that is often right, occasionally wrong, but almost always quick enough to keep you alive and moving.
+
+### How psychologists frame it
+
+- Fast vs slow systems  
+  A fast, automatic system handles most choices, a slower deliberative system checks or corrects when needed. IntuitionOS optimizes for the fast loop, with safe guardrails for the slow loop.
+
+- Heuristics as useful shortcuts  
+  Simple rules often beat heavy calculation when time or data is limited. Fuzzy commands are deliberate shortcuts that trade exact syntax for speed.
+
+- Predictive processing  
+  Brains constantly predict the next sensory input, then update when reality disagrees. The anticipator precomputes likely results while you type, then reveals them only when you press Enter.
+
+- Memory as a working partner  
+  We use episodic memory for context and prospective memory for reminders about the future. IntuitionOS builds both in: quick notes, recall, and natural language scheduling.
+
+- Embodiment and affordances  
+  We reach for handles that suggest grasping. IntuitionOS keeps a small set of obvious actions that stay the same everywhere: read, write, run, list, recall, schedule, hardware call.
+
+### Map from human faculties to product features
+
+| Human faculty | Evolutionary role | IntuitionOS feature |
+| --- | --- | --- |
+| Fast automatic system | Act quickly under uncertainty | Fuzzy commands that forgive typos and guess intent |
+| Slow reflective system | Check, inhibit, correct | Safe Mode and sandbox boundaries, explicit confirmations |
+| Predictive processing | Prepare actions before sensations arrive | Anticipator that prewarms ls, tree, and file reads in the background |
+| Heuristics and priors | Cheap but useful shortcuts | Default command fix for the first token only, model backed fallbacks |
+| Episodic and prospective memory | Context now, reminders later | `/save`, `/recall`, natural language tasks with `/tasks` |
+| Motor planning with constraints | Do only what is safe for the body | Sandboxed `/exec` inside the project directory, hardware simulation first |
+| Risk management | Avoid catastrophic errors | Opt in for unsafe actions, clear toggles, visible plans before execution |
+
+### Design rules derived from the science
+
+- Favor momentum over exactness  
+  The shell should not punish near misses. If you typed `/hlp`, you likely meant `/help`.
+
+- Predict quietly, reveal on confirmation  
+  Precompute, but show nothing until Enter. This preserves control while removing wait time.
+
+- Keep actions few and legible  
+  Fewer verbs reduce choice paralysis and increase trust.
+
+- Constrain the blast radius  
+  Intuition without boundaries can be reckless. The sandbox and Safe Mode keep mistakes small.
+
+- Memory is part of the loop  
+  Capture now, retrieve later, schedule follow ups. This mirrors human prospective memory.
+
+- Intent wins, yet transparency matters  
+  Always show what will run, where it will run, and how to stop it.
+
+### What this means in practice
+
+- Typo tolerance is not decoration, it is a cognitive speedup  
+  Correcting only the first token preserves the meaning of arguments like `/safe off` while still fixing `/hlp`.
+
+- Background work must be reversible  
+  Anticipator results are disposable until you commit with Enter. No state changes, no surprises.
+
+- Safety is a first class control, not a buried setting  
+  You can toggle Safe Mode in one step, and the default is conservative.
+
+- Local by default is not just privacy, it is latency  
+  Local models make the fast loop actually fast and predictable.
+
+### Limits and tradeoffs
+
+- Intuition is fallible by design  
+  Heuristics can misfire. Fuzzy mapping and predictions are bounded by the sandbox and by clear prompts when confidence is low.
+
+- Speed vs completeness  
+  The system favors quick feedback loops. Deep multi step plans still work, but they are explicit and opt in.
+
+- Predictive prewarming uses resources  
+  The anticipator is tuned to cheap operations. Heavy work should only happen when requested.
+
+### How to extend the metaphor
+
+- Better priors  
+  Per project memory can learn your common commands and files, then bias suggestions.
+
+- Active correction  
+  Lightweight checks can propose safer variants when a command looks risky, for example suggesting `/exec "python -m venv .venv"` before running code if no environment exists.
+
+- Skill learning  
+  Allow the model to propose new small actions based on repeated patterns, then accept them explicitly.
+
 ## Why this exists
 
 ### Intent beats syntax
