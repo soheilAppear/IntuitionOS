@@ -1,0 +1,11 @@
+# Core deps
+pyyaml>=6.0.1
+rich>=13.7.1
+python-dotenv>=1.0.1
+requests>=2.31.0
+jsonschema>=4.23.0
+python-dateutil>=2.9.0.post0
+dateparser>=1.2.0
+prompt_toolkit>=3.0.52
+# Optional GPU info
+nvidia-ml-py>=12.0.0

@@ -1,0 +1,23 @@
+# Global config with safe defaults
+backend: ollama                  # can be: ollama or fallback
+model: gpt-oss:20b              # default local model name
+temperature: 0.2
+max_tokens: 600
+timezone: America/New_York
+memory_db_path: data/intuition.db
+log_path: data/log.txt
+planner_schema_path: config/planner_schema.json
+system_prompt_path: config/system_prompt.txt
+
+anticipation:
+  enabled: true
+  debounce_ms: 180
+  match_threshold: 0.6
+
+hardware:
+  drivers:
+    - name: led_strip
+      simulate: true
+      port: null
+    - name: gpu_nvml
+      enabled: true

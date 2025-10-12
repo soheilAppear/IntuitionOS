@@ -1,0 +1,14 @@
+{
+  "plan": [
+    "Keep steps short"
+  ],
+  "tools": [
+    "read_file",
+    "write_file",
+    "list_dir",
+    "list_tree",
+    "hw_call",
+    "run_local",
+    "create_task"
+  ]
+}
