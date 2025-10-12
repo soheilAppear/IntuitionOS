@@ -115,7 +115,7 @@ It is a focused layer that makes the things you already do feel faster and more 
 ```powershell
 cd IntuitionOS_v1.0
 python -m venv .venv
-.\.venv\Scriptsctivate
+.\.venv\Scripts\activate
 pip install -r requirements.txt
 $env:OLLAMA_HOST = "http://127.0.0.1:11434"
 python .\intuitionos.py
