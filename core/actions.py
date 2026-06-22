@@ -101,12 +101,8 @@ def read_file(path:str):
         return {"error": str(e)}
 
 def write_file(path:str, text:str):
-    # Write text to a file, guard by Safe Mode
+    # Write text to a file — always allowed through this explicit built-in
     try:
-        if _is_safe():
-            # Writes are permitted through this explicit action
-            pass
-        # Ensure directory exists
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
@@ -179,9 +175,9 @@ def run_local(cmd:str, cwd:str="."):
     if cmd.lower().startswith("python "):
         cmd = cmd.replace("python", py, 1)
 
+    if _is_safe():
+        return {"error": "Safe Mode is ON — use /safe off first"}
     try:
-        if _is_safe():
-            pass  # exec allowed via explicit /exec
         result = subprocess.run(cmd, cwd=target, shell=True, capture_output=True, text=True, timeout=60)
         return {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
     except Exception as e:

@@ -1,6 +1,6 @@
 # Terminal UI with fuzzy commands, anticipator, and safe built-ins
 
-import os, yaml, json, difflib, time, threading
+import os, re, yaml, json, difflib, time, threading
 from rich import print as rprint
 from rich.panel import Panel
 from prompt_toolkit import PromptSession
@@ -112,7 +112,7 @@ def bootstrap():
             from core.actions import register_driver
             register_driver(GPUNVML(enabled=True))
 
-    return cfg, brain, mem
+    return cfg, brain, mem, sched
 
 def make_anticipator(brain, cfg):
     # Predictor decides what to warm
@@ -160,7 +160,7 @@ def make_anticipator(brain, cfg):
 
 def main():
     # Bootstrap everything
-    cfg, brain, mem = bootstrap()
+    cfg, brain, mem, sched = bootstrap()
     # Print banner
     rprint(Panel.fit('IntuitionOS v1.0 - sandboxed exec + anticipator + fuzzy commands - type /help', title='IntuitionOS'))
 
@@ -168,6 +168,9 @@ def main():
     session=PromptSession('> ')
     # Make anticipator
     ant=make_anticipator(brain, cfg)
+    # _ant_ref lets /reload swap the anticipator without losing the buffer hook
+    _ant_ref = [ant]
+    session.default_buffer.on_text_changed += lambda buf: _ant_ref[0].update_buffer(buf.text)
 
     # Main REPL loop
     while True:
@@ -197,6 +200,18 @@ def main():
             show_help(); continue
         if user=='/config':
             rprint(cfg); continue
+        if user=='/reload':
+            try:
+                sched.stop()
+                cfg, brain, mem, sched = bootstrap()
+                _ant_ref[0].stop()
+                ant = make_anticipator(brain, cfg)
+                _ant_ref[0] = ant
+                session.default_buffer.on_text_changed += lambda buf: _ant_ref[0].update_buffer(buf.text)
+                rprint({'result': 'reloaded'})
+            except Exception as e:
+                rprint(f'reload error: {e}')
+            continue
         if user=='/actions':
             rprint(sorted(actions.names)); continue
         if user=='/memory':
@@ -293,6 +308,12 @@ def main():
             rprint(actions.call('list_dir', path='.')); continue
         if user=='tree':
             rprint(actions.call('list_tree', path='.')); continue
+
+        # Natural language remind: "remind me <title> in/at <when>"
+        _m = re.match(r'^remind\s+me\s+(.+?)\s+((?:in|at)\s+\S.*)$', user, re.IGNORECASE)
+        if _m:
+            rprint(actions.call('create_task', text=_m.group(1).strip(), when=_m.group(2).strip()))
+            continue
 
         # Try anticipator cache first
         pre = None

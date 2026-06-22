@@ -63,3 +63,6 @@ class Scheduler:
                 # Ignore scheduler exceptions
                 pass
             time.sleep(self.tick_seconds)
+
+    def stop(self):
+        self._stop = True
