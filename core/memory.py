@@ -9,7 +9,7 @@ class Memory:
         # Ensure folder exists
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         # Create connection
-        self.conn = sqlite3.connect(db_path)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         # Create schema
         self._init()
 

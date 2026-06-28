@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src ws://127.0.0.1:7432">
+  <title>IntuitionOS</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="hud" id="hud">
+
+    <!-- ── Status bar (draggable) ── -->
+    <div class="status-bar" id="status-bar">
+      <div class="status-left">
+        <span class="safe-dot" id="safe-dot"></span>
+        <span class="status-label" id="safe-label">SAFE</span>
+      </div>
+      <div class="status-center">
+        <span class="app-name">IntuitionOS</span>
+      </div>
+      <div class="status-right">
+        <span class="tasks-badge" id="tasks-badge">0</span>
+        <button class="icon-btn" id="tasks-btn" title="Tasks (T)">≡</button>
+        <button class="icon-btn" id="memory-btn" title="Memory (M)">◎</button>
+        <button class="icon-btn close-btn" id="close-btn" title="Hide (Alt+Space)">×</button>
+      </div>
+    </div>
+
+    <!-- ── Expandable panel ── -->
+    <div class="expand-panel" id="expand-panel">
+
+      <!-- Plan hint strip -->
+      <div class="plan-strip" id="plan-strip"></div>
+
+      <!-- Main reply / output -->
+      <div class="output-area" id="output-area">
+        <div class="output-text" id="output-text"></div>
+      </div>
+
+      <!-- Memory panel -->
+      <div class="side-panel" id="memory-panel">
+        <div class="panel-header">Memory</div>
+        <div class="panel-list" id="memory-list"></div>
+      </div>
+
+      <!-- Tasks panel -->
+      <div class="side-panel" id="tasks-panel">
+        <div class="panel-header">Tasks</div>
+        <div class="panel-list" id="tasks-list"></div>
+      </div>
+
+    </div>
+
+    <!-- ── Input bar ── -->
+    <div class="input-bar">
+      <span class="prompt-char" id="prompt-char">›</span>
+      <div class="input-wrap">
+        <input type="text" id="cmd-input"
+               placeholder="Ask or command…"
+               autocomplete="off"
+               spellcheck="false">
+        <span class="ghost-hint" id="ghost-hint"></span>
+      </div>
+      <div class="thinking-indicator" id="thinking-indicator">
+        <span></span><span></span><span></span>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Reminder toast container -->
+  <div id="toast-root"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

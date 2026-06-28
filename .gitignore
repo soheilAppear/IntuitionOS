@@ -1,0 +1,22 @@
+# Electron dependencies — install with: cd ui && npm install
+ui/node_modules/
+
+# Python virtual environment
+.venv/
+
+# Runtime data
+data/
+*.db
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables
+.env
+
+# OS files
+.DS_Store
+Thumbs.db

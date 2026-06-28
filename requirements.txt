@@ -1,4 +1,7 @@
 # Core deps
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+websockets>=12.0
 pyyaml>=6.0.1
 rich>=13.7.1
 python-dotenv>=1.0.1

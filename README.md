@@ -1,255 +1,285 @@
-# IntuitionOS v1.0
+# IntuitionOS
 
-Local, model-aware shell that listens, anticipates, and helps while keeping your work local and safe.
+> A local, model-aware shell that listens, anticipates, and helps — without leaving your machine.
 
-## The story
+IntuitionOS sits between traditional shells (exact, literal) and cloud AI assistants (helpful, but remote). It behaves like a careful lab partner: it tolerates typos, precomputes likely results while you type, remembers your notes, schedules reminders in natural language, and keeps execution safely sandboxed — all running on your own hardware via Ollama.
 
-Computers got fast. Interfaces did not. We still type exact commands, watch the cursor blink, and repeat little rituals to make simple things happen. That is fine when you have time and full attention. It is painful when you are building, testing, and juggling ideas at the speed you think.
+---
 
-IntuitionOS started from that pain. The goal was simple: build a local, model-aware shell that behaves like a careful lab partner. It listens, anticipates, and helps. It does not nag. It does not steal control. It bends toward your intent even when your input is imperfect.
+## Two interfaces
 
-The first seeds came from day to day research work. Rapid VR and AR prototyping needs a loop like this:
+### HUD overlay (Electron)
 
-- Capture an idea or a todo the moment it appears
-- Run a quick script, log the result, and schedule a follow up if needed
-- Tweak hardware in a safe sandbox without switching tools
-- Try commands that are half typed or slightly wrong and still get the right action
+A frameless, always-on-top ambient overlay that lives at the top of your screen. Press `Alt+Space` anywhere to summon or dismiss it. It expands when you interact and collapses to a minimal bar otherwise — an OS layer, not another app window.
 
-Traditional shells are literal. Chat assistants are helpful but detached from your local machine. IntuitionOS tries to land in the middle. It feels like a shell that thinks with you, not for you.
+- Dark glassmorphic panel — no window chrome, no taskbar entry
+- Live memory and task panels (click ◎ and ≡ in the header)
+- Cyan glow on `›` when the anticipator is running in the background
+- Ghost hint shows the precomputed result before you press Enter
+- Reminder toasts flash the HUD border when a scheduled task fires
 
-## Intuition, evolution, and how this maps to IntuitionOS
+### Terminal (classic)
 
-Humans evolved to act under uncertainty with limited time and incomplete data. Intuition is the brain’s fast way to choose useful actions without parsing every detail. It is shaped by three forces: survival pressure for speed, experience that tunes shortcuts, and bodies that constrain how we sense and move. The result is a system that is often right, occasionally wrong, but almost always quick enough to keep you alive and moving.
+A REPL with fuzzy command correction, Rich-formatted output, and the same brain and memory as the HUD.
 
-### How psychologists frame it
-
-- Fast vs slow systems  
-  A fast, automatic system handles most choices, a slower deliberative system checks or corrects when needed. IntuitionOS optimizes for the fast loop, with safe guardrails for the slow loop.
-
-- Heuristics as useful shortcuts  
-  Simple rules often beat heavy calculation when time or data is limited. Fuzzy commands are deliberate shortcuts that trade exact syntax for speed.
-
-- Predictive processing  
-  Brains constantly predict the next sensory input, then update when reality disagrees. The anticipator precomputes likely results while you type, then reveals them only when you press Enter.
-
-- Memory as a working partner  
-  We use episodic memory for context and prospective memory for reminders about the future. IntuitionOS builds both in: quick notes, recall, and natural language scheduling.
-
-- Embodiment and affordances  
-  We reach for handles that suggest grasping. IntuitionOS keeps a small set of obvious actions that stay the same everywhere: read, write, run, list, recall, schedule, hardware call.
-
-### Map from human faculties to product features
-
-| Human faculty | Evolutionary role | IntuitionOS feature |
-| --- | --- | --- |
-| Fast automatic system | Act quickly under uncertainty | Fuzzy commands that forgive typos and guess intent |
-| Slow reflective system | Check, inhibit, correct | Safe Mode and sandbox boundaries, explicit confirmations |
-| Predictive processing | Prepare actions before sensations arrive | Anticipator that prewarms ls, tree, and file reads in the background |
-| Heuristics and priors | Cheap but useful shortcuts | Default command fix for the first token only, model backed fallbacks |
-| Episodic and prospective memory | Context now, reminders later | `/save`, `/recall`, natural language tasks with `/tasks` |
-| Motor planning with constraints | Do only what is safe for the body | Sandboxed `/exec` inside the project directory, hardware simulation first |
-| Risk management | Avoid catastrophic errors | Opt in for unsafe actions, clear toggles, visible plans before execution |
-
-### Design rules derived from the science
-
-- Favor momentum over exactness  
-  The shell should not punish near misses. If you typed `/hlp`, you likely meant `/help`.
-
-- Predict quietly, reveal on confirmation  
-  Precompute, but show nothing until Enter. This preserves control while removing wait time.
-
-- Keep actions few and legible  
-  Fewer verbs reduce choice paralysis and increase trust.
-
-- Constrain the blast radius  
-  Intuition without boundaries can be reckless. The sandbox and Safe Mode keep mistakes small.
-
-- Memory is part of the loop  
-  Capture now, retrieve later, schedule follow ups. This mirrors human prospective memory.
-
-- Intent wins, yet transparency matters  
-  Always show what will run, where it will run, and how to stop it.
-
-### What this means in practice
-
-- Typo tolerance is not decoration, it is a cognitive speedup  
-  Correcting only the first token preserves the meaning of arguments like `/safe off` while still fixing `/hlp`.
-
-- Background work must be reversible  
-  Anticipator results are disposable until you commit with Enter. No state changes, no surprises.
-
-- Safety is a first class control, not a buried setting  
-  You can toggle Safe Mode in one step, and the default is conservative.
-
-- Local by default is not just privacy, it is latency  
-  Local models make the fast loop actually fast and predictable.
-
-### Limits and tradeoffs
-
-- Intuition is fallible by design  
-  Heuristics can misfire. Fuzzy mapping and predictions are bounded by the sandbox and by clear prompts when confidence is low.
-
-- Speed vs completeness  
-  The system favors quick feedback loops. Deep multi step plans still work, but they are explicit and opt in.
-
-- Predictive prewarming uses resources  
-  The anticipator is tuned to cheap operations. Heavy work should only happen when requested.
-
-### How to extend the metaphor
-
-- Better priors  
-  Per project memory can learn your common commands and files, then bias suggestions.
-
-- Active correction  
-  Lightweight checks can propose safer variants when a command looks risky, for example suggesting `/exec "python -m venv .venv"` before running code if no environment exists.
-
-- Skill learning  
-  Allow the model to propose new small actions based on repeated patterns, then accept them explicitly.
-
-## Why this exists
-
-### Intent beats syntax
-You should not lose flow because you typed `/hlp` instead of `/help`. The system should meet you where you are.
-
-### Anticipation reduces wait time
-While you type, the system can warm up likely results like directory listings or a file preview. You press Enter and it responds instantly. No flashing output until you confirm.
-
-### Local by default
-Models run on your box through Ollama. Your files stay local. You decide what can execute and where.
-
-### Memory that matters
-Notes and recalls are built in. Save a thought now, find it later. Schedule reminders with natural time.
-
-### Safe edges
-Execution is sandboxed to the project folder. Safe Mode is on by default. You can turn it off with a clear command, then turn it back on just as easily.
-
-## What makes IntuitionOS different from a traditional OS
-
-- A traditional OS gives you primitives and expects precision. IntuitionOS wraps the same primitives with a model guided layer that tolerates typos, guesses intent, and precomputes likely next steps.
-- A traditional OS has a strong separation between shell, scheduler, and device tools. IntuitionOS keeps them in one conversational surface so you can say things like “remind me test build in 15m” and it just schedules it.
-- A traditional OS executes exactly what you type. IntuitionOS tries to help you avoid foot guns by keeping execution inside the current working directory and by keeping Safe Mode on until you say otherwise.
-
-## What makes IntuitionOS different from chat assistants
-
-- Chat assistants are great at explanations. They are weak at operating your machine. IntuitionOS is designed to operate locally. It writes files, runs scripts, lists directories, and calls safe hardware adapters.
-- Chat assistants often require cloud access. IntuitionOS uses a local model via Ollama by default.
-- Chat assistants optimize conversations. IntuitionOS optimizes short feedback loops. It is a tool for doing, not only discussing.
-
-## Design principles
-
-- **Local first** - Use local models and local files. Network use is optional and explicit.
-- **Transparent safety** - Show what is about to execute. Keep execution inside the project. Make Safe Mode a first class toggle.
-- **Small, predictable actions** - Expose a tiny set of clear actions: read, write, run, list, recall, schedule, hardware call.
-- **Anticipate quietly** - Prewarm likely responses in the background. Reveal nothing until the user presses Enter.
-- **Forgive typos** - Fuzzy match only the first token so that `/safe off` stays intact while `/hlp` still maps to `/help`.
-
-## A quick scene
-
-You open the terminal and type `tre`. IntuitionOS corrects to `tree`, warms the directory tree in the background, and shows it the instant you hit Enter. You say “remind me export figures in 40m”. It sets a reminder. You say “write file test.py with a small plot and run it”. It writes, then executes inside the sandbox. You say “set led color to ff8800”. The simulated driver reports state without touching any real hardware unless you opt in.
-
-It feels like a shell that understands the rhythm of your work.
-
-## Core capabilities at a glance
-
-- Fuzzy commands that preserve arguments
-- Background anticipator for `ls`, `tree`, and file previews
-- Memory and recall with a tiny SQLite store
-- Natural language reminders with a polling scheduler
-- Sandboxed execution inside the project directory
-- Safe Mode on by default and easy to toggle
-- Local LLM via Ollama with a configurable model name
-- Minimal hardware adapters to grow into real devices later
-
-## Who is this for
-
-- Builders who live in scripts and want a smoother loop
-- Researchers who prototype quickly and need frictionless notes and reminders
-- Tinkerers who want model help without giving up local control
-- Anyone who likes the shell but wishes it felt a bit more like a thoughtful teammate
-
-## What this is not
-
-- A full desktop replacement
-- A general chat portal
-- A license to execute arbitrary commands across your system
-
-It is a focused layer that makes the things you already do feel faster and more humane.
-
-## Roadmap ideas
-
-- Per project memory with tagging and export
-- Smarter task recurrence and time zone handling
-- Optional remote device adapters guarded by explicit allowlists
-- A small UI viewer for plans and logs next to the terminal
-
-## Credits
-
-- Built for local use with Ollama
-- Thanks to everyone who pushed on fuzzy parsing, safe exec, and background prewarming ideas
-
-## Highlights
-
-- Fuzzy slash commands. `/hlp` becomes `/help`. Only the first token is corrected.
-- Anticipator. Prewarms likely results while you type. Shows nothing until you press Enter.
-- Safe Mode. On by default. Toggle with `/safe on` or `/safe off`.
-- Sandboxed exec. `/exec "python script.py"` runs inside this directory only.
-- Local LLM via Ollama. Default model is `gpt-oss:20b`.
-- Memory and recall. `/save "note"`, `/recall "term"`.
-- Tasks. `remind me drink water in 10m`, `/tasks`, `/done <id>`.
-- Files. `/write <path> "text"`, `/read <path>`, `ls`, `tree`.
-- Hardware demo. `plugins/led_strip.py` and GPU info plugin. All safe and simulated by default.
+---
 
 ## Quick start
 
+### HUD overlay
+
 ```powershell
-cd IntuitionOS_v1.0
+# 1. Clone and set up Python environment
+git clone https://github.com/soheilAppear/IntuitionOS
+cd IntuitionOS
 python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
-$env:OLLAMA_HOST = "http://127.0.0.1:11434"
-python .\intuitionos.py
+
+# 2. Install Electron (one time)
+cd ui
+npm install
+cd ..
+
+# 3. Start Ollama (optional — file and task features work without it)
+ollama serve
+ollama pull llama3        # or whichever model you set in config/config.yaml
+
+# 4. Launch
+python start_ui.py
 ```
 
-If `ollama serve` is already running on 127.0.0.1:11434 you are good.
+Use `Alt+Space` to toggle the HUD. `Ctrl+Q` to quit.
 
-## Safe Mode
+### Terminal
 
-Safe Mode blocks `/exec` and any write action that touches the file system unless you use the explicit built ins. Use:
+```powershell
+python intuitionos.py
+```
+
+---
+
+## What you can do
+
+### File system (instant, no Ollama needed)
+
+```
+ls
+tree
+/read config/config.yaml
+/read requirements.txt
+```
+
+### Memory
+
+```
+/save "working on HUD overlay feature"
+/save "Ollama model: llama3"
+/recall Ollama
+/recall HUD
+```
+
+Click **◎** in the HUD header to browse the full memory panel.
+
+### Natural language scheduling
+
+```
+remind me check the build in 10m
+remind me push to GitHub in 1h
+/tasks
+/done 1
+/snooze 2 15m
+/delete 3
+```
+
+The HUD border flashes and a toast appears when a reminder fires.
+
+### Safe mode
 
 ```
 /safe off
-/exec "python -V"
+/exec "python your_script.py"
 /safe on
 ```
 
-You can also start with Safe Mode off:
+Safe Mode is **on by default**. The green dot in the HUD header turns red when it is off.
 
-```powershell
-$env:INTUITION_SAFE = "0"
-python .\intuitionos.py
+### AI (requires Ollama)
+
+```
+what does the anticipator do?
+explain the memory system
+write a python function that reads a csv file
+what are we building?
 ```
 
-## Commands
+After `/save`-ing notes, the LLM uses them as context.
 
-- `/help`
-- `/exit`
-- `/memory`
-- `/dream`
-- `/save "text"`
-- `/recall "term"`
-- `/config`
-- `/actions`
-- `/reload`
-- `/tasks`, `/done <id>`, `/delete <id>`, `/snooze <id> 15m`
-- `/hw`, `/hw schema <name>`
-- `/safe on|off`
-- `/exec "python your_script.py" [cwd]`
-- `/write <path> "text"`
-- `/read <path>`
-- `ls`
-- `tree`
+### Hardware
+
+```
+/hw
+/hw schema led_strip
+```
+
+Drivers are simulated by default. See `config/config.yaml` to configure real hardware.
+
+---
+
+## Anticipation
+
+Type `tree`, `ls`, or `read file <path>` **slowly**. Watch the `›` glow cyan — the anticipator has already computed the result in the background. Press Enter and see `⚡ cached` in the response. No waiting.
+
+---
+
+## Commands reference
+
+| Command | Description |
+|---------|-------------|
+| `ls` | List directory |
+| `tree` | Recursive directory view |
+| `/read <path>` | Read a file |
+| `/write <path> "text"` | Write a file |
+| `/save "text"` | Save a memory note |
+| `/recall "term"` | Search memory |
+| `/memory` | Show recent memory |
+| `/dream` | Run a reflection pass |
+| `/tasks` | List pending tasks |
+| `/done <id>` | Mark task complete |
+| `/delete <id>` | Delete a task |
+| `/snooze <id> 15m\|2h\|1d` | Snooze a task |
+| `/safe on\|off` | Toggle Safe Mode |
+| `/exec "python script.py"` | Run inside sandbox |
+| `/hw` | List hardware devices |
+| `/hw schema <name>` | Show device schema |
+| `/actions` | List all registered actions |
+| `/config` | Print current config |
+| `/reload` | Reload config without restart |
+| `/help` | Show help |
+| `/exit` | Quit terminal mode |
+| `remind me <title> in/at <when>` | Natural language scheduling |
+
+Fuzzy correction applies to all `/` commands — `/hlp` becomes `/help`, `/taks` becomes `/tasks`.
+
+---
+
+## Configuration
+
+Edit `config/config.yaml`:
+
+```yaml
+backend: ollama
+model: llama3              # any model pulled in Ollama
+temperature: 0.2
+max_tokens: 600
+timezone: America/New_York
+memory_db_path: data/intuition.db
+anticipation:
+  enabled: true
+  debounce_ms: 180
+  match_threshold: 0.6
+hardware:
+  drivers:
+    - name: led_strip
+      simulate: true
+    - name: gpu_nvml
+      enabled: true
+```
+
+Environment variables (`.env` or shell):
+
+```
+OLLAMA_HOST=http://127.0.0.1:11434
+INTUITION_SAFE=1
+```
+
+---
+
+## Architecture
+
+```
+start_ui.py
+  ├── uvicorn → interface/server.py   (FastAPI + WebSocket)
+  │               ├── core/brain.py      (LLM coordination)
+  │               ├── core/memory.py     (SQLite store)
+  │               ├── core/scheduler.py  (reminder polling)
+  │               ├── core/anticipator.py (background prewarming)
+  │               └── core/actions.py    (file, exec, task, hw)
+  └── Electron → ui/
+                  ├── main.js            (frameless window, shortcuts)
+                  └── renderer/          (HUD interface)
+
+intuitionos.py → interface/terminal.py  (classic REPL, same core)
+```
+
+---
+
+## Design philosophy
+
+IntuitionOS is built around cognitive science concepts:
+
+| Human faculty | IntuitionOS feature |
+|--------------|---------------------|
+| Fast automatic system | Fuzzy commands that forgive typos |
+| Predictive processing | Anticipator precomputes results while you type |
+| Episodic memory | `/save`, `/recall`, SQLite memory store |
+| Prospective memory | Natural language reminders, scheduler |
+| Risk management | Safe Mode, sandboxed exec, visible plans |
+
+**Core rules:**
+- Favor momentum over exactness — correct typos in the first token, preserve arguments
+- Predict quietly, reveal on confirmation — prewarm but show nothing until Enter
+- Constrain the blast radius — exec is sandboxed, Safe Mode is on by default
+- Local by default — Ollama runs on your machine, your files stay local
+
+---
+
+## Tech stack
+
+- **Python** — core, backend, terminal REPL
+- **FastAPI + WebSocket** — bridge between HUD and brain
+- **Electron** — native HUD window (frameless, always-on-top, transparent)
+- **Ollama** — local LLM inference
+- **SQLite** — memory and task storage
+- **Rich** — terminal formatting
+- **prompt_toolkit** — terminal REPL input
+
+---
 
 ## Troubleshooting
 
-- If you see `venv python not found at ...`, create `.venv` as shown above or set: `$env:INTUITION_ALLOW_SYSTEM_PY = "1"` to permit system Python.
-- If a command times out talking to Ollama, ensure `ollama serve` is running and the model is pulled: `ollama pull gpt-oss:20b`.
+**HUD commands do nothing**
+The WebSocket might not be connected. Check that `python start_ui.py` is running and the terminal shows no errors. The HUD input placeholder reads "Reconnecting…" when disconnected.
+
+**LLM errors**
+Make sure Ollama is running (`ollama serve`) and the model is pulled (`ollama pull <model>`). File and task commands work without Ollama.
+
+**venv Python not found**
+```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+```
+Or allow system Python: `$env:INTUITION_ALLOW_SYSTEM_PY = "1"`
+
+**Safe Mode blocking exec**
+```
+/safe off
+/exec "python your_script.py"
+```
+
+---
+
+## Roadmap
+
+- Per-project memory with tagging and export
+- Streaming LLM replies token by token in the HUD
+- Voice input trigger via hotword
+- Real hardware adapter support (LED strips, serial devices)
+- Plugin system for custom actions
+
+---
+
+## Credits
+
+Built by Soheil Sepahyar. Runs locally on Ollama. No data leaves your machine.
