@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Test and evaluation tooling
+pytest==9.1.1

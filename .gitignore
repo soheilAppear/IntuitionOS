@@ -4,8 +4,9 @@ ui/node_modules/
 # Python virtual environment
 .venv/
 
-# Runtime data
-data/
+# Runtime data — the directory is tracked, its contents are not
+data/*
+!data/.gitkeep
 *.db
 *.log
 

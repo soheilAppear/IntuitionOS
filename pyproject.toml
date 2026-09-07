@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "intuitionos"
+version = "1.0.0"
+description = "An intuition layer over the shell: prediction, episodic memory, and a gated action substrate."
+requires-python = ">=3.10"
+readme = "README.md"
+license = { file = "LICENSE" }
+
+[tool.setuptools]
+packages = ["core", "interface", "plugins"]
+
+[tool.pytest.ini_options]
+# Resolve `core.*` / `interface.*` imports from the repo root without a PYTHONPATH hack.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
