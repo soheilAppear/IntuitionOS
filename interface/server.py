@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from core.actions import (
     actions,
+    get_journal,
     journal_recent,
     register_os_capabilities,
     set_logger,
@@ -26,6 +27,8 @@ from core.actions import (
 from core.anticipator import Anticipator
 from core.brain import Brain
 from core.capabilities import capabilities, is_safe_mode
+from core.context import ContextSensor
+from core.episodes import EpisodeLog, PredictionWindow
 from core.logger import make_logger
 from core.llm import LLMClient
 from core.memory import Memory
@@ -35,6 +38,9 @@ import core.os_sandbox as _os
 
 _state: dict = {}
 _clients: set = set()
+# One prediction window per connection: what the user is typing, and what we put
+# in front of them. Keyed by socket so two HUDs do not credit each other's hints.
+_windows: dict = {}
 _executor = ThreadPoolExecutor(max_workers=4)
 
 
@@ -190,7 +196,17 @@ async def lifespan(app: FastAPI):
         except Exception:
             voice = None
 
-    _state.update({"cfg": cfg, "brain": brain, "mem": mem, "sched": sched, "ant": ant, "voice": voice})
+    # ── Episode log ──────────────────────────────────────────────────────
+    # Every submitted input is recorded, whether or not the user asks — that is
+    # the involuntary encoding /save lacks. It is disclosed in the README and
+    # switchable here, because silently recording what somebody types is not
+    # something to do without an off switch.
+    ecfg = cfg.get("episodes", {}) or {}
+    episodes = EpisodeLog(mem, enabled=bool(ecfg.get("enabled", True)))
+    sensor = ContextSensor(journal=get_journal())
+
+    _state.update({"cfg": cfg, "brain": brain, "mem": mem, "sched": sched, "ant": ant,
+                   "voice": voice, "episodes": episodes, "sensor": sensor})
 
     # Pre-load Whisper model in background so first voice use is instant
     if voice:
@@ -585,7 +601,7 @@ _KNOWN_CMDS = [
     "/help", "/exit", "/memory", "/dream", "/save", "/recall", "/actions",
     "/config", "/reload", "/tasks", "/done", "/delete", "/snooze",
     "/hw", "/task_payload", "/safe", "/exec", "/write", "/read",
-    "/undo", "/journal", "/capabilities",
+    "/undo", "/journal", "/capabilities", "/forget", "/episodes",
 ]
 
 
@@ -719,6 +735,36 @@ async def _handle_command(ws: WebSocket, text: str):
         await ws.send_json({"type": "reply", "text": ", ".join(sorted(actions.names))})
         return
 
+    if text == "/forget":
+        episodes = _state.get("episodes")
+        if not episodes:
+            await ws.send_json({"type": "error", "text": "episode log unavailable"})
+            return
+        n = await loop.run_in_executor(_executor, episodes.forget)
+        await ws.send_json({"type": "reply", "text": f"Forgot {n} episode(s)."})
+        return
+
+    if text == "/episodes":
+        episodes = _state.get("episodes")
+        if not episodes:
+            await ws.send_json({"type": "error", "text": "episode log unavailable"})
+            return
+        rows = episodes.recent(limit=15)
+        if not rows:
+            await ws.send_json({"type": "reply", "text":
+                                "No episodes recorded yet." if episodes.enabled
+                                else "Episode logging is disabled in config.yaml."})
+            return
+        lines = []
+        for e in rows:
+            when = datetime.datetime.fromtimestamp(e.ts).strftime("%H:%M:%S")
+            hint = ""
+            if e.accepted_prediction is not None:
+                hint = "  hint taken" if e.accepted_prediction else f"  hint ignored ({e.predicted})"
+            lines.append(f"{when}  {e.action}{hint}")
+        await ws.send_json({"type": "reply", "text": "\n".join(lines)})
+        return
+
     if text == "/undo":
         res = await loop.run_in_executor(_executor, undo_last)
         if res.get("error"):
@@ -757,6 +803,38 @@ async def _handle_command(ws: WebSocket, text: str):
 
 
 async def _handle_input(ws: WebSocket, text: str):
+    """Encode one episode, then handle the input.
+
+    This is the involuntary part: the row is written because the user submitted
+    something, not because they asked for it to be remembered. The capability and
+    the outcome are filled in by the handler as they become known.
+    """
+    episodes = _state.get("episodes")
+    sensor = _state.get("sensor")
+    window = _windows.get(ws)
+
+    signals = window.take(text) if window else {}
+    ctx = sensor.snapshot() if sensor else None
+    note: dict = {}
+
+    episode_id = episodes.record(text, ctx, **signals) if episodes else None
+
+    try:
+        await _handle_input_inner(ws, text, note)
+    except Exception:
+        if episodes and episode_id:
+            episodes.set_outcome(episode_id, "error")
+        raise
+
+    if sensor:
+        sensor.note_submission(text, exit_code=note.get("exit_code"))
+    if episodes and episode_id:
+        if note.get("capability"):
+            episodes.set_capability(episode_id, note["capability"])
+        episodes.set_outcome(episode_id, note.get("outcome", "ok"))
+
+
+async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
     brain: Brain = _state["brain"]
     mem: Memory = _state["mem"]
     ant: Anticipator = _state["ant"]
@@ -767,11 +845,13 @@ async def _handle_input(ws: WebSocket, text: str):
         fixed = _fuzzy_cmd(tokens[0])
         if fixed != tokens[0]:
             text = " ".join([fixed] + tokens[1:]).strip()
+        note["capability"] = text.split()[0]
         await _handle_command(ws, text)
         return
 
     m = re.match(r"^remind\s+me\s+(.+?)\s+((?:in|at)\s+\S.*)$", text, re.IGNORECASE)
     if m:
+        note["capability"] = "create_task"
         res = actions.call("create_task", text=m.group(1).strip(), when=m.group(2).strip())
         if res.get("ok"):
             due_str = datetime.datetime.fromtimestamp(res["due_ts"]).strftime("%I:%M %p, %b %d")
@@ -782,6 +862,7 @@ async def _handle_input(ws: WebSocket, text: str):
         return
 
     if text == "ls":
+        note["capability"] = "list_dir"
         res = await loop.run_in_executor(_executor, lambda: actions.call("list_dir", path="."))
         if isinstance(res, list):
             lines = "\n".join(
@@ -793,6 +874,7 @@ async def _handle_input(ws: WebSocket, text: str):
         return
 
     if text == "tree":
+        note["capability"] = "list_tree"
         res = await loop.run_in_executor(_executor, lambda: actions.call("list_tree", path="."))
         def _fmt(items, indent=0):
             out = []
@@ -812,6 +894,7 @@ async def _handle_input(ws: WebSocket, text: str):
     os_intent = _try_os_intent(text)
     if os_intent:
         action_name, kwargs = os_intent
+        note["capability"] = action_name
         await ws.send_json({"type": "thinking"})
         # A regex match on speech is a guess, not an instruction. Anything the
         # manifest calls irreversible now comes back parked for confirmation
@@ -862,13 +945,19 @@ async def _maybe_send_anticipation(ws: WebSocket, text: str):
         try:
             await ws.send_json({"type": "anticipation", "data": pre, "text": text})
         except Exception:
-            pass
+            return
+        # Recorded only once the send succeeded: a hint that never reached the
+        # user must not be counted against them for ignoring it.
+        window = _windows.get(ws)
+        if window:
+            window.note_shown(text, pre.get("confidence"))
 
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     _clients.add(ws)
+    _windows[ws] = PredictionWindow()
 
     mem: Memory = _state["mem"]
     await ws.send_json({
@@ -884,8 +973,12 @@ async def ws_endpoint(ws: WebSocket):
             t = data.get("type")
 
             if t == "buffer":
-                _state["ant"].update_buffer(data.get("text", ""))
-                asyncio.create_task(_maybe_send_anticipation(ws, data.get("text", "")))
+                buf = data.get("text", "")
+                _state["ant"].update_buffer(buf)
+                window = _windows.get(ws)
+                if window:
+                    window.note_keystroke(buf)
+                asyncio.create_task(_maybe_send_anticipation(ws, buf))
 
             elif t == "input":
                 text = data.get("text", "").strip()
@@ -940,8 +1033,10 @@ async def ws_endpoint(ws: WebSocket):
 
     except WebSocketDisconnect:
         _clients.discard(ws)
+        _windows.pop(ws, None)
     except Exception:
         _clients.discard(ws)
+        _windows.pop(ws, None)
 
 
 @app.get("/health")

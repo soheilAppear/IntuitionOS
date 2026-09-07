@@ -11,9 +11,11 @@ from core.brain import Brain
 from core.logger import make_logger
 from core.actions import (
     actions, set_scheduler, set_memory, set_logger, set_safe_mode_action,
-    set_thresholds, undo_last, journal_recent,
+    set_thresholds, undo_last, journal_recent, get_journal,
 )
 from core.capabilities import capabilities
+from core.context import ContextSensor
+from core.episodes import EpisodeLog, PredictionWindow
 from core.scheduler import Scheduler
 from core.anticipator import Anticipator
 from plugins.led_strip import LEDStrip
@@ -56,6 +58,8 @@ def show_help():
         '/safe on|off - toggle Safe Mode',
         '/undo - reverse the last reversible action',
         '/journal [n] - show recent gated actions',
+        '/episodes - show what the episode log has recorded',
+        '/forget - erase the episode log',
         '/capabilities - list actions with their declared cost',
         '/exec "python your_script.py" [cwd] - run local venv python',
         '/write <path> "text" - write a file',
@@ -67,7 +71,7 @@ def show_help():
 
 def fuzzy_slash(base:str)->str:
     # Known slash commands for fuzzy matching
-    known=['/help','/exit','/memory','/dream','/save','/recall','/actions','/config','/reload','/tasks','/done','/delete','/snooze','/hw','/task_payload','/safe','/exec','/write','/read','/undo','/journal','/capabilities']
+    known=['/help','/exit','/memory','/dream','/save','/recall','/actions','/config','/reload','/tasks','/done','/delete','/snooze','/hw','/task_payload','/safe','/exec','/write','/read','/undo','/journal','/capabilities','/forget','/episodes']
     # Return exact match if present
     if base in known:
         return base
@@ -152,7 +156,14 @@ def bootstrap():
             from core.actions import register_driver
             register_driver(CPUInfo())
 
-    return cfg, brain, mem, sched
+    # Every submitted input is recorded whether or not the user asks. That is
+    # the involuntary encoding /save lacks; it is disclosed in the README and can
+    # be switched off in config.yaml.
+    ecfg = cfg.get('episodes', {}) or {}
+    episodes = EpisodeLog(mem, enabled=bool(ecfg.get('enabled', True)))
+    sensor = ContextSensor(journal=get_journal())
+
+    return cfg, brain, mem, sched, episodes, sensor
 
 def make_anticipator(brain, cfg):
     # Predictor decides what to warm
@@ -202,7 +213,8 @@ def make_anticipator(brain, cfg):
 
 def main():
     # Bootstrap everything
-    cfg, brain, mem, sched = bootstrap()
+    cfg, brain, mem, sched, episodes, sensor = bootstrap()
+    window = PredictionWindow()
     # Print banner
     rprint(Panel.fit('IntuitionOS v1.0 - sandboxed exec + anticipator + fuzzy commands - type /help', title='IntuitionOS'))
 
@@ -212,7 +224,11 @@ def main():
     ant=make_anticipator(brain, cfg)
     # _ant_ref lets /reload swap the anticipator without losing the buffer hook
     _ant_ref = [ant]
-    session.default_buffer.on_text_changed += lambda buf: _ant_ref[0].update_buffer(buf.text)
+    def _on_text(buf):
+        _ant_ref[0].update_buffer(buf.text)
+        window.note_keystroke(buf.text)
+
+    session.default_buffer.on_text_changed += _on_text
 
     # Main REPL loop
     while True:
@@ -224,6 +240,14 @@ def main():
 
         if not user:
             continue
+
+        # Involuntary encoding: one row per submitted input, before anything is
+        # dispatched, so it is recorded even if handling it raises. The REPL has
+        # no ghost-hint surface, so accepted_prediction stays NULL here — it is
+        # the HUD that can show a hint and therefore have one ignored.
+        _signals = window.take(user)
+        _episode_id = episodes.record(user, sensor.snapshot(), **_signals)
+        sensor.note_submission(user)
 
         # Fuzzy only the first token for slash commands
         if user.startswith('/'):
@@ -245,11 +269,10 @@ def main():
         if user=='/reload':
             try:
                 sched.stop()
-                cfg, brain, mem, sched = bootstrap()
+                cfg, brain, mem, sched, episodes, sensor = bootstrap()
                 _ant_ref[0].stop()
                 ant = make_anticipator(brain, cfg)
                 _ant_ref[0] = ant
-                session.default_buffer.on_text_changed += lambda buf: _ant_ref[0].update_buffer(buf.text)
                 rprint({'result': 'reloaded'})
             except Exception as e:
                 rprint(f'reload error: {e}')
@@ -303,6 +326,20 @@ def main():
                 rprint(actions.call('create_task', text=None, when=when, repeat='', payload=payload))
             except Exception as e:
                 rprint(f"usage: /task_payload '{{...json...}}' <when>. error: {e}")
+            continue
+        if user=='/forget':
+            rprint(f'Forgot {episodes.forget()} episode(s).'); continue
+        if user=='/episodes':
+            rows=episodes.recent(limit=15)
+            if not rows:
+                rprint('No episodes recorded yet.' if episodes.enabled
+                       else 'Episode logging is disabled in config.yaml.')
+            for e in rows:
+                when=time.strftime('%H:%M:%S', time.localtime(e.ts))
+                hint=''
+                if e.accepted_prediction is not None:
+                    hint='  hint taken' if e.accepted_prediction else f'  hint ignored ({e.predicted})'
+                rprint(f'{when}  {e.action}{hint}')
             continue
         if user=='/undo':
             rprint(undo_last()); continue

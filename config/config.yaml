@@ -21,6 +21,12 @@ brain:
   budget_ms: 20000      # wall clock per turn
   history_turns: 6      # conversational turns carried into the prompt
 
+# The episode log records every input you submit, locally, so the predictor has
+# something to learn from. Nothing leaves this machine. Turn it off here, erase
+# what is already there with /forget, and see it with /episodes.
+episodes:
+  enabled: true
+
 anticipation:
   enabled: true
   debounce_ms: 180

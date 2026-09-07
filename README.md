@@ -126,6 +126,39 @@ Drivers are simulated by default. See `config/config.yaml` to configure real har
 
 ---
 
+## What is recorded on your machine
+
+IntuitionOS keeps an **episode log**: one row for every input you submit, stored
+in `data/intuition.db` on your own disk. Each row holds what you typed, a snapshot
+of the situation it arrived in (working directory, git branch and dirtiness, hour
+of day, how long you paused before pressing Enter, the last few commands), and —
+when the HUD showed you a hint — whether you took it or ignored it.
+
+This is deliberate and it is the point. A system cannot learn that you run
+`pytest` after `git commit` unless something records *after what*. The rows the
+predictor learns most from are the ones where it was **wrong**: a hint shown and
+ignored is the negative signal that keeps its confidence honest.
+
+Two things are worth being explicit about:
+
+- **Nothing leaves this machine.** There is no telemetry, no upload, and no
+  hosted API in the path. The log is a table in a local SQLite file.
+- **It records without being asked.** Unlike `/save`, you do not opt in per entry.
+
+So it comes with an off switch and an eraser:
+
+| | |
+|---|---|
+| See what has been recorded | `/episodes` |
+| Erase all of it | `/forget` |
+| Stop recording entirely | set `episodes.enabled: false` in `config/config.yaml` |
+
+The action journal (`/journal`) is separate and smaller: it records only actions
+that changed something, so that `/undo` has something to reverse and so that
+"scoped exec" has an audit trail behind it.
+
+---
+
 ## Anticipation
 
 Type `tree`, `ls`, or `read file <path>` **slowly**. Watch the `›` glow cyan — the anticipator has already computed the result in the background. Press Enter and see `⚡ cached` in the response. No waiting.
