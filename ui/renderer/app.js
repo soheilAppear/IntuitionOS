@@ -26,6 +26,11 @@ const toastRoot    = document.getElementById('toast-root');
 const micBtn       = document.getElementById('mic-btn');
 const recordingBar = document.getElementById('recording-bar');
 const recLabel     = document.getElementById('rec-label');
+const confirmBar    = document.getElementById('confirm-bar');
+const confirmTitle  = document.getElementById('confirm-title');
+const confirmDetail = document.getElementById('confirm-detail');
+const confirmAllow  = document.getElementById('confirm-allow');
+const confirmDeny   = document.getElementById('confirm-deny');
 
 // ── State ──
 let ws = null;
@@ -35,6 +40,7 @@ let tasksOpen    = false;
 let expanded     = false;
 let lastCommand  = '';
 let isRecording  = false;
+let pendingConfirm = null;   // { token, capability, reversibility }
 
 // ── IPC ──
 ipcRenderer.on('focus-input', () => cmdInput.focus());
@@ -108,6 +114,7 @@ function handleMessage(msg) {
     case 'voice_recording':  onVoiceRecording(msg);      break;
     case 'voice_transcribing': onVoiceTranscribing();    break;
     case 'voice_text':       onVoiceText(msg.text);      break;
+    case 'confirm_request':  onConfirmRequest(msg);      break;
   }
 }
 
@@ -133,6 +140,7 @@ function onThinking() {
 
 function onReply(msg) {
   thinkingEl.classList.remove('active');
+  if (pendingConfirm) clearConfirm();
   hud.classList.remove('anticipating');
   ghostHint.textContent = '';
 
@@ -217,6 +225,50 @@ function onError(text) {
   setTimeout(syncHeight, 16);
 }
 
+// ── Confirmation ──
+//
+// The gate parked an action. Nothing has run and nothing will until this is
+// answered, so the bar stays up and Enter/Escape are borrowed for the answer
+// rather than submitting a new command on top of a pending one.
+
+function onConfirmRequest(msg) {
+  thinkingEl.classList.remove('active');
+  pendingConfirm = { token: msg.token, capability: msg.capability };
+
+  const irreversible = msg.reversibility === 'irreversible';
+  confirmBar.classList.toggle('irreversible', irreversible);
+  confirmTitle.textContent = (irreversible ? 'Cannot be undone: ' : 'Confirm: ') + msg.capability;
+
+  const args = msg.args || {};
+  const argText = Object.keys(args).length
+    ? Object.entries(args).map(([k, v]) => `${k}=${String(v)}`).join('  ')
+    : (msg.summary || msg.reason || '');
+  confirmDetail.textContent = argText;
+
+  confirmBar.classList.add('active');
+  openPanel();
+  cmdInput.focus();
+  setTimeout(syncHeight, 16);
+}
+
+function answerConfirm(granted) {
+  if (!pendingConfirm) return;
+  send({ type: 'confirm', token: pendingConfirm.token, granted });
+  clearConfirm();
+  if (granted) onThinking();
+}
+
+function clearConfirm() {
+  pendingConfirm = null;
+  confirmBar.classList.remove('active', 'irreversible');
+  confirmTitle.textContent = '';
+  confirmDetail.textContent = '';
+  setTimeout(syncHeight, 16);
+}
+
+confirmAllow.addEventListener('click', () => answerConfirm(true));
+confirmDeny.addEventListener('click',  () => answerConfirm(false));
+
 // ── Voice ──
 
 function startVoice() {
@@ -298,6 +350,12 @@ cmdInput.addEventListener('input', () => {
 });
 
 cmdInput.addEventListener('keydown', (e) => {
+  // A parked action owns Enter and Escape until it is answered.
+  if (pendingConfirm) {
+    if (e.key === 'Enter')  { e.preventDefault(); answerConfirm(true);  return; }
+    if (e.key === 'Escape') { e.preventDefault(); answerConfirm(false); return; }
+  }
+
   if (e.key === 'Enter') {
     const text = cmdInput.value.trim();
     if (!text) return;

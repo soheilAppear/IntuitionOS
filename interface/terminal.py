@@ -9,7 +9,11 @@ from core.llm import LLMClient
 from core.memory import Memory
 from core.brain import Brain
 from core.logger import make_logger
-from core.actions import actions, set_scheduler, set_memory, set_logger, set_safe_mode_action
+from core.actions import (
+    actions, set_scheduler, set_memory, set_logger, set_safe_mode_action,
+    set_thresholds, undo_last, journal_recent,
+)
+from core.capabilities import capabilities
 from core.scheduler import Scheduler
 from core.anticipator import Anticipator
 from plugins.led_strip import LEDStrip
@@ -50,6 +54,9 @@ def show_help():
         '/hw - list hardware devices',
         '/hw schema <name> - show a device schema',
         '/safe on|off - toggle Safe Mode',
+        '/undo - reverse the last reversible action',
+        '/journal [n] - show recent gated actions',
+        '/capabilities - list actions with their declared cost',
         '/exec "python your_script.py" [cwd] - run local venv python',
         '/write <path> "text" - write a file',
         '/read <path> - read a file',
@@ -60,13 +67,37 @@ def show_help():
 
 def fuzzy_slash(base:str)->str:
     # Known slash commands for fuzzy matching
-    known=['/help','/exit','/memory','/dream','/save','/recall','/actions','/config','/reload','/tasks','/done','/delete','/snooze','/hw','/task_payload','/safe','/exec','/write','/read']
+    known=['/help','/exit','/memory','/dream','/save','/recall','/actions','/config','/reload','/tasks','/done','/delete','/snooze','/hw','/task_payload','/safe','/exec','/write','/read','/undo','/journal','/capabilities']
     # Return exact match if present
     if base in known:
         return base
     # Use difflib to find nearest command
     m=difflib.get_close_matches(base, known, n=1, cutoff=0.55)
     return m[0] if m else base
+
+def run_action(name, **kwargs):
+    """Dispatch through the gate, asking at the prompt if the gate says to.
+
+    The REPL and the HUD answer a CONFIRM the same way — nothing has run when
+    the parked result comes back, and the token is what unparks it — they just
+    ask the question through different surfaces.
+    """
+    res = actions.call(name, **kwargs)
+    if not (isinstance(res, dict) and res.get("needs_confirmation")):
+        return res
+
+    detail = ' '.join(f'{k}={v}' for k, v in (res.get('args') or {}).items())
+    title = 'CANNOT BE UNDONE' if res.get('reversibility') == 'irreversible' else 'Confirm'
+    rprint(Panel.fit(
+        f"{res['capability']}  {detail}\n{res.get('reason','')}",
+        title=title, border_style='red' if res.get('reversibility') == 'irreversible' else 'yellow',
+    ))
+    try:
+        answer = input('proceed? [y/N] ').strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = 'n'
+    return actions.confirm(res['token'], granted=answer in ('y', 'yes'))
+
 
 def bootstrap():
     # Load config and collaborators
@@ -78,6 +109,8 @@ def bootstrap():
     logger=make_logger(cfg.get('log_path','data/log.txt'))
     set_logger(logger)
     set_memory(mem)
+
+    set_thresholds(cfg.get('thresholds'))
 
     llm=LLMClient(cfg.get('backend','ollama'), cfg.get('model','gpt-oss:20b'), cfg.get('temperature',0.2), cfg.get('max_tokens',600))
     brain=Brain(llm, mem, sys_prompt, schema, logger=logger)
@@ -104,7 +137,6 @@ def bootstrap():
     for d in drivers:
         if d.get('name')=='led_strip':
             from plugins.led_strip import LEDStrip
-            actions.register('led_strip', lambda: None)  # no op alias
             from core.actions import register_driver
             register_driver(LEDStrip(simulate=d.get('simulate',True), port=d.get('port')))
         if d.get('name')=='gpu_nvml' and d.get('enabled',True):
@@ -132,20 +164,23 @@ def make_anticipator(brain, cfg):
             return {'intent':'read_file','text':t,'confidence':0.85}
         return {'intent':'plan','text':t,'confidence':0.65}
 
-    # Prewarm runs the action quietly
+    # Prewarm runs the action quietly, as the anticipator rather than as the
+    # user — which is what confines it to free capabilities.
     def prewarm(intent:dict):
         t=intent.get('text','')
         kind=intent.get('intent')
+        conf=float(intent.get('confidence', 0.0))
+
+        def warm(name, args):
+            return str(actions.dispatch(name, args, actor='anticipator', confidence=conf))[:4000]
+
         if kind=='tree':
-            val=actions.call('list_tree', path='.')
-            return (t, {'reply': str(val)[:4000]})
+            return (t, {'reply': warm('list_tree', {'path': '.'})})
         if kind=='ls':
-            val=actions.call('list_dir', path='.')
-            return (t, {'reply': str(val)[:4000]})
+            return (t, {'reply': warm('list_dir', {'path': '.'})})
         if kind=='read_file':
             path=t[len('read file '):].strip()
-            val=actions.call('read_file', path=path)
-            return (t, {'reply': str(val)[:4000]})
+            return (t, {'reply': warm('read_file', {'path': path})})
         if kind=='plan':
             plan=brain.plan_dryrun(t)
             return (t, {'plan': plan.get('plan', [])})
@@ -243,7 +278,7 @@ def main():
             continue
         if user.startswith('/delete '):
             try:
-                tid=int(user.split(' ',1)[1]); rprint(actions.call('delete_task', task_id=tid))
+                tid=int(user.split(' ',1)[1]); rprint(run_action('delete_task', task_id=tid))
             except Exception: rprint('usage: /delete <id>')
             continue
         if user.startswith('/snooze '):
@@ -264,6 +299,25 @@ def main():
             except Exception as e:
                 rprint(f"usage: /task_payload '{{...json...}}' <when>. error: {e}")
             continue
+        if user=='/undo':
+            rprint(undo_last()); continue
+        if user.startswith('/journal'):
+            parts=user.split()
+            limit=int(parts[1]) if len(parts)>1 and parts[1].isdigit() else 15
+            rows=journal_recent(limit=limit).get('rows', [])
+            if not rows:
+                rprint('The journal is empty.')
+            for r in rows:
+                when=time.strftime('%H:%M:%S', time.localtime(r['ts']))
+                mark=' (undone)' if r['undone_at'] else (' [undoable]' if r['undo'] else '')
+                outcome=f"/{r['outcome']}" if r['outcome'] else ''
+                rprint(f"#{r['id']} {when} {r['actor']}/{r['capability']} {r['decision']}{outcome}{mark}")
+            continue
+        if user=='/capabilities':
+            for c in capabilities.manifest():
+                flag='confirm' if c['requires_confirmation'] else ''
+                rprint(f"{c['name']:<24} {c['reversibility']:<13} {flag:<8} {c['summary']}")
+            continue
         if user.startswith('/safe'):
             parts=user.split()
             if len(parts)>=2:
@@ -281,7 +335,7 @@ def main():
                         cmd=rest[1:idx]; tail=rest[idx+1:].strip(); cwd=tail or '.'
                 if not cmd:
                     parts=rest.split(' ',1); cmd=parts[0]; cwd=parts[1] if len(parts)==2 else '.'
-                rprint(actions.call('run_local', cmd=cmd, cwd=cwd))
+                rprint(run_action('run_local', cmd=cmd, cwd=cwd))
             except Exception as e:
                 rprint(f'usage: /exec "python your_script.py" [cwd]. error: {e}')
             continue

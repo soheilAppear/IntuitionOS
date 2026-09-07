@@ -444,3 +444,63 @@ html, body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: rgba(124,58,237,0.28); border-radius: 2px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(124,58,237,0.5); }
+
+/* ── Confirmation bar ──────────────────────────────────────────────────────
+   An action the gate parked. It is deliberately loud: this is the moment the
+   user is being asked to accept a cost the system will not accept on its own,
+   and the irreversible case is styled differently from the merely unconfirmed
+   one so the two never look interchangeable. */
+.confirm-bar {
+  display: none;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-top: 1px solid rgba(255, 176, 32, 0.28);
+  background: rgba(255, 176, 32, 0.07);
+}
+.confirm-bar.active { display: flex; }
+.confirm-bar.irreversible {
+  border-top-color: rgba(255, 82, 82, 0.35);
+  background: rgba(255, 82, 82, 0.09);
+}
+
+.confirm-icon { font-size: 14px; color: #ffb020; flex: 0 0 auto; }
+.confirm-bar.irreversible .confirm-icon { color: #ff6b6b; }
+
+.confirm-text { flex: 1 1 auto; min-width: 0; }
+.confirm-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #ffd07a;
+  letter-spacing: 0.2px;
+}
+.confirm-bar.irreversible .confirm-title { color: #ff9c9c; }
+.confirm-detail {
+  font-size: 10.5px;
+  color: rgba(255, 255, 255, 0.5);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 1px;
+}
+
+.confirm-btn {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 10.5px;
+  padding: 3px 9px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(255, 255, 255, 0.72);
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.confirm-btn:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+.confirm-btn.allow { border-color: rgba(255, 176, 32, 0.45); color: #ffd07a; }
+.confirm-btn.allow:hover { background: rgba(255, 176, 32, 0.18); }
+.confirm-bar.irreversible .confirm-btn.allow {
+  border-color: rgba(255, 82, 82, 0.5);
+  color: #ff9c9c;
+}
+.confirm-bar.irreversible .confirm-btn.allow:hover { background: rgba(255, 82, 82, 0.18); }

@@ -63,6 +63,17 @@
       <button class="mic-btn" id="mic-btn" title="Voice input (Alt+V)">&#x25C9;</button>
     </div>
 
+    <!-- Confirmation bar: an action is parked until the user answers -->
+    <div class="confirm-bar" id="confirm-bar">
+      <span class="confirm-icon" id="confirm-icon">&#x26A0;</span>
+      <div class="confirm-text">
+        <div class="confirm-title" id="confirm-title"></div>
+        <div class="confirm-detail" id="confirm-detail"></div>
+      </div>
+      <button class="confirm-btn deny" id="confirm-deny">Esc &#x2715;</button>
+      <button class="confirm-btn allow" id="confirm-allow">Enter &#x2713;</button>
+    </div>
+
     <!-- Recording indicator (shown while mic is active) -->
     <div class="recording-bar" id="recording-bar">
       <span class="rec-dot"></span>
