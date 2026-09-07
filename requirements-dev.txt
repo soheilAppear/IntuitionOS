@@ -2,3 +2,6 @@
 
 # Test and evaluation tooling
 pytest==9.1.1
+
+# fastapi.testclient needs an HTTP client to drive the app in-process
+httpx==0.28.1

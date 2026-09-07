@@ -43,6 +43,15 @@ thresholds:
   auto_execute:  0.95   # act without asking; reversible capabilities only
   irreversible:  null   # never auto-execute, regardless of confidence
 
+# Consolidation (/dream). Runs offline, on demand, and is the one place the
+# language model earns its cost: it judges whether a recurring pattern is a real
+# habit and names it in a sentence. The rule it writes is then consulted with no
+# model in the query path — a multi-second model cannot sit inside a keystroke.
+consolidation:
+  window: 2000         # episodes examined per run
+  min_support: 4       # fewer occurrences than this is an anecdote, not a habit
+  min_confidence: 0.5  # and it must beat the alternatives in the same situation
+
 # What the predictor learns from, and when it starts trusting itself.
 prediction:
   half_life_s: 604800    # one week: fast enough to follow a change of project,

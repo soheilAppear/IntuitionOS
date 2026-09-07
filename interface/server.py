@@ -29,6 +29,7 @@ from core.anticipator import Anticipator
 from core.brain import Brain
 from core.calibration import CalibrationStore, Calibrator, load_thresholds, reliability
 from core.capabilities import capabilities, is_safe_mode
+from core.consolidation import RuleStore, consolidate, render_rules
 from core.context import ContextSensor
 from core.episodes import EpisodeLog, PredictionWindow
 from core.predictor import Predictor, PredictorStore
@@ -149,6 +150,7 @@ async def lifespan(app: FastAPI):
 
     calibration_store = CalibrationStore(mem)
     calibrator = calibration_store.load()
+    rule_store = RuleStore(mem)
 
     pcfg = cfg.get("prediction", {}) or {}
     predictor = Predictor(
@@ -156,6 +158,7 @@ async def lifespan(app: FastAPI):
         half_life_s=float(pcfg.get("half_life_s", 7 * 24 * 3600)),
         min_episodes=int(pcfg.get("min_episodes", 50)),
         calibrator=calibrator,
+        rules=rule_store,
     )
     if predictor.seen == 0:
         # No saved state: relearn from the log rather than starting cold.
@@ -221,7 +224,8 @@ async def lifespan(app: FastAPI):
     _state.update({"cfg": cfg, "brain": brain, "mem": mem, "sched": sched, "ant": ant,
                    "voice": voice, "episodes": episodes, "sensor": sensor,
                    "predictor": predictor, "calibrator": calibrator,
-                   "calibration_store": calibration_store, "thresholds": thresholds})
+                   "calibration_store": calibration_store, "thresholds": thresholds,
+                   "rules": rule_store})
 
     # Pre-load Whisper model in background so first voice use is instant
     if voice:
@@ -621,7 +625,7 @@ _KNOWN_CMDS = [
     "/config", "/reload", "/tasks", "/done", "/delete", "/snooze",
     "/hw", "/task_payload", "/safe", "/exec", "/write", "/read",
     "/undo", "/journal", "/capabilities", "/forget", "/episodes",
-    "/calibration", "/thresholds",
+    "/calibration", "/thresholds", "/rules",
 ]
 
 
@@ -651,10 +655,44 @@ async def _handle_command(ws: WebSocket, text: str):
         return
 
     if text == "/dream":
-        await ws.send_json({"type": "reply", "text":
-                            "Consolidation is not implemented yet (Phase 6). "
-                            "It will cluster the episode log and promote recurring "
-                            "patterns into rules you can inspect with /rules."})
+        episodes = _state.get("episodes")
+        rules = _state.get("rules")
+        if not (episodes and rules):
+            await ws.send_json({"type": "error", "text": "consolidation unavailable"})
+            return
+        await ws.send_json({"type": "thinking"})
+        ccfg = (_state.get("cfg") or {}).get("consolidation", {}) or {}
+        report = await loop.run_in_executor(_executor, lambda: consolidate(
+            episodes.recent(limit=int(ccfg.get("window", 2000))),
+            rules,
+            llm=_state["brain"].llm,
+            min_support=int(ccfg.get("min_support", 4)),
+            min_confidence=float(ccfg.get("min_confidence", 0.5)),
+            calibrator=_state.get("calibrator"),
+            calibration_store=_state.get("calibration_store"),
+        ))
+        await ws.send_json({"type": "reply", "text": report.summary()})
+        return
+
+    if text.startswith("/rules"):
+        rules = _state.get("rules")
+        if not rules:
+            await ws.send_json({"type": "error", "text": "rule store unavailable"})
+            return
+        parts = text.split()
+        if len(parts) >= 3 and parts[1] == "delete":
+            try:
+                rule_id = int(parts[2])
+            except ValueError:
+                await ws.send_json({"type": "error", "text": "usage: /rules delete <id>"})
+                return
+            ok = rules.delete(rule_id)
+            await ws.send_json({"type": "reply", "text":
+                                f"Deleted rule #{rule_id}." if ok else f"No rule #{rule_id}."})
+            return
+        show_all = len(parts) >= 2 and parts[1] in ("--all", "all")
+        await ws.send_json({"type": "reply",
+                            "text": render_rules(rules.all(active_only=not show_all))})
         return
 
     if text.startswith("/save "):

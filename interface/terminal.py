@@ -15,6 +15,7 @@ from core.actions import (
 )
 from core.calibration import CalibrationStore, load_thresholds, reliability
 from core.capabilities import capabilities
+from core.consolidation import RuleStore, consolidate, render_rules
 from core.context import ContextSensor
 from core.episodes import Episode, EpisodeLog, PredictionWindow
 from core.predictor import Predictor, PredictorStore
@@ -45,7 +46,9 @@ def show_help():
         '/help - show this help',
         '/exit - quit',
         '/memory - show recent memory',
-        '/dream - run reflection',
+        '/dream - consolidate the episode log into rules',
+        '/rules [--all] - what the system believes about your habits',
+        '/rules delete <id> - forget one belief',
         '/save "text" - save a note',
         '/recall "term" - search memory',
         '/actions - list actions',
@@ -75,7 +78,7 @@ def show_help():
 
 def fuzzy_slash(base:str)->str:
     # Known slash commands for fuzzy matching
-    known=['/help','/exit','/memory','/dream','/save','/recall','/actions','/config','/reload','/tasks','/done','/delete','/snooze','/hw','/task_payload','/safe','/exec','/write','/read','/undo','/journal','/capabilities','/forget','/episodes','/calibration','/thresholds']
+    known=['/help','/exit','/memory','/dream','/save','/recall','/actions','/config','/reload','/tasks','/done','/delete','/snooze','/hw','/task_payload','/safe','/exec','/write','/read','/undo','/journal','/capabilities','/forget','/episodes','/calibration','/thresholds','/rules']
     # Return exact match if present
     if base in known:
         return base
@@ -169,16 +172,18 @@ def bootstrap():
     sensor = ContextSensor(journal=get_journal())
 
     calibration_store = CalibrationStore(mem)
+    rule_store = RuleStore(mem)
     pcfg = cfg.get('prediction', {}) or {}
     predictor = Predictor(store=PredictorStore(mem),
                           half_life_s=float(pcfg.get('half_life_s', 7*24*3600)),
                           min_episodes=int(pcfg.get('min_episodes', 50)),
-                          calibrator=calibration_store.load())
+                          calibrator=calibration_store.load(),
+                          rules=rule_store)
     if predictor.seen == 0:
         # No saved state: relearn from the log rather than starting cold.
         predictor.fit(episodes.recent(limit=int(pcfg.get('replay_limit', 5000))))
 
-    return cfg, brain, mem, sched, episodes, sensor, predictor
+    return cfg, brain, mem, sched, episodes, sensor, predictor, rule_store, calibration_store
 
 def make_anticipator(brain, cfg, predictor=None, sensor=None):
     # What to warm now comes from the predictor rather than from four literals
@@ -219,7 +224,7 @@ def make_anticipator(brain, cfg, predictor=None, sensor=None):
 
 def main():
     # Bootstrap everything
-    cfg, brain, mem, sched, episodes, sensor, predictor = bootstrap()
+    cfg, brain, mem, sched, episodes, sensor, predictor, rules, calib_store = bootstrap()
     window = PredictionWindow()
     # Print banner
     rprint(Panel.fit('IntuitionOS v1.0 - sandboxed exec + anticipator + fuzzy commands - type /help', title='IntuitionOS'))
@@ -288,7 +293,7 @@ def main():
         if user=='/reload':
             try:
                 sched.stop()
-                cfg, brain, mem, sched, episodes, sensor, predictor = bootstrap()
+                cfg, brain, mem, sched, episodes, sensor, predictor, rules, calib_store = bootstrap()
                 _ant_ref[0].stop()
                 ant = make_anticipator(brain, cfg, predictor=predictor, sensor=sensor)
                 _ant_ref[0] = ant
@@ -304,8 +309,26 @@ def main():
                 rprint(f'[{role}] {text}')
             continue
         if user=='/dream':
-            rprint('Consolidation is not implemented yet (Phase 6). It will cluster '
-                   'the episode log and promote recurring patterns into rules.')
+            ccfg=cfg.get('consolidation',{}) or {}
+            report=consolidate(episodes.recent(limit=int(ccfg.get('window',2000))),
+                               rules, llm=brain.llm,
+                               min_support=int(ccfg.get('min_support',4)),
+                               min_confidence=float(ccfg.get('min_confidence',0.5)),
+                               calibrator=predictor.calibrator,
+                               calibration_store=calib_store)
+            rprint(Panel.fit(report.summary(), title='Consolidation'))
+            continue
+        if user.startswith('/rules'):
+            parts=user.split()
+            if len(parts)>=3 and parts[1]=='delete':
+                try:
+                    rid=int(parts[2])
+                except ValueError:
+                    rprint('usage: /rules delete <id>'); continue
+                rprint(f'Deleted rule #{rid}.' if rules.delete(rid) else f'No rule #{rid}.')
+                continue
+            show_all = len(parts)>=2 and parts[1] in ('--all','all')
+            rprint(render_rules(rules.all(active_only=not show_all)))
             continue
         if user.startswith('/save '):
             note=user[6:].strip().strip('"')
