@@ -1,0 +1,58 @@
+{
+  "source": "synthetic (800 episodes, seed 7, noise 25%)",
+  "train": 560,
+  "test": 240,
+  "results": [
+    {
+      "name": "baseline",
+      "episodes": 240,
+      "top1": 0.125,
+      "top3": 0.125,
+      "coverage": 1.0,
+      "prewarm_hit_rate": 0.125,
+      "wasted_prewarm_rate": 0.875,
+      "false_reveal_rate": 0.0,
+      "ece": 0.050000000000000044,
+      "median_latency_saved_ms": 40.0,
+      "reveals": 16,
+      "prewarms": 240
+    },
+    {
+      "name": "learned",
+      "episodes": 240,
+      "top1": 0.5458333333333333,
+      "top3": 0.6125,
+      "coverage": 1.0,
+      "prewarm_hit_rate": 0.6494845360824743,
+      "wasted_prewarm_rate": 0.35051546391752575,
+      "false_reveal_rate": 0.09473684210526312,
+      "ece": 0.05736842105263161,
+      "median_latency_saved_ms": 40.0,
+      "reveals": 95,
+      "prewarms": 194
+    },
+    {
+      "name": "calibrated",
+      "episodes": 240,
+      "top1": 0.5458333333333333,
+      "top3": 0.6125,
+      "coverage": 1.0,
+      "prewarm_hit_rate": 0.6142857142857143,
+      "wasted_prewarm_rate": 0.3857142857142857,
+      "false_reveal_rate": 0.09909909909909909,
+      "ece": 0.03738738738738737,
+      "median_latency_saved_ms": 40.0,
+      "reveals": 111,
+      "prewarms": 210
+    }
+  ],
+  "tool_loop": {
+    "plans": 12,
+    "succeeded": 12,
+    "rate": 1.0,
+    "failures": [],
+    "parse_recoveries": 1,
+    "gate_denials": 0
+  },
+  "calibrator_fitted": true
+}

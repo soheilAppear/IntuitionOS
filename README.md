@@ -35,7 +35,7 @@ A frameless, always-on-top ambient overlay that lives at the top of your screen.
 
 ### Terminal (classic)
 
-A REPL with fuzzy command correction, Rich-formatted output, and the same brain,
+A REPL with visible command correction, Rich-formatted output, and the same brain,
 memory, predictor and gate as the HUD. Confirmations are answered at the prompt
 instead of in a bar; everything else behaves identically.
 
@@ -73,11 +73,85 @@ python start_ui.py
 
 Use `Alt+Space` to toggle the HUD. `Ctrl+Q` to quit.
 
+If port `7432` is already occupied by an IntuitionOS backend, launch just the
+overlay with `cd ui` followed by `npm start`. A different service on that port
+must be identified first; starting another backend will fail.
+
 ### Terminal
 
 ```powershell
 python intuitionos.py
 ```
+
+### Command correction: shared by the HUD and terminal
+
+Type an imperfect command and review the proposed full command before submitting:
+
+```text
+gti status                       → git status
+pyhton train.py --lr 0.001        → python train.py --lr 0.001
+git statsu                       → git status
+/taks                            → /tasks
+```
+
+The changed token is highlighted. **Ctrl+N / Ctrl+P** cycle suggestions and
+**Keep original**; **Escape** selects the original; **Enter** submits the
+displayed choice. If an edit has not been displayed yet, Enter requests a fresh
+preview rather than submitting a replacement. The HUD also supports arrow keys
+and clicking a candidate. Voice fills an editable draft and uses the same review
+step. Editing revokes old correction selections and pending action approvals.
+
+The shared core distinguishes exact commands, incomplete names, likely spelling
+mistakes, ambiguous alternatives, and unsupported input. Adjacent transpositions
+work immediately with no history or Ollama. Explicitly accepted corrections
+influence later ranking through frequency, recency, and project context. These
+are **ranking scores, not probabilities**; correction acceptance and execution
+success are separate observations.
+
+Only a command token, or a Git subcommand understood by its provider, is changed.
+Argument text, spacing, quotes, flags, paths, and values are preserved. Valid
+commands stay exact even when a more common alternative exists. Pipelines,
+redirection, chaining, expansions, quoted executable names, and other syntax the
+parser cannot safely span receive an explanation and no correction. Bare inputs
+with unsupported shell syntax are not dispatched automatically; the existing
+quoted `/exec "..."` route remains available for intentional shell expressions.
+
+Available shell commands execute through the **irreversible `run_command`
+capability**: Safe Mode must be off and the displayed action must be confirmed.
+Spelling scores never grant permission. The existing quoted `/exec` form retains
+its project-venv Python behavior; bare commands and unquoted `/exec` preserve the
+selected command exactly in the configured execution shell.
+
+The default execution shell is **CMD on Windows** and **`sh` on POSIX**, regardless
+of the terminal used to launch Python. Executables/scripts are discovered from
+the actual PATH and PATHEXT, alongside shell built-ins. Git obtains available
+subcommands and aliases through a fixed metadata query. Discovery never invokes
+a proposed candidate. Providers can be extended for additional namespaces.
+
+To use PowerShell and capture the current session's aliases/functions, launch
+from that session:
+
+```powershell
+.\scripts\start-intuition.ps1 -Interface terminal
+# or:
+.\scripts\start-intuition.ps1 -Interface hud
+```
+
+The launcher makes a temporary local snapshot and deletes it on exit. Execution
+and discovery use the same PowerShell `-NoProfile` environment plus that snapshot.
+For a clean PowerShell environment without a snapshot, set
+`$env:INTUITION_SHELL = "pwsh"` (or `"powershell"`) before the normal launcher.
+Snapshots preserve definitions, not closures, session variables, module state,
+or later interactive changes. Each executed shell command uses a fresh child
+process; changing directory there does not change the assistant's project.
+
+See the [2026-09-07 milestone report](docs/2026-09-07-command-resolution.md) for
+the measured comparisons, test feedback, supported shells, and remaining limits.
+
+![HUD displaying a spelling correction before submission](docs/results/2026-09-07-hud-correction.png)
+
+The image uses the actual Electron renderer with a fixed resolver response and
+no backend connection; it does not depict a command being executed.
 
 ---
 
@@ -173,8 +247,8 @@ Drivers are simulated by default. See `config/config.yaml` to configure real har
 ## What is recorded on your machine
 
 IntuitionOS keeps an **episode log**: one row for every input you submit, stored
-in `data/intuition.db` on your own disk. Each row holds what you typed, a snapshot
-of the situation it arrived in (working directory, git branch and dirtiness, hour
+in `data/intuition.db` on your own disk. Episode rows use an argument-free command
+representation and a snapshot of the situation (working directory, git branch and dirtiness, hour
 of day, how long you paused before pressing Enter, the last few commands), and —
 when the HUD showed you a hint — whether you took it or ignored it.
 
@@ -194,12 +268,21 @@ So it comes with an off switch and an eraser:
 | | |
 |---|---|
 | See what has been recorded | `/episodes` |
-| Erase all of it | `/forget` |
+| Erase episodes and derived prediction/correction learning | `/forget` |
 | Stop recording entirely | set `episodes.enabled: false` in `config/config.yaml` |
 
 The action journal (`/journal`) is separate and smaller: it records only actions
 that changed something, so that `/undo` has something to reverse and so that
 "scoped exec" has an audit trail behind it.
+
+Correction events share the same SQLite database. They retain the original
+command token, candidate tokens, explicit selection or manual edit, project key,
+and execution outcome. Full argument values stay out of correction learning and
+episode/context command representations. Ignored suggestions are not labelled
+as rejected. `episodes.enabled: false` disables correction storage and ranking
+from past acceptance, and `/forget` clears both stored evidence and live views.
+Explicit notes, conversations, and the action journal remain separate stores;
+the journal still records the actual arguments needed for auditing and undo.
 
 ---
 
@@ -324,7 +407,9 @@ never submit, so it is not allowed to change anything at all.
 | `/exit` | Quit terminal mode |
 | `remind me <title> in/at <when>` | Natural language scheduling |
 
-Fuzzy correction applies to all `/` commands — `/hlp` becomes `/help`, `/taks` becomes `/tasks`.
+Visible correction covers `/` commands and available shell commands: `/hlp`
+offers `/help`, `/taks` offers `/tasks`, and `gti status` offers `git status`.
+The selected replacement is always shown before it can be submitted.
 
 ---
 
@@ -432,7 +517,7 @@ eval/                                    (replayable metrics, CI gate)
 
 | Tier | What it is | Latency | Can it act? |
 |---|---|---|---|
-| Reflex | Fuzzy command correction, cached prewarms | sub-millisecond | free capabilities only |
+| Reflex | Shared deterministic command resolution, cached prewarms | measured milliseconds; see milestone report | suggestions and free prewarms; command execution still goes through the gate |
 | Habit | `core/predictor.py` — learned, local, explainable | milliseconds | prewarms only, never a side effect |
 | Deliberation | `core/brain.py` — the model, with tools | seconds | proposes; the gate decides |
 
@@ -460,7 +545,8 @@ the human faculty work.
 | Risk management | An estimate of the cost of being wrong | Each action declares its reversibility; thresholds are keyed on that cost, and `irreversible` has no threshold at all |
 
 **Core rules:**
-- **Favour momentum over exactness** — correct typos in the first token, preserve arguments.
+- **Favour momentum with visible intent** — suggest typo fixes, preserve arguments,
+  and bind execution to the exact command the user reviewed.
 - **Prewarm cheaply, reveal expensively.** Two thresholds, not one. Being wrong
   about a prewarm costs a few background milliseconds. Being wrong about a hint
   costs your attention, which is why `reveal` sits well above `free`.

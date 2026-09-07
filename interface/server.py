@@ -1,6 +1,5 @@
 import asyncio
 import datetime
-import difflib
 import json
 import os
 import re
@@ -31,6 +30,11 @@ from core.calibration import CalibrationStore, Calibrator, load_thresholds, reli
 from core.capabilities import capabilities, is_safe_mode
 from core.consolidation import RuleStore, consolidate, render_rules
 from core.context import ContextSensor
+from core.os_intents import _try_os_intent
+from core.command_resolver import (
+    KNOWN_COMMANDS, CorrectionSession, create_default_resolver, legacy_fuzzy_slash,
+    learning_text,
+)
 from core.episodes import EpisodeLog, PredictionWindow
 from core.predictor import Predictor, PredictorStore
 from core.logger import make_logger
@@ -46,6 +50,10 @@ _clients: set = set()
 # One prediction window per connection: what the user is typing, and what we put
 # in front of them. Keyed by socket so two HUDs do not credit each other's hints.
 _windows: dict = {}
+_resolutions: dict = {}
+_connections: dict = {}
+_confirmations: dict = {}
+_active_notes: dict = {}
 _executor = ThreadPoolExecutor(max_workers=4)
 
 
@@ -155,6 +163,7 @@ async def lifespan(app: FastAPI):
     # seen enough to do better.
     ecfg = cfg.get("episodes", {}) or {}
     episodes = EpisodeLog(mem, enabled=bool(ecfg.get("enabled", True)))
+    resolver = create_default_resolver(mem, enabled=lambda: episodes.enabled)
     sensor = ContextSensor(journal=get_journal())
 
     thresholds = load_thresholds(cfg.get("thresholds"))
@@ -237,7 +246,7 @@ async def lifespan(app: FastAPI):
                    "voice": voice, "episodes": episodes, "sensor": sensor,
                    "predictor": predictor, "calibrator": calibrator,
                    "calibration_store": calibration_store, "thresholds": thresholds,
-                   "rules": rule_store, "retriever": retriever})
+                   "rules": rule_store, "retriever": retriever, "resolver": resolver})
 
     # Pre-load Whisper model in background so first voice use is instant
     if voice:
@@ -250,9 +259,10 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    ant.stop()
+    _state["ant"].stop()
     try:
-        predictor.save()
+        if _state["episodes"].enabled:
+            _state["predictor"].save()
     except Exception:
         logger("could not save predictor state")
     try:
@@ -263,215 +273,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-_VOL_WORDS = {
-    'zero': 0, 'muted': 0, 'ten': 10, 'twenty': 20, 'thirty': 30,
-    'forty': 40, 'fifty': 50, 'half': 50, 'sixty': 60, 'seventy': 70,
-    'eighty': 80, 'ninety': 90, 'hundred': 100, 'full': 100, 'max': 100,
-    'maximum': 100, 'twenty five': 25, 'seventy five': 75,
-}
-
-# App names that should always route to os_open_app
-_KNOWN_APP_NAMES = {
-    'chrome', 'google chrome', 'google', 'firefox', 'edge', 'browser',
-    'web browser', 'my browser', 'vscode', 'vs code', 'visual studio code',
-    'code', 'notepad', 'calculator', 'calc', 'explorer', 'file explorer',
-    'terminal', 'cmd', 'spotify', 'discord', 'slack', 'teams',
-    'word', 'excel', 'powerpoint', 'paint', 'task manager', 'steam',
-    'obs', 'vlc', 'settings', 'control panel',
-}
-
-_APP_NAME_ALIAS = {
-    'google chrome': 'chrome', 'google': 'chrome',
-    'browser': 'chrome', 'web browser': 'chrome', 'my browser': 'chrome',
-    'vs code': 'vscode', 'visual studio code': 'vscode', 'code editor': 'vscode',
-    'windows terminal': 'terminal', 'command prompt': 'terminal', 'cmd': 'terminal',
-    'file manager': 'explorer', 'file explorer': 'explorer', 'files': 'explorer',
-    'calc': 'calculator',
-}
-
-
-def _try_os_intent(text: str):
-    """Match natural language OS commands. Returns (action, kwargs) or None."""
-    t = text.lower().strip()
-
-    # open / launch / start  (action-first: "open chrome") ────────────
-    m = re.match(
-        r'^(?:open|launch|start|run|execute)\s+(?:the\s+|my\s+|a\s+)?'
-        r'(.+?)(?:\s+(?:app(?:lication)?|program|browser))?[.!?]?$', t
-    )
-    if m:
-        name = m.group(1).strip().rstrip('.,!?')
-        name = _APP_NAME_ALIAS.get(name, name)
-        words = name.split()
-        if name in _KNOWN_APP_NAMES or (1 <= len(words) <= 3 and not any(
-            w in ('a', 'an', 'the', 'new', 'quick', 'file', 'search', 'question')
-            for w in words
-        )):
-            return ('os_open_app', {'name': name})
-
-    # open / launch  (name-first: "chrome open", "spotify launch") ─────
-    m = re.match(r'^(.+?)\s+(?:open|launch|start|run)[.!?]?$', t)
-    if m:
-        name = m.group(1).strip().rstrip('.,!?')
-        name = _APP_NAME_ALIAS.get(name, name)
-        words = name.split()
-        if name in _KNOWN_APP_NAMES or (1 <= len(words) <= 2):
-            return ('os_open_app', {'name': name})
-
-    # volume numeric — "set/put/change volume to/at/as X[%]" ──────────
-    m = re.search(
-        r'(?:set|put|change|turn|make|adjust)\s+(?:the\s+)?(?:volume|sound)\s+(?:to|at|as|=)\s*(\d+)',
-        t
-    ) or re.search(r'\bvolume\s+(?:to\s+|at\s+|=\s*)?(\d+)\b', t) \
-      or re.search(r'\b(\d+)\s*%?\s*(?:volume|loudness)\b', t)
-    if m:
-        return ('os_set_volume', {'level': int(m.group(1))})
-
-    # volume word numbers ("set volume to fifty") ───────────────────────
-    for phrase, num in _VOL_WORDS.items():
-        pesc = re.escape(phrase)
-        if re.search(rf'(?:volume|sound)\s+(?:to\s+|at\s+|=\s*)?{pesc}\b', t) or \
-           re.search(rf'(?:set|put|change|make)\s+(?:the\s+)?(?:volume|sound)\s+(?:to\s+|at\s+)?{pesc}\b', t) or \
-           re.search(rf'\b{pesc}\s*(?:percent\s+)?(?:volume|loudness)\b', t):
-            return ('os_set_volume', {'level': num})
-
-    # volume relative ───────────────────────────────────────────────────
-    if re.search(r'\bmute\b|\bno\s+sound\b|\bsilent(?:ce)?\b', t):
-        return ('os_set_volume', {'level': 0})
-    if re.search(r'(?:volume|sound)\s+(?:up|max|full|loud|higher|louder)', t) or \
-       re.search(r'turn\s+(?:up|the\s+volume\s+up|volume\s+up)', t) or \
-       re.search(r'turn\s+up\s+(?:the\s+)?(?:volume|sound)', t) or \
-       re.search(r'(?:raise|increase)\s+(?:the\s+)?(?:volume|sound)', t):
-        return ('os_set_volume', {'level': 90})
-    if re.search(r'(?:volume|sound)\s+(?:down|low|quiet(?:er)?|half|lower)', t) or \
-       re.search(r'turn\s+(?:down|the\s+volume\s+down|volume\s+down)', t) or \
-       re.search(r'turn\s+(?:the\s+)?(?:volume|sound)\s+down', t) or \
-       re.search(r'(?:lower|decrease|reduce)\s+(?:the\s+)?(?:volume|sound)', t):
-        return ('os_set_volume', {'level': 20})
-
-    # get/check current volume ──────────────────────────────────────────
-    if re.search(r'(?:what|check|get|show)\s+(?:is\s+)?(?:the\s+)?(?:current\s+)?(?:volume|sound\s+level)', t):
-        return ('os_get_volume', {})
-
-    # brightness ────────────────────────────────────────────────────────
-    m = re.search(
-        r'(?:set|put|change|adjust)\s+(?:the\s+)?brightness\s+(?:to|at|=)\s*(\d+)', t
-    ) or re.search(r'\bbrightness\s+(?:to\s+|at\s+)?(\d+)\b', t) \
-      or re.search(r'\b(\d+)\s*%?\s*brightness\b', t)
-    if m:
-        return ('os_set_brightness', {'level': int(m.group(1))})
-    if re.search(r'\bbrightness\s+(?:up|higher|brighter|max|full)\b', t) or \
-       re.search(r'(?:increase|raise|turn\s+up)\s+(?:the\s+)?brightness', t):
-        return ('os_set_brightness', {'level': 100})
-    if re.search(r'\bbrightness\s+(?:down|lower|dim|half|low)\b', t) or \
-       re.search(r'(?:decrease|lower|dim|reduce|turn\s+down)\s+(?:the\s+)?brightness', t):
-        return ('os_set_brightness', {'level': 30})
-    if re.search(r'(?:what|check|get|show)\s+(?:is\s+)?(?:the\s+)?(?:current\s+)?brightness', t):
-        return ('os_get_brightness', {})
-
-    # battery ───────────────────────────────────────────────────────────
-    if re.search(
-        r'\b(?:battery|charge|power\s+level|how\s+much\s+(?:battery|charge|power)|'
-        r'battery\s+(?:life|level|status|percentage|percent)|'
-        r'how\s+long\s+(?:until|till|before).*(?:battery|dies|dead))\b', t
-    ):
-        return ('os_get_battery', {})
-
-    # network / wifi ────────────────────────────────────────────────────
-    if re.search(
-        r'\b(?:network\s+info(?:rmation)?|(?:what(?:\'s|\s+is)\s+(?:my|the)\s+)?(?:ip|wifi|wi-fi|ssid|'
-        r'connection|internet)\s+(?:address|status|info|name)?|'
-        r'am\s+i\s+connected|what\s+network|which\s+wifi|show\s+network)\b', t
-    ):
-        return ('os_get_network_info', {})
-    if re.search(r'\b(?:enable|turn\s+on)\s+(?:the\s+)?(?:wifi|wi-fi|wireless)\b', t):
-        return ('os_toggle_wifi', {'state': 'on'})
-    if re.search(r'\b(?:disable|turn\s+off)\s+(?:the\s+)?(?:wifi|wi-fi|wireless)\b', t):
-        return ('os_toggle_wifi', {'state': 'off'})
-
-    # sleep / lock ──────────────────────────────────────────────────────
-    if re.search(
-        r'\b(?:sleep|hibernate|suspend)\s+(?:(?:the|my)\s+)?(?:computer|pc|machine|laptop)?\b', t
-    ) and 'wake' not in t:
-        return ('os_sleep_computer', {})
-    if re.search(
-        r'\b(?:lock\s+(?:(?:the|my)\s+)?(?:screen|computer|pc|machine|laptop)?|'
-        r'(?:screen\s+)?lock)\b', t
-    ):
-        return ('os_lock_screen', {})
-
-    # power / shutdown / restart ────────────────────────────────────────
-    if re.search(
-        r'\b(?:shut\s*down|shutdown|power\s*off|turn\s+off)\s+(?:(?:the|my|this|your)\s+)?(?:computer|pc|machine|system|laptop)\b',
-        t
-    ):
-        return ('os_shutdown_computer', {'delay_sec': 30})
-    if re.search(
-        r'\b(?:restart|reboot)\s+(?:(?:the|my|this|your)\s+)?(?:computer|pc|machine|system|laptop)\b', t
-    ):
-        return ('os_restart_computer', {'delay_sec': 30})
-    if re.search(r'\bcancel\s+(?:the\s+)?(?:shutdown|restart|reboot)\b', t):
-        return ('os_cancel_shutdown', {})
-
-    # screenshot ────────────────────────────────────────────────────────
-    if re.search(r'screenshot|screen\s+cap(?:ture)?|snap\s+(?:the\s+)?screen', t):
-        return ('os_take_screenshot', {})
-
-    # system info / resource report ────────────────────────────────────
-    if re.search(
-        r'\b(?:'
-        # direct terms
-        r'system\s+info(?:rmation)?|sys(?:tem)?\s+status|pc\s+info(?:rmation)?|'
-        r'hardware\s+info(?:rmation)?|computer\s+stats?|machine\s+info|'
-        # resource variants
-        r'(?:windows|system|pc|computer|my)\s+resources?|'
-        r'resource\s+(?:report|usage|status|info|check)|'
-        r'performance\s+(?:report|status|info|stats?)|'
-        # RAM / memory
-        r'ram(?:\s+(?:usage|status|info|report|check))?|'
-        r'memory\s+(?:usage|status|info|report|check|left)|'
-        r'how\s+much\s+(?:ram|memory|storage|disk\s+space)|'
-        # CPU
-        r'cpu(?:\s+(?:usage|load|status|info|report|check|temp(?:erature)?))?|'
-        r'processor\s+(?:usage|load|status|info)|'
-        # disk
-        r'disk\s+(?:space|usage|status|info)|storage\s+(?:space|status|info)|'
-        # catch-alls
-        r'tell\s+me\s+about\s+(?:my\s+)?(?:system|resources?|computer|pc)|'
-        r'(?:show|give\s+me|check)\s+(?:(?:my|the)\s+)?(?:system|resource|performance|pc|computer)\s+(?:report|status|info|stats?|usage)'
-        r')\b', t
-    ):
-        return ('os_system_info', {})
-
-    # processes ─────────────────────────────────────────────────────────
-    if re.search(
-        r'\b(?:(?:list|show|display|what(?:\'s|\s+is)?)\s+(?:running|'
-        r'(?:all\s+)?processes?|(?:open\s+)?apps?|programs?)|'
-        r'running\s+(?:processes?|apps?|programs?)|'
-        r'what\s+(?:apps?|programs?)\s+(?:are\s+)?(?:open|running))\b', t
-    ):
-        return ('os_list_processes', {})
-
-    # kill process ──────────────────────────────────────────────────────
-    m = re.match(
-        r'^(?:kill|close|stop|quit|end|terminate|force\s+close)\s+'
-        r'(?:the\s+)?(?:process\s+)?(.+?)(?:\s+(?:process|app))?[.!?]?$', t
-    )
-    if m:
-        name = m.group(1).strip().rstrip('.,!?')
-        if name not in ('window', 'panel', 'hud', 'overlay', 'this', 'app', 'application', 'it'):
-            return ('os_kill_process', {'name': name})
-
-    # clipboard ─────────────────────────────────────────────────────────
-    if re.search(
-        r'(?:what(?:\'s|\s+is)\s+in\s+(?:my\s+)?clipboard|'
-        r'read\s+clipboard|show\s+clipboard|get\s+clipboard|clipboard\s+content)', t
-    ):
-        return ('os_get_clipboard', {})
-
-    return None
-
 
 def _format_os_result(action: str, result: dict, kwargs: dict) -> str:
     if result.get("error"):
@@ -539,6 +340,105 @@ def _format_os_result(action: str, result: dict, kwargs: dict) -> str:
 # ── Gated dispatch ───────────────────────────────────────────────────────────
 
 
+def _outcome(result):
+    if result is None:
+        return "pending"
+    if isinstance(result, dict):
+        if result.get("cancelled"):
+            return "cancelled"
+        if result.get("denied"):
+            return "denied"
+        if result.get("error") or result.get("returncode", 0) != 0:
+            return "error"
+    return "ok"
+
+
+def _park_confirmation(ws, token, capability, resume_token=None):
+    session = _resolutions.get(ws)
+    note = _active_notes.get(ws, {})
+    note["outcome"] = "pending"
+    _confirmations[token] = {
+        "ws": ws, "revision": session.revision if session else None,
+        "client_revision": _connections.get(ws, {}).get("client_revision"),
+        "capability": capability, "resume_token": resume_token,
+        "feedback_id": session.feedback_id if session else None,
+        "episode_id": note.get("episode_id"),
+    }
+    return _confirmations[token]
+
+
+def _finish_feedback(meta, outcome):
+    store = getattr(_state.get("resolver"), "feedback", None)
+    if store and meta.get("feedback_id"):
+        store.record_outcome(meta["feedback_id"], outcome)
+    episodes = _state.get("episodes")
+    if episodes and meta.get("episode_id"):
+        episodes.set_outcome(meta["episode_id"], outcome)
+
+
+async def _invalidate_input(ws, *, notify=False, resolution=True):
+    """An edit/disconnect revokes approvals, including suspended model actions."""
+    for token, meta in list(_confirmations.items()):
+        if meta["ws"] is not ws:
+            continue
+        _confirmations.pop(token, None)
+        actions.confirm(token, granted=False)
+        resume = meta.get("resume_token")
+        if resume:
+            _state["brain"]._suspended.pop(resume, None)
+        _finish_feedback(meta, "cancelled")
+    if resolution and ws in _resolutions:
+        _resolutions[ws].invalidate()
+    if notify:
+        await ws.send_json({"type": "input_invalidated"})
+
+
+async def _show_resolution(ws, text, client_revision=None):
+    meta = _connections.setdefault(ws, {})
+    if meta.get("text") != text or meta.get("client_revision") != client_revision:
+        await _invalidate_input(ws, resolution=meta.get("text") == text)
+    meta.update(text=text, client_revision=client_revision)
+    session = _resolutions.setdefault(ws, CorrectionSession(_state["resolver"]))
+    # No LLM or candidate subprocess is consulted by this hot path.
+    session.update(text, context={"cwd": os.getcwd(), "ts": time.time()})
+    await ws.send_json({"type": "resolution", **session.snapshot(),
+                        "client_revision": client_revision})
+
+
+async def _reset_learning_views():
+    """Drop every connection's displayed suggestions and all in-memory models."""
+    for peer in list(_resolutions):
+        await _invalidate_input(peer, notify=True)
+    mem = _state["mem"]
+    episodes = _state["episodes"]
+    _state["resolver"] = create_default_resolver(mem, enabled=lambda: episodes.enabled)
+    for peer in list(_resolutions):
+        _resolutions[peer] = CorrectionSession(_state["resolver"])
+        _windows[peer] = PredictionWindow()
+    cfg = _state["cfg"].get("prediction", {}) or {}
+    calibrator = _state["calibration_store"].load()
+    predictor = Predictor(store=PredictorStore(mem) if episodes.enabled else None,
+                          half_life_s=float(cfg.get("half_life_s", 7 * 24 * 3600)),
+                          min_episodes=int(cfg.get("min_episodes", 50)),
+                          calibrator=calibrator, rules=_state["rules"])
+    _state.update(predictor=predictor, calibrator=calibrator)
+    old_ant = _state["ant"]
+    old_ant.stop()
+    old_ant.invalidate()
+    _state["sensor"] = ContextSensor(journal=get_journal())
+    cfg = _state["cfg"].get("anticipation", {}) or {}
+    ant = Anticipator(
+        prewarm_fn=old_ant.prewarm_fn, predictor=predictor,
+        context_fn=lambda: _state["sensor"].snapshot(),
+        enabled=bool(cfg.get("enabled", True)),
+        debounce_ms=int(cfg.get("debounce_ms", 180)),
+        match_threshold=float(cfg.get("match_threshold", 0.6)),
+        thresholds=_state["thresholds"],
+    )
+    _state["ant"] = ant
+    ant.start()
+
+
 async def _dispatch(ws: WebSocket, name: str, kwargs: dict, actor: str = "user",
                     confidence: float = 1.0):
     """Run one action through the gate, surfacing a confirmation if it needs one.
@@ -552,7 +452,12 @@ async def _dispatch(ws: WebSocket, name: str, kwargs: dict, actor: str = "user",
         _executor,
         lambda: actions.dispatch(name, kwargs, actor=actor, confidence=confidence),
     )
+    note = _active_notes.get(ws)
+    if note is not None:
+        note.update(capability=name, outcome=_outcome(res),
+                    exit_code=res.get("returncode") if isinstance(res, dict) else None)
     if isinstance(res, dict) and res.get("needs_confirmation"):
+        binding = _park_confirmation(ws, res["token"], res["capability"])
         await ws.send_json({
             "type": "confirm_request",
             "token": res["token"],
@@ -561,6 +466,7 @@ async def _dispatch(ws: WebSocket, name: str, kwargs: dict, actor: str = "user",
             "reason": res.get("reason", ""),
             "reversibility": res.get("reversibility", ""),
             "summary": res.get("summary", ""),
+            "client_revision": binding["client_revision"],
         })
         return None
     return res
@@ -568,20 +474,29 @@ async def _dispatch(ws: WebSocket, name: str, kwargs: dict, actor: str = "user",
 
 async def _resolve_confirmation(ws: WebSocket, token: str, granted: bool):
     loop = asyncio.get_running_loop()
+    meta = _confirmations.get(token)
+    session = _resolutions.get(ws)
+    if (not meta or meta["ws"] is not ws
+            or (session and meta["revision"] != session.revision)):
+        await ws.send_json({"type": "error", "text": "Confirmation expired, changed, or belongs to another connection."})
+        return
+    _confirmations.pop(token, None)
 
     # A confirmation raised from inside the tool loop resumes that loop rather
     # than just running the action, so the model gets to see how it was answered
     # and finish its turn either way.
-    resume_token = _state.get("brain_resume", {}).pop(token, None)
+    resume_token = meta.get("resume_token")
     if resume_token is not None:
         brain: Brain = _state["brain"]
         out = await loop.run_in_executor(
             _executor, lambda: brain.resume(resume_token, granted, on_token=_token_sink(ws, loop))
         )
+        _finish_feedback(meta, "ok" if granted and not out.get("error") else "cancelled")
         await _send_brain_result(ws, out)
         return
 
     res = await loop.run_in_executor(_executor, lambda: actions.confirm(token, granted=granted))
+    _finish_feedback(meta, _outcome(res))
     mem: Memory = _state["mem"]
     if res.get("error"):
         await ws.send_json({"type": "error", "text": res["error"]})
@@ -589,8 +504,8 @@ async def _resolve_confirmation(ws: WebSocket, token: str, granted: bool):
     if res.get("cancelled"):
         await ws.send_json({"type": "reply", "text": f"Cancelled {res['capability']}."})
         return
-    pending = _state.pop("last_confirm_action", None)
-    text = _format_os_result(pending, res, {}) if pending else _summarise(res)
+    pending = meta["capability"]
+    text = _format_os_result(pending, res, {}) if pending.startswith("os_") else _summarise(res)
     await ws.send_json({"type": "reply", "text": text})
     await ws.send_json({"type": "status", "safe_mode": is_safe_mode(),
                         "tasks_count": len(mem.list_open())})
@@ -610,7 +525,7 @@ def _token_sink(ws: WebSocket, loop):
 async def _send_brain_result(ws: WebSocket, out: dict):
     """Deliver a Brain result: a reply, or a confirmation that suspended it."""
     if out.get("needs_confirmation"):
-        _state.setdefault("brain_resume", {})[out["confirm_token"]] = out["resume_token"]
+        binding = _park_confirmation(ws, out["confirm_token"], out["capability"], out["resume_token"])
         await ws.send_json({
             "type": "confirm_request",
             "token": out["confirm_token"],
@@ -619,6 +534,7 @@ async def _send_brain_result(ws: WebSocket, out: dict):
             "reason": out.get("reason", ""),
             "reversibility": out.get("reversibility", ""),
             "summary": "",
+            "client_revision": binding["client_revision"],
         })
         return
     await ws.send_json({"type": "reply", "text": out.get("reply", ""), "plan": out.get("plan", [])})
@@ -632,26 +548,56 @@ def _summarise(res: dict) -> str:
     return json.dumps(res, indent=2, default=str)
 
 
-_KNOWN_CMDS = [
-    "/help", "/exit", "/memory", "/dream", "/save", "/recall", "/actions",
-    "/config", "/reload", "/tasks", "/done", "/delete", "/snooze",
-    "/hw", "/task_payload", "/safe", "/exec", "/write", "/read",
-    "/undo", "/journal", "/capabilities", "/forget", "/episodes",
-    "/calibration", "/thresholds", "/rules",
-]
+_KNOWN_CMDS = list(KNOWN_COMMANDS)
 
 
 def _fuzzy_cmd(base: str) -> str:
-    if base in _KNOWN_CMDS:
-        return base
-    m = difflib.get_close_matches(base, _KNOWN_CMDS, n=1, cutoff=0.55)
-    return m[0] if m else base
+    """Compatibility/evaluation only; submission never calls this matcher."""
+    return legacy_fuzzy_slash(base)
 
 
 async def _handle_command(ws: WebSocket, text: str):
     mem: Memory = _state["mem"]
     brain: Brain = _state["brain"]
     loop = asyncio.get_running_loop()
+
+    if text == "/help":
+        await ws.send_json({"type": "reply", "text":
+            "Commands: " + ", ".join(_KNOWN_CMDS) + "\n"
+            "Type gti status or git statsu to preview a correction. "
+            "Up/Down or Ctrl+N/P selects alternatives; Escape keeps the original; "
+            "Enter submits the displayed choice. Shell commands use the capability gate.\n"
+            "/exec <command> (or /exec \"command\" [cwd]); /write <path> \"text\"; "
+            "/read <path>; /hw schema <device>; /task_payload '{JSON}' <when>."})
+        return
+
+    if text == "/exit":
+        await _invalidate_input(ws)
+        await ws.send_json({"type": "exit", "text": "HUD hidden. Backend remains available."})
+        return
+
+    if text == "/config":
+        await ws.send_json({"type": "reply", "text": yaml.safe_dump(_state.get("cfg", {}), sort_keys=False)})
+        return
+
+    if text == "/reload":
+        cfg = _load_config()
+        # Live settings and prompts are safe to replace. Database, voice and
+        # hardware wiring require a restart rather than orphaning live workers.
+        brain.system_prompt = _read_text(cfg.get("system_prompt_path", "config/system_prompt.txt"))
+        brain.schema = _read_json(cfg.get("planner_schema_path", "config/planner_schema.json"))
+        _state["cfg"] = cfg
+        episodes = _state["episodes"]
+        episodes.enabled = bool((cfg.get("episodes") or {}).get("enabled", True))
+        thresholds = load_thresholds(cfg.get("thresholds"))
+        set_thresholds(thresholds)
+        _state["thresholds"] = thresholds
+        _state["ant"].enabled = bool((cfg.get("anticipation") or {}).get("enabled", True))
+        await _reset_learning_views()
+        await ws.send_json({"type": "reply", "text":
+            "Reloaded prompts, logging, anticipation and execution thresholds. "
+            "Restart the backend for model, database, voice or hardware changes."})
+        return
 
     if text == "/memory":
         rows = mem.recent(limit=12)
@@ -795,22 +741,54 @@ async def _handle_command(ws: WebSocket, text: str):
             await ws.send_json({"type": "error", "text": "usage: /safe on|off"})
         return
 
-    if text.startswith("/exec "):
-        rest = text[6:].strip()
+    if re.match(r"^/exec\s", text):
+        rest = text[6:]
         cmd, cwd = None, "."
+        action_name = "run_command"
         if rest.startswith('"'):
             idx = rest.find('"', 1)
             if idx != -1:
                 cmd = rest[1:idx]
                 cwd = rest[idx + 1:].strip() or "."
+                action_name = "run_local"
         if not cmd:
-            pts = rest.split(" ", 1)
-            cmd, cwd = pts[0], (pts[1] if len(pts) == 2 else ".")
-        res = await _dispatch(ws, "run_local", {"cmd": cmd, "cwd": cwd})
+            cmd = rest
+        res = await _dispatch(ws, action_name, {"cmd": cmd, "cwd": cwd})
         if res is None:
             return  # parked awaiting confirmation
         out = res.get("stdout", "") or res.get("error", "") or json.dumps(res)
         await ws.send_json({"type": "reply", "text": out})
+        return
+
+    if text.startswith("/write "):
+        match = re.fullmatch(r'/write\s+(?:"([^"]+)"|(\S+))\s+"(.*)"\s*', text, re.DOTALL)
+        if not match:
+            await ws.send_json({"type": "error", "text": 'usage: /write <path> "text"'})
+            return
+        result = await _dispatch(ws, "write_file", {"path": match[1] or match[2], "text": match[3]})
+        if result is not None:
+            await ws.send_json({"type": "reply", "text": _summarise(result)})
+        return
+
+    if text.startswith("/task_payload "):
+        rest = text[len("/task_payload "):].lstrip()
+        try:
+            quote = rest[0] if rest.startswith(("'", '"')) else ""
+            payload, end = json.JSONDecoder().raw_decode(rest[1:] if quote else rest)
+            tail = rest[1 + end:] if quote else rest[end:]
+            if quote:
+                if not tail.startswith(quote):
+                    raise ValueError("missing closing quote")
+                tail = tail[1:]
+            when = tail.strip()
+            if not when:
+                raise ValueError("missing time")
+            result = await _dispatch(ws, "create_task", {"text": None, "when": when,
+                                                       "repeat": "", "payload": payload})
+            if result is not None:
+                await ws.send_json({"type": "reply", "text": _summarise(result)})
+        except (ValueError, IndexError) as error:
+            await ws.send_json({"type": "error", "text": f"usage: /task_payload '{{JSON}}' <when>: {error}"})
         return
 
     if text.startswith("/read "):
@@ -821,6 +799,12 @@ async def _handle_command(ws: WebSocket, text: str):
 
     if text == "/hw":
         await ws.send_json({"type": "reply", "text": json.dumps(actions.call("hw_list"), indent=2)})
+        return
+
+    if text.startswith("/hw schema "):
+        result = await _dispatch(ws, "hw_schema", {"device": text[len("/hw schema "):]})
+        if result is not None:
+            await ws.send_json({"type": "reply", "text": _summarise(result)})
         return
 
     if text == "/actions":
@@ -852,6 +836,7 @@ async def _handle_command(ws: WebSocket, text: str):
             await ws.send_json({"type": "error", "text": "episode log unavailable"})
             return
         n = await loop.run_in_executor(_executor, episodes.forget)
+        await _reset_learning_views()
         await ws.send_json({"type": "reply", "text": f"Forgot {n} episode(s)."})
         return
 
@@ -910,6 +895,8 @@ async def _handle_command(ws: WebSocket, text: str):
         await ws.send_json({"type": "reply", "text": "\n".join(lines)})
         return
 
+    if ws in _active_notes:
+        _active_notes[ws]["outcome"] = "error"
     await ws.send_json({"type": "error", "text": f"Unknown command: {text}"})
 
 
@@ -928,7 +915,15 @@ async def _handle_input(ws: WebSocket, text: str):
     ctx = sensor.snapshot() if sensor else None
     note: dict = {}
 
-    episode_id = episodes.record(text, ctx, **signals) if episodes else None
+    # Forget must stay forgotten; raw shell arguments are deliberately absent
+    # from correction feedback (handled by CorrectionSession's token store).
+    learned = learning_text(text)
+    for key in ("keystroke_prefix", "predicted"):
+        if signals.get(key):
+            signals[key] = learning_text(signals[key])
+    episode_id = episodes.record(learned, ctx, **signals) if episodes and text.strip() != "/forget" else None
+    note["episode_id"] = episode_id
+    _active_notes[ws] = note
 
     try:
         await _handle_input_inner(ws, text, note)
@@ -936,9 +931,14 @@ async def _handle_input(ws: WebSocket, text: str):
         if episodes and episode_id:
             episodes.set_outcome(episode_id, "error")
         raise
+    finally:
+        _active_notes.pop(ws, None)
+
+    if text.strip() in ("/forget", "/reload"):
+        return
 
     if sensor:
-        sensor.note_submission(text, exit_code=note.get("exit_code"))
+        sensor.note_submission(learned, exit_code=note.get("exit_code"))
     if episodes and episode_id:
         if note.get("capability"):
             episodes.set_capability(episode_id, note["capability"])
@@ -947,15 +947,18 @@ async def _handle_input(ws: WebSocket, text: str):
     # Online update: this submission is the ground truth for whatever was
     # predicted a moment ago, including the times the prediction was wrong.
     predictor = _state.get("predictor")
-    if predictor is not None:
+    if predictor is not None and episodes and episodes.enabled:
         from core.episodes import Episode as _Episode
         predictor.update(_Episode(
-            ts=time.time(), action=text, context=ctx,
-            keystroke_prefix=signals.get("keystroke_prefix") or text,
+            ts=time.time(), action=learned, context=ctx,
+            keystroke_prefix=signals.get("keystroke_prefix") or learned,
         ))
 
     # A write may have invalidated something prewarmed against the old state.
-    if note.get("capability") in ("write_file", "/write", "/exec", "run_local"):
+    session = _resolutions.get(ws)
+    if session:
+        session.outcome(note.get("outcome", "ok"))
+    if note.get("capability") in ("write_file", "/write", "/exec", "run_local", "run_command"):
         ant = _state.get("ant")
         if ant:
             ant.invalidate()
@@ -967,13 +970,32 @@ async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
     ant: Anticipator = _state["ant"]
     loop = asyncio.get_running_loop()
 
-    if text.startswith("/"):
-        tokens = text.split()
-        fixed = _fuzzy_cmd(tokens[0])
-        if fixed != tokens[0]:
-            text = " ".join([fixed] + tokens[1:]).strip()
+    # Parsing/ranking never authorizes a replacement here: `text` is exactly
+    # the raw input or a candidate already displayed and explicitly committed.
+    resolution = _state["resolver"].resolve(text, context={"cwd": os.getcwd()})
+    if not text.lstrip().startswith("/") and ((resolution.namespace == "git" and resolution.status != "unsupported") or (resolution.namespace == "shell" and resolution.status == "exact")):
+        result = await _dispatch(ws, "run_command", {"cmd": text, "cwd": "."})
+        if result is not None:
+            await ws.send_json({"type": "reply", "text":
+                result.get("stdout") or result.get("stderr") or result.get("error") or _summarise(result)})
+        return
+
+    if text.lstrip().startswith("/"):
+        text = text.lstrip()
+        if len(text.split()) == 1:
+            text = text.rstrip()
         note["capability"] = text.split()[0]
         await _handle_command(ws, text)
+        return
+
+    if resolution.status in ("correction", "incomplete", "ambiguous"):
+        note["outcome"] = "error"
+        await ws.send_json({"type": "error", "text": "Original input kept unchanged; command is not recognized. Choose a displayed correction or edit it."})
+        return
+
+    if resolution.status == "unsupported" and resolution.namespace in ("shell", "git"):
+        note["outcome"] = "error"
+        await ws.send_json({"type": "error", "text": resolution.reason})
         return
 
     m = re.match(r"^remind\s+me\s+(.+?)\s+((?:in|at)\s+\S.*)$", text, re.IGNORECASE)
@@ -988,7 +1010,7 @@ async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
         await ws.send_json({"type": "reply", "text": reply})
         return
 
-    if text == "ls":
+    if text.strip() == "ls":
         note["capability"] = "list_dir"
         res = await loop.run_in_executor(_executor, lambda: actions.call("list_dir", path="."))
         if isinstance(res, list):
@@ -1000,7 +1022,7 @@ async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
         await ws.send_json({"type": "reply", "text": lines})
         return
 
-    if text == "tree":
+    if text.strip() == "tree":
         note["capability"] = "list_tree"
         res = await loop.run_in_executor(_executor, lambda: actions.call("list_tree", path="."))
         def _fmt(items, indent=0):
@@ -1027,7 +1049,6 @@ async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
         # manifest calls irreversible now comes back parked for confirmation
         # instead of firing, which is what stops "close this" from killing a
         # process and "shut down" from being heard across the room.
-        _state["last_confirm_action"] = action_name
         try:
             result = await _dispatch(ws, action_name, kwargs, actor="user")
         except Exception as e:
@@ -1035,7 +1056,6 @@ async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
             return
         if result is None:
             return  # parked awaiting confirmation
-        _state.pop("last_confirm_action", None)
         reply = _format_os_result(action_name, result, kwargs)
         mem.add("user", text)
         mem.add("assistant", reply)
@@ -1090,11 +1110,48 @@ async def _maybe_send_anticipation(ws: WebSocket, text: str):
             window.note_shown(text, pre.get("confidence"))
 
 
+async def _submit_input(ws, data):
+    original = data.get("text", "")
+    if not isinstance(original, str) or not original.strip():
+        return
+    session = _resolutions[ws]
+    if "token" in data:
+        # Validate the untouched buffer AND selected rendered command. An old
+        # candidate cannot borrow new argument text or another socket's token.
+        try:
+            snapshot = session.snapshot()
+            index = data.get("candidate_index")
+            expected = (snapshot["original"] if index is None
+                        else snapshot["candidates"][index]["text"])
+            if data.get("selected_text", expected) != expected:
+                raise ValueError("Displayed command does not match this selection")
+            text = session.commit(original, token=data["token"],
+                                  revision=data.get("revision"), candidate_index=index)
+        except (ValueError, KeyError, TypeError, IndexError) as error:
+            await ws.send_json({"type": "error", "text": f"Stale or invalid correction: {error}. Review the current input again."})
+            return
+    else:
+        # Older clients can still submit exact commands. A misspelling is only
+        # offered for review, never silently fixed in the submission handler.
+        resolution = _state["resolver"].resolve(original, context={"cwd": os.getcwd()})
+        if resolution.candidates and resolution.status != "exact":
+            await _show_resolution(ws, original, data.get("client_revision"))
+            return
+        await _invalidate_input(ws)
+        _connections[ws].update(text=original, client_revision=data.get("client_revision"))
+        session.update(original, context={"cwd": os.getcwd()})
+        session.commit(original, token=session.token, revision=session.revision)
+        text = original
+    await _handle_input(ws, text)
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     _clients.add(ws)
     _windows[ws] = PredictionWindow()
+    _resolutions[ws] = CorrectionSession(_state["resolver"])
+    _connections[ws] = {"text": "", "client_revision": None}
 
     mem: Memory = _state["mem"]
     await ws.send_json({
@@ -1111,16 +1168,24 @@ async def ws_endpoint(ws: WebSocket):
 
             if t == "buffer":
                 buf = data.get("text", "")
+                if not isinstance(buf, str):
+                    continue
+                if "client_revision" in data:
+                    await _show_resolution(ws, buf, data["client_revision"])
+                else:
+                    await _invalidate_input(ws)
+                    _connections[ws]["text"] = buf
                 _state["ant"].update_buffer(buf)
                 window = _windows.get(ws)
                 if window:
                     window.note_keystroke(buf)
                 asyncio.create_task(_maybe_send_anticipation(ws, buf))
 
+            elif t == "resolve":
+                await _show_resolution(ws, data.get("text", ""), data.get("client_revision"))
+
             elif t == "input":
-                text = data.get("text", "").strip()
-                if text:
-                    await _handle_input(ws, text)
+                await _submit_input(ws, data)
 
             elif t == "confirm":
                 await _resolve_confirmation(ws, data.get("token", ""), bool(data.get("granted")))
@@ -1152,7 +1217,8 @@ async def ws_endpoint(ws: WebSocket):
                         async def _finish():
                             if recognized_text:
                                 await ws.send_json({"type": "voice_text", "text": recognized_text})
-                                await _handle_input(ws, recognized_text)
+                                # Speech is editable draft input, subject to the
+                                # same visible correction/Enter flow as typing.
                             else:
                                 await ws.send_json({"type": "error", "text": "No speech detected"})
                         asyncio.run_coroutine_threadsafe(_finish(), _loop)
@@ -1169,11 +1235,13 @@ async def ws_endpoint(ws: WebSocket):
                     voice.stop_now()  # signals VAD to stop; callbacks still fire
 
     except WebSocketDisconnect:
+        pass
+    finally:
+        await _invalidate_input(ws)
         _clients.discard(ws)
         _windows.pop(ws, None)
-    except Exception:
-        _clients.discard(ws)
-        _windows.pop(ws, None)
+        _resolutions.pop(ws, None)
+        _connections.pop(ws, None)
 
 
 @app.get("/health")

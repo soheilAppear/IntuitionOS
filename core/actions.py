@@ -9,7 +9,7 @@
 # call site the way it was when run_local, write_file and hw_call each had their
 # own idea of what "safe" meant.
 
-import os, json, shlex, subprocess, sys, shutil, time
+import os, json, re, shlex, subprocess, sys, shutil, time
 
 from .capabilities import (
     Capability,
@@ -98,7 +98,11 @@ class ActionRegistry:
             return {"ok": True, "cancelled": True, "capability": p.capability}
         # The arguments in the store were already validated and jailed by the
         # gate, so they are executed as-is rather than re-read from the wire.
-        return self._execute(cap, p.args, p.actor, p.confidence, "confirm_granted")
+        # Permissions can change while the prompt is visible (for example,
+        # another client enables Safe Mode). Approval binds the stored args,
+        # but never bypasses a fresh gate decision.
+        return self.dispatch(p.capability, p.args, actor=p.actor,
+                             confidence=p.confidence, confirmed=True)
 
     def _execute(self, cap, args, actor, confidence, decision_label):
         undo_payload = {}
@@ -120,7 +124,9 @@ class ActionRegistry:
         except Exception as e:
             result = {"error": str(e)}
 
-        outcome = "error" if isinstance(result, dict) and result.get("error") else "ok"
+        outcome = "error" if isinstance(result, dict) and (
+            result.get("error") or result.get("returncode", 0) != 0
+        ) else "ok"
 
         if outcome == "ok" and cap.capture_undo_result:
             try:
@@ -369,14 +375,28 @@ def run_local(cmd: str, cwd: str = "."):
 
 def _swap_interpreter(cmd: str, py: str) -> str:
     """Replace a leading `python` token with our interpreter, and only a token."""
-    try:
-        tokens = shlex.split(cmd, posix=(os.name != "nt"))
-    except ValueError:
-        return cmd
-    if not tokens or tokens[0].lower() not in ("python", "python3", "py"):
+    match = re.match(r'''^\s*(?:"(?:python3?|py)"|'(?:python3?|py)'|(?:python3?|py))(?=\s|$)''', cmd, re.IGNORECASE)
+    if not match:
         return cmd
     quoted = f'"{py}"' if (" " in py and os.name == "nt") else shlex.quote(py) if os.name != "nt" else py
-    return " ".join([quoted] + tokens[1:])
+    start = len(cmd) - len(cmd.lstrip())
+    return cmd[:start] + quoted + cmd[match.end():]
+
+
+def run_command(cmd: str, cwd: str = "."):
+    """Execute the exact visibly selected command in the resolver's shell.
+
+    Unlike the historical /exec helper this does not substitute Python or
+    reconstruct arguments. The irreversible capability always requires a gate
+    confirmation. A direct call still respects Safe Mode.
+    """
+    if is_safe_mode():
+        return {"error": "Safe Mode is ON — use /safe off first"}
+    from .shell_environment import execute_command
+    try:
+        return execute_command(cmd, cwd=os.path.abspath(cwd))
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # Hardware registry and adapters
@@ -538,6 +558,11 @@ _cap("delete_task", delete_task, _schema({"task_id": {"type": "integer"}}, ["tas
 
 _cap("run_local", run_local, _schema({"cmd": {"type": "string", "minLength": 1}, "cwd": _PATH}, ["cmd"]),
      "irreversible", 500, True, "Run a shell command inside the project directory.",
+     path_scope="project", path_args=("cwd",))
+
+_cap("run_command", run_command,
+     _schema({"cmd": {"type": "string", "minLength": 1}, "cwd": _PATH}, ["cmd"]),
+     "irreversible", 500, True, "Run the exact displayed command in the selected execution shell.",
      path_scope="project", path_args=("cwd",))
 
 _cap("hw_list", hw_list, _schema({}), "free", 1, False, "List registered hardware devices.")

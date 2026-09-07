@@ -34,6 +34,13 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Test HUD correction interactions
+        run: node --test tests/hud_renderer_test.cjs
+
       - name: Check the generated manifest is current
         # config/planner_schema.json is generated from the capability manifest.
         # A capability added without regenerating it means the model is shown a
@@ -67,3 +74,6 @@ jobs:
         # failure mode, CI fails rather than letting the README keep quoting a
         # number that no longer holds.
         run: python -m eval.check
+
+      - name: Compare correction baselines and chronological personalization
+        run: python -m eval.command_resolution --check

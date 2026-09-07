@@ -7,6 +7,7 @@ than inherit whatever launched pytest.
 """
 
 import os
+import copy
 
 import pytest
 
@@ -18,10 +19,13 @@ from core.memory import Memory
 
 @pytest.fixture(autouse=True)
 def restore_safe_mode():
-    # Safe Mode is process-wide; leave it as we found it.
+    # Startup installs process-wide thresholds as well as Safe Mode. A socket
+    # integration test must not change the gate configuration of later tests.
     before = actions_mod._is_safe()
+    before_thresholds = copy.deepcopy(actions_mod._thresholds)
     yield
     set_safe_mode(before)
+    actions_mod.set_thresholds(before_thresholds)
 
 
 @pytest.fixture

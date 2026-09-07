@@ -174,14 +174,31 @@ class EpisodeLog:
     # ── Forgetting ───────────────────────────────────────────────────────
 
     def forget(self) -> int:
-        """Delete every episode. Recording what someone types needs a way out."""
+        """Erase episodes and their derived learning, including correction data.
+
+        Notes, tasks and the action journal have their own lifetimes. Interfaces
+        also reset live predictors; the correction store's generation invalidates
+        other sessions' displayed candidates and cached preference reads.
+        """
         n = self.count()
         self.mem.execute("DELETE FROM episodes")
+        for table in ("predictor_state", "calibration_state", "rules"):
+            if self.mem.has_table(table):
+                self.mem.execute(f"DELETE FROM {table}")
+        from .command_resolver import CorrectionFeedbackStore
+        CorrectionFeedbackStore(self.mem, enabled=self.enabled).forget()
         return n
 
     def forget_before(self, ts: float) -> int:
         n = self.mem.query("SELECT COUNT(*) FROM episodes WHERE ts<?", (ts,))[0][0]
         self.mem.execute("DELETE FROM episodes WHERE ts<?", (ts,))
+        # Aggregates cannot subtract old observations reliably; rebuild them
+        # from remaining episodes instead of retaining forgotten evidence.
+        for table in ("predictor_state", "calibration_state", "rules"):
+            if self.mem.has_table(table):
+                self.mem.execute(f"DELETE FROM {table}")
+        from .command_resolver import CorrectionFeedbackStore
+        CorrectionFeedbackStore(self.mem, enabled=self.enabled).forget(before=ts)
         return n
 
 

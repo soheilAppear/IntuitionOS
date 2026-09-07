@@ -684,6 +684,32 @@
       "est_cost_ms": 10
     },
     {
+      "name": "run_command",
+      "summary": "Run the exact displayed command in the selected execution shell.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "cmd": {
+            "type": "string",
+            "minLength": 1
+          },
+          "cwd": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "cmd"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "irreversible",
+      "requires_confirmation": true,
+      "path_scope": "project",
+      "undoable": false,
+      "est_cost_ms": 500
+    },
+    {
       "name": "run_local",
       "summary": "Run a shell command inside the project directory.",
       "args": {

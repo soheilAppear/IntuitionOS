@@ -63,6 +63,13 @@
       <button class="mic-btn" id="mic-btn" title="Voice input (Alt+V)">&#x25C9;</button>
     </div>
 
+    <!-- Full command candidates are shown before submission. -->
+    <div class="correction-bar" id="correction-bar" aria-live="polite">
+      <div class="correction-label" id="correction-label"></div>
+      <div id="correction-choices" role="listbox" aria-label="Command correction"></div>
+      <div class="correction-help">↑/↓ or Ctrl+N/P choose · Esc keep original · Enter submit selected</div>
+    </div>
+
     <!-- Confirmation bar: an action is parked until the user answers -->
     <div class="confirm-bar" id="confirm-bar">
       <span class="confirm-icon" id="confirm-icon">&#x26A0;</span>

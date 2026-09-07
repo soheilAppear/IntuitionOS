@@ -1,0 +1,198 @@
+{
+  "source": "fixed synthetic command catalog; chronological score-before-feedback replay",
+  "environment": {
+    "os": "Windows-10-10.0.26200-SP0",
+    "python": "3.10.11",
+    "shell": "cmd"
+  },
+  "results": [
+    {
+      "name": "legacy",
+      "cases": 26,
+      "top1": 0.4230769230769231,
+      "top3": 0.4230769230769231,
+      "incorrect_changes_to_valid": 0,
+      "valid_cases": 14,
+      "warm_latency": {
+        "median_ms": 0.041,
+        "p95_ms": 0.0732,
+        "samples": 240
+      },
+      "top1_misses": [
+        {
+          "typed": "gti status",
+          "expected": "git status",
+          "suggested": []
+        },
+        {
+          "typed": "pyhton train.py --lr 0.001",
+          "expected": "python train.py --lr 0.001",
+          "suggested": []
+        },
+        {
+          "typed": "git statsu",
+          "expected": "git status",
+          "suggested": []
+        },
+        {
+          "typed": "git chekcout topic",
+          "expected": "git checkout topic",
+          "suggested": []
+        },
+        {
+          "typed": "git comimt -m \"two words\"",
+          "expected": "git commit -m \"two words\"",
+          "suggested": []
+        },
+        {
+          "typed": "nmp install",
+          "expected": "npm install",
+          "suggested": []
+        },
+        {
+          "typed": "pytesst -q",
+          "expected": "pytest -q",
+          "suggested": []
+        },
+        {
+          "typed": "  pyhton\t\"train file.py\"  --lr 0.001  ",
+          "expected": "  python\t\"train file.py\"  --lr 0.001  ",
+          "suggested": []
+        },
+        {
+          "typed": "/exec gti status",
+          "expected": "/exec git status",
+          "suggested": []
+        },
+        {
+          "typed": "gco file.txt",
+          "expected": "gcp file.txt",
+          "suggested": []
+        },
+        {
+          "typed": "gco file.txt",
+          "expected": "gcp file.txt",
+          "suggested": []
+        },
+        {
+          "typed": "gco file.txt",
+          "expected": "gcp file.txt",
+          "suggested": []
+        },
+        {
+          "typed": "gco file.txt",
+          "expected": "gcp file.txt",
+          "suggested": []
+        },
+        {
+          "typed": "gco file.txt",
+          "expected": "gcp file.txt",
+          "suggested": []
+        },
+        {
+          "typed": "gco file.txt",
+          "expected": "gcp file.txt",
+          "suggested": []
+        }
+      ]
+    },
+    {
+      "name": "deterministic",
+      "cases": 26,
+      "top1": 0.7692307692307693,
+      "top3": 1.0,
+      "incorrect_changes_to_valid": 0,
+      "valid_cases": 14,
+      "warm_latency": {
+        "median_ms": 0.1132,
+        "p95_ms": 0.7974,
+        "samples": 240
+      },
+      "top1_misses": [
+        {
+          "typed": "gco file.txt",
+          "expected": "gcp file.txt",
+          "suggested": [
+            "gcc file.txt",
+            "gcp file.txt"
+          ]
+        },
+        {
+          "typed": "gco file.txt",
+          "expected": "gcp file.txt",
+          "suggested": [
+            "gcc file.txt",
+            "gcp file.txt"
+          ]
+        },
+        {
+          "typed": "gco file.txt",
+          "expected": "gcp file.txt",
+          "suggested": [
+            "gcc file.txt",
+            "gcp file.txt"
+          ]
+        },
+        {
+          "typed": "gco file.txt",
+          "expected": "gcp file.txt",
+          "suggested": [
+            "gcc file.txt",
+            "gcp file.txt"
+          ]
+        },
+        {
+          "typed": "gco file.txt",
+          "expected": "gcp file.txt",
+          "suggested": [
+            "gcc file.txt",
+            "gcp file.txt"
+          ]
+        },
+        {
+          "typed": "gco file.txt",
+          "expected": "gcp file.txt",
+          "suggested": [
+            "gcc file.txt",
+            "gcp file.txt"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "personalized",
+      "cases": 26,
+      "top1": 0.9615384615384616,
+      "top3": 1.0,
+      "incorrect_changes_to_valid": 0,
+      "valid_cases": 14,
+      "warm_latency": {
+        "median_ms": 0.1367,
+        "p95_ms": 0.8448,
+        "samples": 240
+      },
+      "top1_misses": [
+        {
+          "typed": "gco file.txt",
+          "expected": "gcp file.txt",
+          "suggested": [
+            "gcc file.txt",
+            "gcp file.txt"
+          ]
+        }
+      ]
+    }
+  ],
+  "installed_catalog_warm_latency": {
+    "median_ms": 5.6825,
+    "p95_ms": 9.739,
+    "samples": 48
+  },
+  "unsupported_inputs_preserved": true,
+  "limitations": [
+    "Synthetic preferences, not a user study.",
+    "Legacy matcher exposed one candidate; its top-3 equals top-1.",
+    "Warm timing excludes first filesystem/PowerShell catalog discovery and UI rendering.",
+    "POSIX behavior is unit-tested where simulated; actual shells are reported separately."
+  ]
+}

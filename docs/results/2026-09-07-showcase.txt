@@ -1,0 +1,15 @@
+IntuitionOS correction showcase (suggestions only; no commands executed)
+gti status
+  correction: git status
+pyhton train.py --lr 0.001
+  correction: python train.py --lr 0.001
+git statsu
+  correction: git status | git stash
+stat file.txt
+  exact: Available command; input is preserved.
+gco file.txt
+  ambiguous: gcc file.txt | gcp file.txt
+gti status | more
+  unsupported: Shell operators, expansions, escapes or unmatched quotes prevent a safe correction span; input is unchanged.
+Stale selection after editing:
+  BLOCKED: Correction is stale; display the current input again.

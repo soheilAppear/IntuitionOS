@@ -31,6 +31,9 @@ const confirmTitle  = document.getElementById('confirm-title');
 const confirmDetail = document.getElementById('confirm-detail');
 const confirmAllow  = document.getElementById('confirm-allow');
 const confirmDeny   = document.getElementById('confirm-deny');
+const correctionBar = document.getElementById('correction-bar');
+const correctionLabel = document.getElementById('correction-label');
+const correctionChoices = document.getElementById('correction-choices');
 
 // ── State ──
 let ws = null;
@@ -41,6 +44,9 @@ let expanded     = false;
 let lastCommand  = '';
 let isRecording  = false;
 let pendingConfirm = null;   // { token, capability, reversibility }
+let inputRevision = 0;
+let resolution = null;
+let selectedCorrection = null; // null explicitly keeps the original
 
 // ── IPC ──
 ipcRenderer.on('focus-input', () => cmdInput.focus());
@@ -87,6 +93,8 @@ function connect() {
   };
 
   ws.onclose = () => {
+    clearResolution();
+    clearConfirm();
     cmdInput.placeholder = 'Reconnecting…';
     setTimeout(connect, RECONNECT_MS);
   };
@@ -115,6 +123,9 @@ function handleMessage(msg) {
     case 'voice_transcribing': onVoiceTranscribing();    break;
     case 'voice_text':       onVoiceText(msg.text);      break;
     case 'confirm_request':  onConfirmRequest(msg);      break;
+    case 'resolution':       onResolution(msg);          break;
+    case 'input_invalidated':clearResolution(); clearConfirm(); break;
+    case 'exit':            ipcRenderer.send('hide-window'); break;
     case 'token':            onToken(msg.text);          break;
   }
 }
@@ -183,6 +194,7 @@ function onReply(msg) {
 }
 
 function onAnticipation(msg) {
+  if (resolution && resolution.candidates.length) return;
   if (msg.text !== cmdInput.value.trim()) return;
   hud.classList.remove('anticipating');
   const d = msg.data || {};
@@ -287,6 +299,11 @@ function clearStream() { streamBuffer = ''; }
 // rather than submitting a new command on top of a pending one.
 
 function onConfirmRequest(msg) {
+  // An edit may have happened while dispatch was awaiting the capability gate.
+  if (msg.client_revision !== undefined && msg.client_revision !== null && msg.client_revision !== inputRevision) {
+    send({ type: 'confirm', token: msg.token, granted: false });
+    return;
+  }
   thinkingEl.classList.remove('active');
   pendingConfirm = { token: msg.token, capability: msg.capability };
 
@@ -362,8 +379,10 @@ function onVoiceText(text) {
   recordingBar.classList.remove('active');
   isRecording = false;
   if (text) {
-    lastCommand = text;  // cmd-echo will show what was heard above the reply
-    showToast(`Heard: "${text}"`);
+    cmdInput.value = text;
+    inputChanged();
+    cmdInput.focus();
+    showToast('Speech is ready to review. Enter submits the selected command.');
   }
   setTimeout(syncHeight, 16);
 }
@@ -386,23 +405,83 @@ function showToast(text) {
   setTimeout(() => el.remove(), 4200);
 }
 
-// ── Input ──
-cmdInput.addEventListener('input', () => {
-  const val = cmdInput.value;
+// ── Visible command resolution ──
+function clearResolution() {
+  resolution = null;
+  selectedCorrection = null;
+  correctionChoices.replaceChildren();
+  correctionBar.classList.remove('active');
+  setTimeout(syncHeight, 16);
+}
+
+function onResolution(msg) {
+  if (msg.original !== cmdInput.value || msg.client_revision !== inputRevision) return;
+  resolution = msg;
+  selectedCorrection = msg.candidates.length ? 0 : null;
   clearGhost();
+  renderResolution();
+}
 
-  if (!val.trim()) {
-    hud.classList.remove('anticipating');
-    return;
+function renderResolution() {
+  if (!resolution) return;
+  correctionChoices.replaceChildren();
+  correctionLabel.textContent = resolution.candidates.length
+    ? `${resolution.status}: review the highlighted change`
+    : (resolution.status === 'exact' ? 'Exact command · Enter submits unchanged' : resolution.reason || 'Enter submits unchanged');
+  const choices = [...resolution.candidates.map((c, index) => ({ ...c, index })),
+    { text: resolution.original, index: null }];
+  for (const candidate of choices) {
+    const button = document.createElement('button');
+    button.className = 'correction-choice';
+    button.classList.toggle('selected', candidate.index === selectedCorrection);
+    button.setAttribute('role', 'option');
+    button.setAttribute('aria-selected', String(candidate.index === selectedCorrection));
+    const caption = document.createElement('span');
+    caption.className = 'choice-caption';
+    caption.textContent = candidate.index === null ? 'Keep original' : `Suggestion ${candidate.index + 1}`;
+    button.appendChild(caption);
+    if (candidate.index !== null && candidate.span) {
+      const start = candidate.span[0];
+      const end = start + candidate.token.length;
+      button.appendChild(document.createTextNode(candidate.text.slice(0, start)));
+      const changed = document.createElement('mark');
+      changed.textContent = candidate.text.slice(start, end);
+      button.appendChild(changed);
+      button.appendChild(document.createTextNode(candidate.text.slice(end)));
+      button.title = candidate.reason || '';
+    } else {
+      button.appendChild(document.createTextNode(candidate.text));
+    }
+    button.addEventListener('click', () => { selectedCorrection = candidate.index; renderResolution(); cmdInput.focus(); });
+    correctionChoices.appendChild(button);
   }
+  correctionBar.classList.toggle('active', !!resolution.original.trim());
+  setTimeout(syncHeight, 16);
+}
 
-  hud.classList.add('anticipating');
+function cycleCorrection(delta) {
+  if (!resolution || !resolution.candidates.length) return;
+  const count = resolution.candidates.length;
+  const current = selectedCorrection === null ? count : selectedCorrection;
+  const next = (current + delta + count + 1) % (count + 1);
+  selectedCorrection = next === count ? null : next;
+  renderResolution();
+}
 
+// ── Input ──
+function inputChanged() {
+  const val = cmdInput.value;
+  inputRevision += 1;
+  clearResolution();
+  clearConfirm();
+  clearGhost();
+  hud.classList.toggle('anticipating', !!val.trim());
   clearTimeout(bufferTimer);
-  bufferTimer = setTimeout(() => {
-    send({ type: 'buffer', text: val });
-  }, 90);
-});
+  // Send even empty edits immediately: the server must revoke approvals before
+  // any following Enter/click can submit a stale command.
+  send({ type: 'buffer', text: val, client_revision: inputRevision });
+}
+cmdInput.addEventListener('input', inputChanged);
 
 cmdInput.addEventListener('keydown', (e) => {
   // A parked action owns Enter and Escape until it is answered.
@@ -411,15 +490,33 @@ cmdInput.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { e.preventDefault(); answerConfirm(false); return; }
   }
 
+  if ((e.key === 'ArrowDown' || (e.ctrlKey && e.key.toLowerCase() === 'n')) && resolution) {
+    e.preventDefault(); cycleCorrection(1); return;
+  }
+  if ((e.key === 'ArrowUp' || (e.ctrlKey && e.key.toLowerCase() === 'p')) && resolution) {
+    e.preventDefault(); cycleCorrection(-1); return;
+  }
+  if (e.key === 'Escape' && resolution && resolution.candidates.length) {
+    e.preventDefault(); selectedCorrection = null; renderResolution(); return;
+  }
+
   if (e.key === 'Enter') {
-    const text = cmdInput.value.trim();
-    if (!text) return;
-    lastCommand = text;
+    e.preventDefault();
+    const text = cmdInput.value;
+    if (!text.trim()) return;
+    if (!resolution || resolution.original !== text || resolution.client_revision !== inputRevision) {
+      send({ type: 'resolve', text, client_revision: inputRevision });
+      return;
+    }
+    const selectedText = selectedCorrection === null ? text : resolution.candidates[selectedCorrection].text;
+    lastCommand = selectedText;
+    send({ type: 'input', text, selected_text: selectedText, token: resolution.token,
+      revision: resolution.revision, candidate_index: selectedCorrection, client_revision: inputRevision });
     cmdInput.value = '';
+    clearResolution();
     clearGhost();
     hud.classList.remove('anticipating');
     clearTimeout(bufferTimer);
-    send({ type: 'input', text });
     return;
   }
 
@@ -430,8 +527,7 @@ cmdInput.addEventListener('keydown', (e) => {
       if (tasksOpen)  toggleTasks();
     } else {
       cmdInput.value = '';
-      clearGhost();
-      hud.classList.remove('anticipating');
+      inputChanged();
     }
   }
 });
