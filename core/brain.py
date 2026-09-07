@@ -27,6 +27,7 @@ from typing import Optional
 
 from .capabilities import capabilities
 from .llm import LLMError
+from .retrieval import estimate_tokens, render_notes
 
 # ── Wire format ──────────────────────────────────────────────────────────────
 #
@@ -210,7 +211,8 @@ class _Suspended:
 class Brain:
     def __init__(self, llm, memory, system_prompt, planner_schema, logger=None,
                  dispatcher=None, registry=None, max_iters: int = 5, budget_ms: int = 8000,
-                 history_turns: int = 6):
+                 history_turns: int = 6, retriever=None, retrieve_k: int = 4,
+                 prompt_budget_tokens: int = 2400):
         # Save collaborators
         self.llm = llm
         self.mem = memory
@@ -226,15 +228,58 @@ class Brain:
         self.max_iters = max_iters
         self.budget_ms = budget_ms
         self.history_turns = history_turns
+        self.retriever = retriever
+        self.retrieve_k = retrieve_k
+        # A ceiling on everything that is not the system prompt itself. Without
+        # it a long session or a large note database silently pushes the tool
+        # protocol out of the front of the context window, which fails in the
+        # most confusing way available: the model simply stops using tools.
+        self.prompt_budget_tokens = prompt_budget_tokens
         self._suspended: dict[str, _Suspended] = {}
 
     # ── Prompt ───────────────────────────────────────────────────────────
 
-    def build_system_prompt(self, context=None) -> str:
+    def build_system_prompt(self, context=None, notes=None) -> str:
         parts = [self.system_prompt, "", "AVAILABLE TOOLS", render_capabilities(self.registry.manifest())]
         if context is not None:
             parts += ["", "CURRENT SITUATION", _render_context(context)]
+        if notes:
+            parts += ["", render_notes(notes)]
         return "\n".join(parts)
+
+    def retrieve(self, user_text: str, context=None) -> list:
+        """Notes worth putting in front of the model, chosen by the situation
+        as well as by the words.
+
+        This is what makes the README's claim about /save true. It is also
+        cue-driven: a note surfaces because it matches where you are and what
+        you just did, not only because you happened to type a word from it.
+        """
+        if not self.retriever:
+            return []
+        try:
+            return self.retriever.retrieve(user_text, context, k=self.retrieve_k)
+        except Exception as e:
+            self.log(f"brain: retrieval failed ({e})")
+            return []
+
+    def _trim(self, messages: list) -> list:
+        """Drop the oldest turns until the history fits its share of the budget.
+
+        Oldest first, because the exchange the user is still in the middle of is
+        the one that must survive.
+        """
+        budget = max(0, self.prompt_budget_tokens)
+        kept: list = []
+        used = 0
+        for msg in reversed(messages):
+            cost = estimate_tokens(msg.get("content", ""))
+            if used + cost > budget:
+                break
+            kept.append(msg)
+            used += cost
+        kept.reverse()
+        return kept
 
     def _history(self) -> list:
         """The last few conversational turns, so the model has continuity.
@@ -262,8 +307,9 @@ class Brain:
         max_iters = self.max_iters if max_iters is None else max_iters
         budget_ms = self.budget_ms if budget_ms is None else budget_ms
 
-        messages = [{"role": "system", "content": self.build_system_prompt(context)}]
-        messages += self._history()
+        notes = self.retrieve(user_text, context)
+        messages = [{"role": "system", "content": self.build_system_prompt(context, notes)}]
+        messages += self._trim(self._history())
         messages.append({"role": "user", "content": user_text})
 
         self.mem.add("user", user_text)

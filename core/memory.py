@@ -47,6 +47,22 @@ class Memory:
             self.conn.commit()
             return cur.lastrowid
 
+    def insert_many(self, sql: str, rows) -> None:
+        # One transaction for many rows. A per-row commit is fine for the handful
+        # of writes a session makes, and unusable for a bulk import or a test
+        # fixture that needs thousands.
+        with self._lock:
+            self.conn.executemany(sql, rows)
+            self.conn.commit()
+
+    def add_many(self, entries) -> None:
+        # entries: iterable of (role, text, tags)
+        now = time.time()
+        self.insert_many(
+            "INSERT INTO mem (ts, role, text, tags) VALUES (?,?,?,?)",
+            [(now, role, text, tags) for role, text, tags in entries],
+        )
+
     def has_table(self, name: str) -> bool:
         # Used by migrations to tell a fresh database from an existing one
         return bool(self.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)))

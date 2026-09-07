@@ -36,6 +36,7 @@ from core.predictor import Predictor, PredictorStore
 from core.logger import make_logger
 from core.llm import LLMClient
 from core.memory import Memory
+from core.retrieval import Retriever
 from core.scheduler import Scheduler
 from core.voice import VoiceRecognizer
 import core.os_sandbox as _os
@@ -92,11 +93,16 @@ async def lifespan(app: FastAPI):
         cfg.get("max_tokens", 600),
     )
     bcfg = cfg.get("brain", {}) or {}
+    rcfg = cfg.get("retrieval", {}) or {}
+    retriever = Retriever(mem, budget_tokens=int(rcfg.get("budget_tokens", 700)))
     brain = Brain(
         llm, mem, sys_prompt, schema, logger=logger,
         max_iters=int(bcfg.get("max_iters", 5)),
         budget_ms=int(bcfg.get("budget_ms", 20000)),
         history_turns=int(bcfg.get("history_turns", 6)),
+        retriever=retriever,
+        retrieve_k=int(rcfg.get("k", 4)),
+        prompt_budget_tokens=int(bcfg.get("prompt_budget_tokens", 2400)),
     )
 
     def notify(task_id: int, title: str):
@@ -225,7 +231,7 @@ async def lifespan(app: FastAPI):
                    "voice": voice, "episodes": episodes, "sensor": sensor,
                    "predictor": predictor, "calibrator": calibrator,
                    "calibration_store": calibration_store, "thresholds": thresholds,
-                   "rules": rule_store})
+                   "rules": rule_store, "retriever": retriever})
 
     # Pre-load Whisper model in background so first voice use is instant
     if voice:
@@ -703,11 +709,34 @@ async def _handle_command(ws: WebSocket, text: str):
 
     if text.startswith("/recall "):
         term = text[8:].strip().strip('"')
-        rows = mem.search(term, limit=12)
+        retriever = _state.get("retriever")
+        sensor = _state.get("sensor")
+        snapshot = sensor.snapshot() if sensor else None
+
+        # Notes first. Appendix A #16: Brain writes both sides of every
+        # conversation into `mem`, so an unfiltered search buries the notes under
+        # the transcript.
+        hits = retriever.search(term, limit=12, roles=("note",)) if retriever else []
+        if not hits and retriever:
+            hits = retriever.search(term, limit=12)
+        if not hits:
+            hits = [type("R", (), {"id": r[0], "ts": r[1], "role": r[2], "text": r[3],
+                                   "tags": r[4]})() for r in mem.search(term, limit=12)]
+
         await ws.send_json({"type": "memory", "rows": [
-            {"id": r[0], "ts": r[1], "role": r[2], "text": r[3], "tags": r[4]}
-            for r in reversed(rows)
+            {"id": h.id, "ts": h.ts, "role": h.role, "text": h.text, "tags": h.tags}
+            for h in hits
         ]})
+
+        # And show what the situation alone would have surfaced, which is the
+        # point of cue-driven retrieval: you should not have needed to ask.
+        if retriever and snapshot is not None:
+            cued = [n for n in retriever.retrieve("", snapshot, k=2)
+                    if all(n.id != h.id for h in hits)]
+            if cued:
+                await ws.send_json({"type": "reply", "text":
+                                    "Also relevant here right now:" + chr(10)
+                                    + chr(10).join(f"- {n.text}" for n in cued)})
         return
 
     if text.startswith("/done "):
@@ -1022,7 +1051,11 @@ async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
     await ws.send_json({"type": "thinking"})
     try:
         sink = _token_sink(ws, loop)
-        out = await loop.run_in_executor(_executor, lambda: brain.step(text, on_token=sink))
+        sensor = _state.get("sensor")
+        snapshot = sensor.snapshot() if sensor else None
+        out = await loop.run_in_executor(
+            _executor, lambda: brain.step(text, context=snapshot, on_token=sink)
+        )
         await _send_brain_result(ws, out)
     except Exception as e:
         await ws.send_json({"type": "error", "text": f"LLM error: {e}"})

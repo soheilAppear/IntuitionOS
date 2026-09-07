@@ -7,6 +7,7 @@ from prompt_toolkit import PromptSession
 
 from core.llm import LLMClient
 from core.memory import Memory
+from core.retrieval import Retriever
 from core.brain import Brain
 from core.logger import make_logger
 from core.actions import (
@@ -126,10 +127,15 @@ def bootstrap():
 
     llm=LLMClient(cfg.get('backend','ollama'), cfg.get('model','gpt-oss:20b'), cfg.get('temperature',0.2), cfg.get('max_tokens',600))
     bcfg=cfg.get('brain',{}) or {}
+    rcfg=cfg.get('retrieval',{}) or {}
+    retriever=Retriever(mem, budget_tokens=int(rcfg.get('budget_tokens',700)))
     brain=Brain(llm, mem, sys_prompt, schema, logger=logger,
                 max_iters=int(bcfg.get('max_iters',5)),
                 budget_ms=int(bcfg.get('budget_ms',20000)),
-                history_turns=int(bcfg.get('history_turns',6)))
+                history_turns=int(bcfg.get('history_turns',6)),
+                retriever=retriever,
+                retrieve_k=int(rcfg.get('k',4)),
+                prompt_budget_tokens=int(bcfg.get('prompt_budget_tokens',2400)))
 
     def notify(task_id:int, title:str):
         rprint(Panel.fit(f'Remind #{task_id}: {title}', title='Reminder'))
@@ -335,9 +341,18 @@ def main():
             mem.add('note', note, tags='note'); rprint('saved.'); continue
         if user.startswith('/recall '):
             term=user[8:].strip().strip('"')
-            rows=mem.search(term, limit=12)
-            for _id, ts, role, text, tags in rows[::-1]:
-                rprint(f'[{role}] {text}')
+            # Notes first: the transcript would otherwise bury them (Appendix A #16).
+            hits=brain.retriever.search(term, limit=12, roles=('note',))
+            if not hits:
+                hits=brain.retriever.search(term, limit=12)
+            for h in hits:
+                rprint(f'[{h.role}] {h.text}')
+            cued=[n for n in brain.retriever.retrieve('', _ctx, k=2)
+                  if all(n.id != h.id for h in hits)]
+            if cued:
+                rprint('[dim]Also relevant here right now:[/dim]')
+                for n in cued:
+                    rprint(f'  - {n.text}')
             continue
         if user=='/tasks':
             rprint(actions.call('list_tasks', status='pending')); continue
@@ -478,7 +493,7 @@ def main():
             continue
 
         # Default to LLM brain — a real propose/validate/execute/observe loop.
-        out = brain.step(user)
+        out = brain.step(user, context=_ctx)
         while out.get('needs_confirmation'):
             detail=' '.join(f'{k}={v}' for k,v in (out.get('args') or {}).items())
             title='CANNOT BE UNDONE' if out.get('reversibility')=='irreversible' else 'Confirm'

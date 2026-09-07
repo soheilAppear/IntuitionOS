@@ -27,6 +27,14 @@ brain:
 episodes:
   enabled: true
 
+# Cue-driven retrieval. Notes surface because the situation matches — the branch
+# you are on, the file you just touched, the command you just ran — not only
+# because you typed a word from them. The budget is a hard ceiling: a database of
+# ten thousand notes must not be able to push the tool protocol out of the prompt.
+retrieval:
+  k: 4                 # notes injected per turn
+  budget_tokens: 700   # ceiling on the note block
+
 anticipation:
   enabled: true
   debounce_ms: 180
