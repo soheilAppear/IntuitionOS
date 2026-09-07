@@ -504,3 +504,10 @@ html, body {
   color: #ff9c9c;
 }
 .confirm-bar.irreversible .confirm-btn.allow:hover { background: rgba(255, 82, 82, 0.18); }
+
+/* Streamed tokens, before the final reply replaces them. Dimmed so a partial
+   answer never reads as a finished one. */
+.streaming {
+  color: rgba(255, 255, 255, 0.62);
+  white-space: pre-wrap;
+}

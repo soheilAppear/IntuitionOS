@@ -115,6 +115,7 @@ function handleMessage(msg) {
     case 'voice_transcribing': onVoiceTranscribing();    break;
     case 'voice_text':       onVoiceText(msg.text);      break;
     case 'confirm_request':  onConfirmRequest(msg);      break;
+    case 'token':            onToken(msg.text);          break;
   }
 }
 
@@ -133,6 +134,7 @@ function onStatus(msg) {
 }
 
 function onThinking() {
+  clearStream();
   thinkingEl.classList.add('active');
   hud.classList.remove('anticipating');
   ghostHint.textContent = '';
@@ -140,6 +142,7 @@ function onThinking() {
 
 function onReply(msg) {
   thinkingEl.classList.remove('active');
+  clearStream();
   if (pendingConfirm) clearConfirm();
   hud.classList.remove('anticipating');
   ghostHint.textContent = '';
@@ -219,11 +222,33 @@ function onReminder(msg) {
 
 function onError(text) {
   thinkingEl.classList.remove('active');
+  clearStream();
   openPanel();
   outputText.innerHTML = `<span class="error-text">⚠  ${esc(text)}</span>`;
   outputArea.classList.add('visible');
   setTimeout(syncHeight, 16);
 }
+
+// ── Streaming ──
+//
+// A turn can now span several tool iterations, so the panel shows tokens as they
+// land rather than staying blank for the whole round trip. onReply overwrites
+// this with the final text, which is the authoritative version.
+
+let streamBuffer = '';
+
+function onToken(piece) {
+  if (!piece) return;
+  if (!streamBuffer) {
+    openPanel();
+    outputArea.classList.add('visible');
+  }
+  streamBuffer += piece;
+  outputText.innerHTML = `<span class="streaming">${esc(streamBuffer)}</span>`;
+  setTimeout(syncHeight, 16);
+}
+
+function clearStream() { streamBuffer = ''; }
 
 // ── Confirmation ──
 //

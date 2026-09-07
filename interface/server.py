@@ -81,7 +81,13 @@ async def lifespan(app: FastAPI):
         cfg.get("temperature", 0.2),
         cfg.get("max_tokens", 600),
     )
-    brain = Brain(llm, mem, sys_prompt, schema, logger=logger)
+    bcfg = cfg.get("brain", {}) or {}
+    brain = Brain(
+        llm, mem, sys_prompt, schema, logger=logger,
+        max_iters=int(bcfg.get("max_iters", 5)),
+        budget_ms=int(bcfg.get("budget_ms", 20000)),
+        history_turns=int(bcfg.get("history_turns", 6)),
+    )
 
     def notify(task_id: int, title: str):
         mem.add("reminder", f"#{task_id} {title}", tags="reminder")
@@ -150,8 +156,9 @@ async def lifespan(app: FastAPI):
         if kind == "read_file":
             path = t[len("read file "):].strip()
             return (t, {"reply": warm("read_file", {"path": path})})
-        if kind == "plan":
-            return (t, {"plan": brain.plan_dryrun(t).get("plan", [])})
+        # There is deliberately no "plan" branch any more. plan_dryrun returned a
+        # hardcoded list, so the ghost hint for arbitrary text was a fixed string
+        # dressed up as a prediction. Phase 4 puts a real prediction here.
         return None
 
     a = cfg.get("anticipation", {}) or {}
@@ -510,6 +517,19 @@ async def _dispatch(ws: WebSocket, name: str, kwargs: dict, actor: str = "user",
 
 async def _resolve_confirmation(ws: WebSocket, token: str, granted: bool):
     loop = asyncio.get_running_loop()
+
+    # A confirmation raised from inside the tool loop resumes that loop rather
+    # than just running the action, so the model gets to see how it was answered
+    # and finish its turn either way.
+    resume_token = _state.get("brain_resume", {}).pop(token, None)
+    if resume_token is not None:
+        brain: Brain = _state["brain"]
+        out = await loop.run_in_executor(
+            _executor, lambda: brain.resume(resume_token, granted, on_token=_token_sink(ws, loop))
+        )
+        await _send_brain_result(ws, out)
+        return
+
     res = await loop.run_in_executor(_executor, lambda: actions.confirm(token, granted=granted))
     mem: Memory = _state["mem"]
     if res.get("error"):
@@ -523,6 +543,34 @@ async def _resolve_confirmation(ws: WebSocket, token: str, granted: bool):
     await ws.send_json({"type": "reply", "text": text})
     await ws.send_json({"type": "status", "safe_mode": is_safe_mode(),
                         "tasks_count": len(mem.list_tasks(status="pending"))})
+
+
+def _token_sink(ws: WebSocket, loop):
+    """Forward model tokens to the HUD as they arrive.
+
+    With a tool loop a single turn can take several seconds per iteration, so
+    without this the user watches a still panel and assumes it has hung.
+    """
+    def sink(piece: str):
+        asyncio.run_coroutine_threadsafe(ws.send_json({"type": "token", "text": piece}), loop)
+    return sink
+
+
+async def _send_brain_result(ws: WebSocket, out: dict):
+    """Deliver a Brain result: a reply, or a confirmation that suspended it."""
+    if out.get("needs_confirmation"):
+        _state.setdefault("brain_resume", {})[out["confirm_token"]] = out["resume_token"]
+        await ws.send_json({
+            "type": "confirm_request",
+            "token": out["confirm_token"],
+            "capability": out["capability"],
+            "args": out.get("args", {}),
+            "reason": out.get("reason", ""),
+            "reversibility": out.get("reversibility", ""),
+            "summary": "",
+        })
+        return
+    await ws.send_json({"type": "reply", "text": out.get("reply", ""), "plan": out.get("plan", [])})
 
 
 def _summarise(res: dict) -> str:
@@ -567,8 +615,10 @@ async def _handle_command(ws: WebSocket, text: str):
         return
 
     if text == "/dream":
-        out = await loop.run_in_executor(_executor, lambda: brain.plan_dryrun("reflection"))
-        await ws.send_json({"type": "reply", "plan": out.get("plan", []), "text": ""})
+        await ws.send_json({"type": "reply", "text":
+                            "Consolidation is not implemented yet (Phase 6). "
+                            "It will cluster the episode log and promote recurring "
+                            "patterns into rules you can inspect with /rules."})
         return
 
     if text.startswith("/save "):
@@ -795,12 +845,9 @@ async def _handle_input(ws: WebSocket, text: str):
 
     await ws.send_json({"type": "thinking"})
     try:
-        out = await loop.run_in_executor(_executor, lambda: brain.step(text))
-        await ws.send_json({
-            "type": "reply",
-            "text": out.get("reply", ""),
-            "plan": out.get("plan", []),
-        })
+        sink = _token_sink(ws, loop)
+        out = await loop.run_in_executor(_executor, lambda: brain.step(text, on_token=sink))
+        await _send_brain_result(ws, out)
     except Exception as e:
         await ws.send_json({"type": "error", "text": f"LLM error: {e}"})
 

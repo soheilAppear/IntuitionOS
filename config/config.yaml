@@ -14,6 +14,13 @@ voice:
   model: base        # tiny (fastest) | base | small | medium (most accurate)
   language: en
 
+# Bounds on one tool-loop turn. A local 20B model on consumer hardware will
+# otherwise iterate for minutes; both limits are enforced, whichever hits first.
+brain:
+  max_iters: 5          # tool calls per turn
+  budget_ms: 20000      # wall clock per turn
+  history_turns: 6      # conversational turns carried into the prompt
+
 anticipation:
   enabled: true
   debounce_ms: 180

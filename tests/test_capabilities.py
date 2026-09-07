@@ -315,3 +315,19 @@ def test_os_reads_are_free_so_the_anticipator_may_prewarm_them():
     if c is None:
         pytest.skip("os sandbox unavailable on this platform")
     assert gate(c, {}, confidence=1.0, actor="anticipator").verdict == "allow"
+
+
+def test_the_checked_in_planner_schema_matches_the_manifest(tmp_path):
+    """config/planner_schema.json is generated, not written by hand. If this
+    fails, run: python -m core.gen_manifest"""
+    import json
+    from core.gen_manifest import generate
+
+    regenerated = tmp_path / "planner_schema.json"
+    generate(str(regenerated))
+    fresh = json.loads(regenerated.read_text(encoding="utf-8"))
+
+    with open("config/planner_schema.json", encoding="utf-8") as f:
+        checked_in = json.load(f)
+
+    assert checked_in["tools"] == fresh["tools"], "run: python -m core.gen_manifest"

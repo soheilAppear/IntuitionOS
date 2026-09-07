@@ -1,14 +1,761 @@
 {
-  "plan": [
-    "Keep steps short"
-  ],
+  "_generated_by": "python -m core.gen_manifest",
+  "_note": "Generated from core.capabilities. Do not edit by hand.",
   "tools": [
-    "read_file",
-    "write_file",
-    "list_dir",
-    "list_tree",
-    "hw_call",
-    "run_local",
-    "create_task"
+    {
+      "name": "complete_task",
+      "summary": "Mark a reminder done.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": true,
+      "est_cost_ms": 10
+    },
+    {
+      "name": "create_task",
+      "summary": "Schedule a reminder for a time given in plain language.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "when": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repeat": {
+            "type": "string"
+          },
+          "payload": {
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": true,
+      "est_cost_ms": 20
+    },
+    {
+      "name": "delete_task",
+      "summary": "Delete a reminder permanently.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "irreversible",
+      "requires_confirmation": true,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 10
+    },
+    {
+      "name": "hw_call",
+      "summary": "Invoke a declared action on a hardware device.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "device": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string"
+          },
+          "args": {
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "device",
+          "action"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 50
+    },
+    {
+      "name": "hw_list",
+      "summary": "List registered hardware devices.",
+      "args": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "free",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 1
+    },
+    {
+      "name": "hw_schema",
+      "summary": "Show the actions one hardware device declares.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "device": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "device"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "free",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 1
+    },
+    {
+      "name": "list_dir",
+      "summary": "List the entries of one directory.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "free",
+      "requires_confirmation": false,
+      "path_scope": "project",
+      "undoable": false,
+      "est_cost_ms": 5
+    },
+    {
+      "name": "list_tasks",
+      "summary": "List reminders by status.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "free",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 5
+    },
+    {
+      "name": "list_tree",
+      "summary": "List a directory recursively to a bounded depth.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "depth": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 6
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "free",
+      "requires_confirmation": false,
+      "path_scope": "project",
+      "undoable": false,
+      "est_cost_ms": 60
+    },
+    {
+      "name": "os_cancel_shutdown",
+      "summary": "Cancel a pending shutdown or restart.",
+      "args": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "free",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 50
+    },
+    {
+      "name": "os_click",
+      "summary": "Click the mouse.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "y": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "button": {
+            "enum": [
+              "left",
+              "right",
+              "middle"
+            ]
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "irreversible",
+      "requires_confirmation": true,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 100
+    },
+    {
+      "name": "os_get_battery",
+      "summary": "Read battery level and charge state.",
+      "args": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "free",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 20
+    },
+    {
+      "name": "os_get_brightness",
+      "summary": "Read display brightness.",
+      "args": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "free",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 200
+    },
+    {
+      "name": "os_get_clipboard",
+      "summary": "Read the clipboard.",
+      "args": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "free",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 300
+    },
+    {
+      "name": "os_get_network_info",
+      "summary": "Report interfaces and Wi-Fi SSID.",
+      "args": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "free",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 400
+    },
+    {
+      "name": "os_get_volume",
+      "summary": "Read the current master volume.",
+      "args": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "free",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 80
+    },
+    {
+      "name": "os_kill_process",
+      "summary": "Terminate a process by name.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "irreversible",
+      "requires_confirmation": true,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 200
+    },
+    {
+      "name": "os_list_processes",
+      "summary": "List running processes.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "filter_name": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "free",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 300
+    },
+    {
+      "name": "os_list_windows",
+      "summary": "List visible window titles.",
+      "args": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "free",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 600
+    },
+    {
+      "name": "os_lock_screen",
+      "summary": "Lock the screen.",
+      "args": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 100
+    },
+    {
+      "name": "os_move_mouse",
+      "summary": "Move the mouse pointer.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "integer"
+          },
+          "y": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "irreversible",
+      "requires_confirmation": true,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 100
+    },
+    {
+      "name": "os_open_app",
+      "summary": "Launch an application by name.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 800
+    },
+    {
+      "name": "os_restart_computer",
+      "summary": "Restart the computer.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "delay_sec": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3600
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "irreversible",
+      "requires_confirmation": true,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 100
+    },
+    {
+      "name": "os_set_brightness",
+      "summary": "Set display brightness 0-100.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "level": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          }
+        },
+        "required": [
+          "level"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": true,
+      "est_cost_ms": 400
+    },
+    {
+      "name": "os_set_clipboard",
+      "summary": "Replace the clipboard contents.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 100000
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": true,
+      "est_cost_ms": 300
+    },
+    {
+      "name": "os_set_volume",
+      "summary": "Set master volume 0-100.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "level": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          }
+        },
+        "required": [
+          "level"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": true,
+      "est_cost_ms": 400
+    },
+    {
+      "name": "os_shutdown_computer",
+      "summary": "Shut the computer down.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "delay_sec": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3600
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "irreversible",
+      "requires_confirmation": true,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 100
+    },
+    {
+      "name": "os_sleep_computer",
+      "summary": "Put the computer to sleep.",
+      "args": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": true,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 100
+    },
+    {
+      "name": "os_system_info",
+      "summary": "Report OS, RAM, disk and uptime.",
+      "args": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "free",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 120
+    },
+    {
+      "name": "os_take_screenshot",
+      "summary": "Capture the screen to data/screenshots.",
+      "args": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": true,
+      "est_cost_ms": 900
+    },
+    {
+      "name": "os_toggle_wifi",
+      "summary": "Enable or disable the Wi-Fi adapter.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "enum": [
+              "on",
+              "off"
+            ]
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": true,
+      "path_scope": null,
+      "undoable": true,
+      "est_cost_ms": 2000
+    },
+    {
+      "name": "os_type_text",
+      "summary": "Type text as synthetic keystrokes.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 4000
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "irreversible",
+      "requires_confirmation": true,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 500
+    },
+    {
+      "name": "read_file",
+      "summary": "Read a UTF-8 text file and return its contents.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "free",
+      "requires_confirmation": false,
+      "path_scope": "project",
+      "undoable": false,
+      "est_cost_ms": 10
+    },
+    {
+      "name": "run_local",
+      "summary": "Run a shell command inside the project directory.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "cmd": {
+            "type": "string",
+            "minLength": 1
+          },
+          "cwd": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "cmd"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "irreversible",
+      "requires_confirmation": true,
+      "path_scope": "project",
+      "undoable": false,
+      "est_cost_ms": 500
+    },
+    {
+      "name": "snooze_task",
+      "summary": "Push a reminder later by 15m, 2h or 1d.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "integer"
+          },
+          "delta": {
+            "type": "string",
+            "pattern": "^\\d+[mhd]?$"
+          }
+        },
+        "required": [
+          "task_id",
+          "delta"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": true,
+      "est_cost_ms": 10
+    },
+    {
+      "name": "write_file",
+      "summary": "Overwrite a file with new text. Undoable from the journal.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 1000000
+          }
+        },
+        "required": [
+          "path",
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": "project",
+      "undoable": true,
+      "est_cost_ms": 15
+    }
   ]
 }

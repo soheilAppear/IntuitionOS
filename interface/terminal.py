@@ -113,7 +113,11 @@ def bootstrap():
     set_thresholds(cfg.get('thresholds'))
 
     llm=LLMClient(cfg.get('backend','ollama'), cfg.get('model','gpt-oss:20b'), cfg.get('temperature',0.2), cfg.get('max_tokens',600))
-    brain=Brain(llm, mem, sys_prompt, schema, logger=logger)
+    bcfg=cfg.get('brain',{}) or {}
+    brain=Brain(llm, mem, sys_prompt, schema, logger=logger,
+                max_iters=int(bcfg.get('max_iters',5)),
+                budget_ms=int(bcfg.get('budget_ms',20000)),
+                history_turns=int(bcfg.get('history_turns',6)))
 
     def notify(task_id:int, title:str):
         rprint(Panel.fit(f'Remind #{task_id}: {title}', title='Reminder'))
@@ -181,9 +185,8 @@ def make_anticipator(brain, cfg):
         if kind=='read_file':
             path=t[len('read file '):].strip()
             return (t, {'reply': warm('read_file', {'path': path})})
-        if kind=='plan':
-            plan=brain.plan_dryrun(t)
-            return (t, {'plan': plan.get('plan', [])})
+        # No 'plan' branch any more: plan_dryrun returned a hardcoded list, so
+        # the hint for arbitrary text was a fixed string dressed as a prediction.
         return None
 
     a=cfg.get('anticipation',{}) or {}
@@ -259,7 +262,9 @@ def main():
                 rprint(f'[{role}] {text}')
             continue
         if user=='/dream':
-            rprint(brain.plan_dryrun("reflection")); continue
+            rprint('Consolidation is not implemented yet (Phase 6). It will cluster '
+                   'the episode log and promote recurring patterns into rules.')
+            continue
         if user.startswith('/save '):
             note=user[6:].strip().strip('"')
             mem.add('note', note, tags='note'); rprint('saved.'); continue
@@ -387,8 +392,19 @@ def main():
             mem.add('assistant', pre.get('reply',''))
             continue
 
-        # Default to LLM brain
+        # Default to LLM brain — a real propose/validate/execute/observe loop.
         out = brain.step(user)
+        while out.get('needs_confirmation'):
+            detail=' '.join(f'{k}={v}' for k,v in (out.get('args') or {}).items())
+            title='CANNOT BE UNDONE' if out.get('reversibility')=='irreversible' else 'Confirm'
+            rprint(Panel.fit(f"{out['capability']}  {detail}" + chr(10) + f"{out.get('reason','')}",
+                             title=title,
+                             border_style='red' if out.get('reversibility')=='irreversible' else 'yellow'))
+            try:
+                answer=input('proceed? [y/N] ').strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer='n'
+            out = brain.resume(out['resume_token'], granted=answer in ('y','yes'))
         plan = out.get('plan') or []
         if isinstance(plan,str):
             plan_lines=[plan]
