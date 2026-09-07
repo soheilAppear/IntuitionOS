@@ -261,14 +261,16 @@ def run_main(monkeypatch, memory, inputs, resolver):
     monkeypatch.setattr(terminal, 'ContextSensor', lambda **kw: sensor)
     brain = SimpleNamespace(step=lambda *a, **kw: pytest.fail('recognized commands reached the LLM'))
     cfg = {'anticipation': {'enabled': False}}
-    scheduler = SimpleNamespace(stop=lambda: None)
+    stopped = []
+    scheduler = SimpleNamespace(stop=lambda: stopped.append('scheduler'))
     monkeypatch.setattr(terminal, 'bootstrap', lambda: (
         cfg, brain, memory, scheduler, episodes, sensor, predictor,
         RuleStore(memory), CalibrationStore(memory),
     ))
     monkeypatch.setattr(terminal, 'create_default_resolver', lambda *a, **kw: resolver)
     monkeypatch.setattr(terminal, 'make_anticipator', lambda *a, **kw: SimpleNamespace(
-        update_buffer=lambda text: None, stop=lambda: None, try_serve=lambda text: None,
+        update_buffer=lambda text: None, stop=lambda: stopped.append('anticipator'),
+        try_serve=lambda text: None,
     ))
     monkeypatch.setattr(terminal, 'rprint', lambda *a, **kw: None)
     failures = []
@@ -308,6 +310,8 @@ def run_main(monkeypatch, memory, inputs, resolver):
         monkeypatch.setattr(terminal, 'CorrectionPrompt', ScriptedPrompt)
         terminal.main()
     assert failures == []
+    assert 'scheduler' in stopped
+    assert 'anticipator' in stopped
     return episodes, predictor
 
 

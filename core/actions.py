@@ -405,8 +405,33 @@ def delete_task(task_id: int):
 
 def snooze_task(task_id: int, delta: str):
     # Parse short form like 15m 2h 1d into seconds
-    _memory.snooze_task(task_id, _delta_seconds(delta))
+    seconds = _delta_seconds(delta)
+    if seconds <= 0:
+        return {"error": "snooze duration must be greater than zero"}
+    if not _memory.snooze_task(task_id, seconds):
+        return {"error": f"no task {task_id}"}
     return {"ok": True}
+
+
+def _capture_snooze(args):
+    task = _memory.get_task(args["task_id"])
+    if task is None:
+        raise ValueError(f"no task {args['task_id']}")
+    return {"task_id": task["id"], "due": task["due"], "status": task["status"]}
+
+
+def _undo_snooze(payload):
+    task_id = payload["task_id"]
+    task = _memory.get_task(task_id)
+    if task is None:
+        raise ValueError(f"no task {task_id}")
+    # Journals from before exact schedule capture stored only the delta.
+    due = payload.get("due")
+    if due is None:
+        due = task["due"] - _delta_seconds(payload["delta"])
+    if not _memory.restore_task_schedule(task_id, due, payload.get("status", task["status"])):
+        raise ValueError(f"no task {task_id}")
+    return {"unsnoozed_task": task_id}
 
 
 def _delta_seconds(delta: str) -> int:
@@ -734,11 +759,8 @@ _cap(
     10,
     False,
     "Push a reminder later by 15m, 2h or 1d.",
-    capture_undo=lambda args: {"task_id": args["task_id"], "delta": args["delta"]},
-    undo=lambda p: (
-        _memory.snooze_task(p["task_id"], -_delta_seconds(p["delta"])),
-        {"unsnoozed_task": p["task_id"]},
-    )[1],
+    capture_undo=_capture_snooze,
+    undo=_undo_snooze,
 )
 
 _cap(

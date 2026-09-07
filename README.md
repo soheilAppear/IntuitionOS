@@ -21,6 +21,9 @@ then the [command-resolution API and protocol](docs/command-resolution.md) and
 contains test feedback, evaluation results, and the HUD showcase.
 The [HUD recovery report](docs/2026-09-07-hud-recovery.md) covers launcher,
 connection, and microphone fixes with live verification.
+The [branch consolidation report](docs/2026-09-07-main-consolidation.md) records
+the merge into `main` and subsequent bug fixes. The original 2025 prototype is
+preserved in the [historical archive](archive/README.md).
 
 ---
 

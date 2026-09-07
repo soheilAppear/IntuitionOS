@@ -22,6 +22,9 @@ from pathlib import Path
 
 _cache = {}
 _lock = threading.RLock()
+# Cold scans on Windows images with many installed modules exceed 15 seconds.
+# Keep a finite setup budget; this does not increase any action's run timeout.
+POWERSHELL_DISCOVERY_TIMEOUT = 120
 # Catalog names can include PowerShell's built-in `%`, `?` and `cd~` forms.
 _NAME = re.compile(r"^[%~\w?.:/\\-]+$")
 
@@ -71,6 +74,8 @@ def load_shell_catalog(shell=None):
     if Path(path).stat().st_size > 8_000_000:
         raise ValueError("Shell catalog exceeds 8 MB")
     data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    if not isinstance(data, dict):
+        raise ValueError("Shell catalog must be a JSON object")
     if data.get("shell") != shell:
         raise ValueError("Shell catalog belongs to a different execution shell")
     entries = data.get("commands", [])
@@ -133,7 +138,8 @@ def _ps_argv(script, shell):
 def discover_powershell_commands(shell=None):
     """Return name/kind/source metadata from the configured PowerShell environment.
 
-    The process-local cache keys on shell, snapshot path/mtime and PATH. The lock
+    The process-local cache keys on shell, snapshot path/mtime, PATH, PATHEXT,
+    and PSModulePath. The lock
     serializes cold scans; switching keys discards the previous catalog. Setup
     failures propagate so callers cannot silently miss aliases that shadow PATH.
     Non-PowerShell shells return an empty list.
@@ -144,7 +150,8 @@ def discover_powershell_commands(shell=None):
     load_shell_catalog(shell)  # validate before PowerShell loads definitions
     path = os.environ.get("INTUITION_SHELL_CATALOG", "")
     stamp = Path(path).stat().st_mtime_ns if path else 0
-    key = (shell, path, stamp, os.environ.get("PATH", ""))
+    key = (shell, path, stamp, os.environ.get("PATH", ""),
+           os.environ.get("PSModulePath", ""), os.environ.get("PATHEXT", ""))
     with _lock:
         if key in _cache:
             return list(_cache[key])
@@ -157,15 +164,22 @@ $metadata = @(Microsoft.PowerShell.Core\Get-Command -All | Microsoft.PowerShell.
 [Console]::WriteLine((Microsoft.PowerShell.Utility\ConvertTo-Json -InputObject $metadata -Compress))
 """
         )
-        result = subprocess.run(
-            _ps_argv(script, shell),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        try:
+            result = subprocess.run(
+                _ps_argv(script, shell),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=POWERSHELL_DISCOVERY_TIMEOUT,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ValueError(
+                "PowerShell command discovery timed out after "
+                f"{POWERSHELL_DISCOVERY_TIMEOUT} seconds. Check the selected shell's "
+                "PSModulePath for slow or unavailable module locations, then retry."
+            ) from error
         if result.returncode:
             raise ValueError(
                 "PowerShell command discovery failed: " + result.stderr[:300]

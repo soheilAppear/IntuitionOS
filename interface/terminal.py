@@ -12,6 +12,7 @@ prediction state when the user exits normally.
 import json
 import re
 import time
+from contextlib import ExitStack
 
 import yaml
 from rich import print as rprint
@@ -524,10 +525,18 @@ def make_anticipator(brain, cfg, predictor=None, sensor=None):
 
 
 def main():
+    """Run the REPL and always stop its current workers on exit or failure."""
+    with ExitStack() as cleanup:
+        _run_terminal(cleanup)
+
+
+def _run_terminal(cleanup):
     """Run the terminal, keeping raw execution text separate from learning data."""
     cfg, brain, mem, sched, episodes, sensor, predictor, rules, calib_store = (
         bootstrap()
     )
+    # Closures read the current services after /reload and /forget replacements.
+    cleanup.callback(lambda: sched.stop())
     window = PredictionWindow()
     # Print banner
     rprint(
@@ -544,6 +553,7 @@ def main():
     ant = make_anticipator(brain, cfg, predictor=predictor, sensor=sensor)
     # The buffer hook outlives worker replacements on both /reload and /forget.
     _ant_ref = [ant]
+    cleanup.callback(lambda: _ant_ref[0].stop())
 
     def _on_text(buf):
         _ant_ref[0].update_buffer(buf.text)

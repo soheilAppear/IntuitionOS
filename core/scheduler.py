@@ -18,6 +18,7 @@ and `execute_cb` ran a stored payload with no gate at all.
 """
 
 import json
+import math
 import threading
 import time
 from datetime import datetime, timezone as dt_timezone
@@ -50,7 +51,7 @@ class Scheduler:
         # External memory will be assigned by set_scheduler
         self.memory = None
         # Start thread
-        self._stop = False
+        self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="scheduler", daemon=True)
         self._thread.start()
 
@@ -128,14 +129,16 @@ class Scheduler:
 
     @staticmethod
     def repeat_seconds(repeat: str):
+        if not isinstance(repeat, str):
+            return None
         return _REPEATS.get((repeat or "").strip().lower())
 
     # ── The loop ─────────────────────────────────────────────────────────
 
     def _run(self):
-        while not self._stop:
+        while not self._stop.is_set():
             self.tick_safely()
-            time.sleep(self.tick_seconds)
+            self._stop.wait(self.tick_seconds)
 
     def tick_safely(self) -> bool:
         """One tick, with failures logged rather than swallowed.
@@ -161,33 +164,33 @@ class Scheduler:
     def _fire(self, task):
         task_id = task["id"]
         try:
-            self.notify_cb(task_id, task["title"])
-        except Exception as e:
-            self.log(f"scheduler: notify failed for task {task_id}: {e}")
-
-        try:
             payload = json.loads(task["payload"] or "{}")
         except Exception:
             payload = {}
+        if not isinstance(payload, dict):
+            self.log(f"scheduler: ignoring non-object payload for task {task_id}")
+            payload = {}
 
         repeat = payload.pop("_repeat", None)
-        if payload:
-            self._execute(task_id, payload)
-
         interval = self.repeat_seconds(repeat) if repeat else None
+        now = time.time()
+        next_due = None
         if interval:
-            # Reschedule rather than complete. Stepping from the due time rather
-            # than from now keeps a daily reminder on its hour instead of
-            # drifting later by however long the tick took to notice it.
-            self.memory.snooze_task(task_id, interval)
-            self.memory.set_task_status(task_id, "pending")
+            # Skip missed intervals in one step, preserving the original cadence
+            # without replaying a backlog of notifications or action payloads.
+            elapsed = max(0, math.floor((now - task["due"]) / interval))
+            next_due = task["due"] + (elapsed + 1) * interval
+        if not self.memory.claim_due_task(task_id, task["due"], now, next_due):
             return
 
-        # Appendix A: a task used to be marked 'done' the moment it fired, so a
-        # notification the user never saw — app closed, machine asleep — was
-        # indistinguishable from one they acted on. 'fired' says what actually
-        # happened; the user still completes it themselves.
-        self.memory.set_task_status(task_id, "fired")
+        # Claim before callbacks: another app cannot deliver the same occurrence,
+        # and completion/snooze from a callback is not overwritten afterward.
+        try:
+            self.notify_cb(task_id, task["title"])
+        except Exception as e:
+            self.log(f"scheduler: notify failed for task {task_id}: {e}")
+        if payload:
+            self._execute(task_id, payload)
 
     def _execute(self, task_id: int, payload: dict):
         """Run a scheduled payload through the gate.
@@ -224,4 +227,6 @@ class Scheduler:
             self.log(f"scheduler: execute callback failed for {name!r}: {e}")
 
     def stop(self):
-        self._stop = True
+        self._stop.set()
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=5)

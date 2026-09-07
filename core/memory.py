@@ -191,19 +191,44 @@ class Memory:
         self.execute("DELETE FROM tasks WHERE id=?", (task_id,))
 
     def snooze_task(self, task_id: int, delta_seconds: int):
-        """Shift a task's due timestamp; a missing task is a no-op."""
-        rows = self.query("SELECT due_ts FROM tasks WHERE id=?", (task_id,))
-        if not rows:
-            return
-        self.execute(
-            "UPDATE tasks SET due_ts=? WHERE id=?",
-            (rows[0][0] + delta_seconds, task_id),
-        )
+        """Reactivate a reminder, delaying from now or its future due time.
+
+        Update in one statement so a scheduler cannot claim a partially changed
+        task. Recurrence advancement uses claim_due_task instead of this API.
+        """
+        return self.execute(
+            "UPDATE tasks SET due_ts=MAX(due_ts, ?)+?, status='pending' WHERE id=?",
+            (time.time(), delta_seconds, task_id),
+        ).rowcount == 1
+
+    def restore_task_schedule(self, task_id: int, due_ts: float, status: str):
+        """Restore exact snooze undo state without calculating from the clock."""
+        return self.execute(
+            "UPDATE tasks SET due_ts=?, status=? WHERE id=?",
+            (due_ts, status, task_id),
+        ).rowcount == 1
+
+    def claim_due_task(self, task_id: int, expected_due: float, now_ts: float,
+                       next_due: float = None):
+        """Atomically consume one pending occurrence across SQLite connections.
+
+        Advance repeats or mark one-offs fired before notifying. A crash after
+        this update may miss a notification, but cannot replay a payload; fired
+        one-offs remain visible until the user completes them.
+        """
+        return self.execute(
+            "UPDATE tasks SET status=?, due_ts=?"
+            " WHERE id=? AND status='pending' AND due_ts=? AND due_ts<=?",
+            ("pending" if next_due is not None else "fired",
+             next_due if next_due is not None else expected_due,
+             task_id, expected_due, now_ts),
+        ).rowcount == 1
 
     def due_tasks(self, now_ts: float):
-        """Return pending task IDs, titles and payloads due at the given epoch."""
+        """Return pending occurrences, including the due time used to claim them."""
         rows = self.query(
-            "SELECT id, title, payload FROM tasks WHERE status='pending' AND due_ts<=?",
+            "SELECT id, title, payload, due_ts FROM tasks WHERE status='pending' AND due_ts<=?"
+            " ORDER BY due_ts, id",
             (now_ts,),
         )
-        return [{"id": r[0], "title": r[1], "payload": r[2]} for r in rows]
+        return [{"id": r[0], "title": r[1], "payload": r[2], "due": r[3]} for r in rows]

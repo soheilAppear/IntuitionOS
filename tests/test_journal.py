@@ -171,7 +171,8 @@ def test_completing_a_task_can_be_undone(project, wired):
     assert mem.get_task(tid)["status"] == "pending"
 
 
-def test_snoozing_a_task_can_be_undone(project, wired):
+def test_snoozing_a_task_can_be_undone(project, wired, monkeypatch):
+    monkeypatch.setattr("core.memory.time.time", lambda: 500.0)
     acts, _journal, mem = wired
     tid = mem.create_task("standup", due_ts=1000.0)
 

@@ -1,0 +1,2 @@
+# Preserve the archived prototype byte-for-byte, including historical whitespace.
+archive/prototype-2025/** -text -whitespace

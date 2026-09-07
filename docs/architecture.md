@@ -55,9 +55,9 @@ The terminal is a complete Python process; it does not connect to the HUD
 backend. Running both creates separate runtime objects, even if their configured
 SQLite path is the same. Safe Mode and pending approvals are process-local.
 The HUD backend binds to `127.0.0.1:7432`; only one backend can bind that address.
-Each process also starts a scheduler. Run one interface at a time against a
-shared database to avoid duplicate reminder delivery: due tasks are not claimed
-atomically across processes.
+Each process also starts a scheduler. A conditional SQLite update claims each
+due occurrence before delivery, so processes sharing a database cannot deliver
+the same reminder occurrence twice.
 
 | Component | Source | Responsibility |
 |---|---|---|
@@ -162,9 +162,13 @@ command are different observations.
 **Reminders.** Both bootstraps install a scheduler and the same `Memory` instance
 used by actions. The binding helpers support either initialization order.
 Natural-language time is interpreted in the configured timezone and stored as
-a UTC epoch. A worker polls due tasks, notifies the interface, and marks one-off
-reminders `fired`; the user marks them done. Repeating reminders advance from the
-previous due time. Stored action payloads dispatch as `actor="scheduler"`;
+a UTC epoch. A worker claims due tasks and marks one-offs `fired` before notifying
+the interface; the user marks them done. Repeating reminders advance from the
+previous due time, skipping missed intervals to the next future occurrence.
+Snoozing reactivates a reminder and delays from now or its later due time; undo
+restores its exact earlier due time and status. Delivery is at most once per
+occurrence: a crash after claiming may miss a notification, while a fired
+one-off remains in the open task list. Stored payloads dispatch as `actor="scheduler"`;
 irreversible payloads are denied and actions requiring confirmation are not run
 unattended. The app must be running to deliver reminders.
 
