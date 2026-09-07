@@ -179,11 +179,22 @@ function onAnticipation(msg) {
   if (msg.text !== cmdInput.value.trim()) return;
   hud.classList.remove('anticipating');
   const d = msg.data || {};
-  if (d.plan && d.plan.length) {
-    ghostHint.textContent = '→ ' + d.plan[0];
-  } else if (d.reply) {
-    ghostHint.textContent = d.reply.slice(0, 62) + (d.reply.length > 62 ? '…' : '');
+
+  // The predicted action is the hint now. Previously the ghost showed a preview
+  // of a precomputed result, which meant a prediction with nothing cheap to
+  // precompute could not be shown at all.
+  let hint = '';
+  if (d.reply) {
+    hint = d.reply.slice(0, 62) + (d.reply.length > 62 ? '…' : '');
+  } else if (d.action) {
+    hint = d.action;
+  } else if (d.plan && d.plan.length) {
+    hint = d.plan[0];
   }
+  if (!hint) return;
+
+  ghostHint.textContent = '→ ' + hint;
+  ghostHint.title = d.why || '';
 }
 
 function onMemory(rows) {

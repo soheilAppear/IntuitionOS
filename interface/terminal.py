@@ -15,7 +15,8 @@ from core.actions import (
 )
 from core.capabilities import capabilities
 from core.context import ContextSensor
-from core.episodes import EpisodeLog, PredictionWindow
+from core.episodes import Episode, EpisodeLog, PredictionWindow
+from core.predictor import Predictor, PredictorStore
 from core.scheduler import Scheduler
 from core.anticipator import Anticipator
 from plugins.led_strip import LEDStrip
@@ -163,57 +164,56 @@ def bootstrap():
     episodes = EpisodeLog(mem, enabled=bool(ecfg.get('enabled', True)))
     sensor = ContextSensor(journal=get_journal())
 
-    return cfg, brain, mem, sched, episodes, sensor
+    pcfg = cfg.get('prediction', {}) or {}
+    predictor = Predictor(store=PredictorStore(mem),
+                          half_life_s=float(pcfg.get('half_life_s', 7*24*3600)),
+                          min_episodes=int(pcfg.get('min_episodes', 50)))
+    if predictor.seen == 0:
+        # No saved state: relearn from the log rather than starting cold.
+        predictor.fit(episodes.recent(limit=int(pcfg.get('replay_limit', 5000))))
 
-def make_anticipator(brain, cfg):
-    # Predictor decides what to warm
-    def predict(buf:str):
-        t=buf.strip()
-        if not t:
-            return {'confidence':0.0}
-        if t=='tree' or t.startswith('tree '):
-            return {'intent':'tree','text':t,'confidence':0.9}
-        if t=='ls':
-            return {'intent':'ls','text':t,'confidence':0.9}
-        if t.startswith('read file '):
-            return {'intent':'read_file','text':t,'confidence':0.85}
-        return {'intent':'plan','text':t,'confidence':0.65}
+    return cfg, brain, mem, sched, episodes, sensor, predictor
 
-    # Prewarm runs the action quietly, as the anticipator rather than as the
-    # user — which is what confines it to free capabilities.
-    def prewarm(intent:dict):
-        t=intent.get('text','')
-        kind=intent.get('intent')
-        conf=float(intent.get('confidence', 0.0))
+def make_anticipator(brain, cfg, predictor=None, sensor=None):
+    # What to warm now comes from the predictor rather than from four literals
+    # that had never been compared to anything.
+    def prewarm(prediction):
+        # Speculative work runs as the anticipator, never as the user — that
+        # actor is what confines it to free capabilities.
+        text=prediction.action
+        conf=prediction.confidence
 
         def warm(name, args):
             return str(actions.dispatch(name, args, actor='anticipator', confidence=conf))[:4000]
 
-        if kind=='tree':
-            return (t, {'reply': warm('list_tree', {'path': '.'})})
-        if kind=='ls':
-            return (t, {'reply': warm('list_dir', {'path': '.'})})
-        if kind=='read_file':
+        t=text.strip()
+        common={'confidence': conf, 'why': prediction.why, 'action': text}
+        if t=='tree' or t.startswith('tree '):
+            return (text, dict(common, reply=warm('list_tree', {'path': '.'})))
+        if t=='ls':
+            return (text, dict(common, reply=warm('list_dir', {'path': '.'})))
+        if t.startswith('read file '):
             path=t[len('read file '):].strip()
-            return (t, {'reply': warm('read_file', {'path': path})})
-        # No 'plan' branch any more: plan_dryrun returned a hardcoded list, so
-        # the hint for arbitrary text was a fixed string dressed as a prediction.
-        return None
+            return (text, dict(common, reply=warm('read_file', {'path': path})))
+        # Nothing cheap to precompute, but the prediction itself still has value.
+        return (text, common)
 
     a=cfg.get('anticipation',{}) or {}
     ant = Anticipator(
-        predict_fn=predict,
         prewarm_fn=prewarm,
+        predictor=predictor,
+        context_fn=(lambda: sensor.snapshot()) if sensor else None,
         enabled=bool(a.get('enabled',True)),
         debounce_ms=int(a.get('debounce_ms',180)),
-        match_threshold=float(a.get('match_threshold',0.6))
+        match_threshold=float(a.get('match_threshold',0.6)),
+        thresholds=cfg.get('thresholds'),
     )
     ant.start()
     return ant
 
 def main():
     # Bootstrap everything
-    cfg, brain, mem, sched, episodes, sensor = bootstrap()
+    cfg, brain, mem, sched, episodes, sensor, predictor = bootstrap()
     window = PredictionWindow()
     # Print banner
     rprint(Panel.fit('IntuitionOS v1.0 - sandboxed exec + anticipator + fuzzy commands - type /help', title='IntuitionOS'))
@@ -221,7 +221,7 @@ def main():
     # Create prompt session
     session=PromptSession('> ')
     # Make anticipator
-    ant=make_anticipator(brain, cfg)
+    ant=make_anticipator(brain, cfg, predictor=predictor, sensor=sensor)
     # _ant_ref lets /reload swap the anticipator without losing the buffer hook
     _ant_ref = [ant]
     def _on_text(buf):
@@ -235,6 +235,10 @@ def main():
         try:
             user=session.prompt('io> ').strip()
         except (EOFError, KeyboardInterrupt):
+            try:
+                predictor.save()
+            except Exception:
+                pass
             rprint('\nbye.')
             break
 
@@ -246,8 +250,13 @@ def main():
         # no ghost-hint surface, so accepted_prediction stays NULL here — it is
         # the HUD that can show a hint and therefore have one ignored.
         _signals = window.take(user)
-        _episode_id = episodes.record(user, sensor.snapshot(), **_signals)
+        _ctx = sensor.snapshot()
+        _episode_id = episodes.record(user, _ctx, **_signals)
         sensor.note_submission(user)
+        # This submission is the ground truth for whatever was predicted a moment
+        # ago, including the times the prediction was wrong.
+        predictor.update(Episode(ts=time.time(), action=user, context=_ctx,
+                                 keystroke_prefix=_signals.get('keystroke_prefix') or user))
 
         # Fuzzy only the first token for slash commands
         if user.startswith('/'):
@@ -260,6 +269,10 @@ def main():
 
         # Built-ins
         if user=='/exit':
+            try:
+                predictor.save()
+            except Exception:
+                pass
             rprint('bye.')
             break
         if user=='/help':
@@ -269,9 +282,9 @@ def main():
         if user=='/reload':
             try:
                 sched.stop()
-                cfg, brain, mem, sched, episodes, sensor = bootstrap()
+                cfg, brain, mem, sched, episodes, sensor, predictor = bootstrap()
                 _ant_ref[0].stop()
-                ant = make_anticipator(brain, cfg)
+                ant = make_anticipator(brain, cfg, predictor=predictor, sensor=sensor)
                 _ant_ref[0] = ant
                 rprint({'result': 'reloaded'})
             except Exception as e:

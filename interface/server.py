@@ -5,6 +5,7 @@ import json
 import os
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
@@ -29,6 +30,7 @@ from core.brain import Brain
 from core.capabilities import capabilities, is_safe_mode
 from core.context import ContextSensor
 from core.episodes import EpisodeLog, PredictionWindow
+from core.predictor import Predictor, PredictorStore
 from core.logger import make_logger
 from core.llm import LLMClient
 from core.memory import Memory
@@ -132,48 +134,61 @@ async def lifespan(app: FastAPI):
             from core.actions import register_driver
             register_driver(CPUInfo())
 
-    def predict(buf: str):
-        t = buf.strip()
-        if not t:
-            return {"confidence": 0.0}
-        if t == "tree" or t.startswith("tree "):
-            return {"intent": "tree", "text": t, "confidence": 0.9}
-        if t == "ls":
-            return {"intent": "ls", "text": t, "confidence": 0.9}
-        if t.startswith("read file "):
-            return {"intent": "read_file", "text": t, "confidence": 0.85}
-        return {"intent": "plan", "text": t, "confidence": 0.65}
+    # ── Prediction ───────────────────────────────────────────────────────
+    # The four literals that used to live here (0.9, 0.9, 0.85, 0.65) were never
+    # compared to anything, so they could not be wrong. The predictor learns from
+    # the episode log and falls back to exactly those heuristics until it has
+    # seen enough to do better.
+    ecfg = cfg.get("episodes", {}) or {}
+    episodes = EpisodeLog(mem, enabled=bool(ecfg.get("enabled", True)))
+    sensor = ContextSensor(journal=get_journal())
 
-    def prewarm(intent: dict):
-        # Speculative work runs as the anticipator, never as the user. That actor
-        # is what confines it to free capabilities: it is guessing at something
-        # the user has not submitted and may never submit.
-        t = intent.get("text", "")
-        kind = intent.get("intent")
-        conf = float(intent.get("confidence", 0.0))
+    pcfg = cfg.get("prediction", {}) or {}
+    predictor = Predictor(
+        store=PredictorStore(mem),
+        half_life_s=float(pcfg.get("half_life_s", 7 * 24 * 3600)),
+        min_episodes=int(pcfg.get("min_episodes", 50)),
+    )
+    if predictor.seen == 0:
+        # No saved state: relearn from the log rather than starting cold.
+        predictor.fit(episodes.recent(limit=int(pcfg.get("replay_limit", 5000))))
+
+    def prewarm(prediction):
+        """Run the predicted action speculatively, as the anticipator.
+
+        That actor is what confines this to free capabilities: it is guessing at
+        something the user has not submitted and may never submit.
+        """
+        text = prediction.action
+        conf = prediction.confidence
 
         def warm(name, args):
             return str(actions.dispatch(name, args, actor="anticipator", confidence=conf))[:4000]
 
-        if kind == "tree":
-            return (t, {"reply": warm("list_tree", {"path": "."})})
-        if kind == "ls":
-            return (t, {"reply": warm("list_dir", {"path": "."})})
-        if kind == "read_file":
+        t = text.strip()
+        if t == "tree" or t.startswith("tree "):
+            return (text, {"reply": warm("list_tree", {"path": "."}), "confidence": conf,
+                           "why": prediction.why, "action": text})
+        if t == "ls":
+            return (text, {"reply": warm("list_dir", {"path": "."}), "confidence": conf,
+                           "why": prediction.why, "action": text})
+        if t.startswith("read file "):
             path = t[len("read file "):].strip()
-            return (t, {"reply": warm("read_file", {"path": path})})
-        # There is deliberately no "plan" branch any more. plan_dryrun returned a
-        # hardcoded list, so the ghost hint for arbitrary text was a fixed string
-        # dressed up as a prediction. Phase 4 puts a real prediction here.
-        return None
+            return (text, {"reply": warm("read_file", {"path": path}), "confidence": conf,
+                           "why": prediction.why, "action": text})
+        # Anything else is still worth predicting even though there is nothing
+        # cheap to precompute: the hint alone has value.
+        return (text, {"confidence": conf, "why": prediction.why, "action": text})
 
     a = cfg.get("anticipation", {}) or {}
     ant = Anticipator(
-        predict_fn=predict,
         prewarm_fn=prewarm,
+        predictor=predictor,
+        context_fn=lambda: sensor.snapshot(),
         enabled=bool(a.get("enabled", True)),
         debounce_ms=int(a.get("debounce_ms", 180)),
         match_threshold=float(a.get("match_threshold", 0.6)),
+        thresholds=cfg.get("thresholds"),
     )
     ant.start()
 
@@ -196,17 +211,9 @@ async def lifespan(app: FastAPI):
         except Exception:
             voice = None
 
-    # ── Episode log ──────────────────────────────────────────────────────
-    # Every submitted input is recorded, whether or not the user asks — that is
-    # the involuntary encoding /save lacks. It is disclosed in the README and
-    # switchable here, because silently recording what somebody types is not
-    # something to do without an off switch.
-    ecfg = cfg.get("episodes", {}) or {}
-    episodes = EpisodeLog(mem, enabled=bool(ecfg.get("enabled", True)))
-    sensor = ContextSensor(journal=get_journal())
-
     _state.update({"cfg": cfg, "brain": brain, "mem": mem, "sched": sched, "ant": ant,
-                   "voice": voice, "episodes": episodes, "sensor": sensor})
+                   "voice": voice, "episodes": episodes, "sensor": sensor,
+                   "predictor": predictor})
 
     # Pre-load Whisper model in background so first voice use is instant
     if voice:
@@ -220,6 +227,10 @@ async def lifespan(app: FastAPI):
     yield
 
     ant.stop()
+    try:
+        predictor.save()
+    except Exception:
+        logger("could not save predictor state")
     try:
         sched.stop()
     except Exception:
@@ -833,6 +844,22 @@ async def _handle_input(ws: WebSocket, text: str):
             episodes.set_capability(episode_id, note["capability"])
         episodes.set_outcome(episode_id, note.get("outcome", "ok"))
 
+    # Online update: this submission is the ground truth for whatever was
+    # predicted a moment ago, including the times the prediction was wrong.
+    predictor = _state.get("predictor")
+    if predictor is not None:
+        from core.episodes import Episode as _Episode
+        predictor.update(_Episode(
+            ts=time.time(), action=text, context=ctx,
+            keystroke_prefix=signals.get("keystroke_prefix") or text,
+        ))
+
+    # A write may have invalidated something prewarmed against the old state.
+    if note.get("capability") in ("write_file", "/write", "/exec", "run_local"):
+        ant = _state.get("ant")
+        if ant:
+            ant.invalidate()
+
 
 async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
     brain: Brain = _state["brain"]
@@ -942,6 +969,11 @@ async def _maybe_send_anticipation(ws: WebSocket, text: str):
         return
     pre = ant.try_serve(text)
     if pre and isinstance(pre, dict):
+        # Prewarming happens above the "free" threshold; revealing needs the
+        # higher "reveal" one, because a wrong hint costs the user attention
+        # rather than a few background milliseconds.
+        if float(pre.get("confidence", 0.0)) < ant.reveal_threshold:
+            return
         try:
             await ws.send_json({"type": "anticipation", "data": pre, "text": text})
         except Exception:

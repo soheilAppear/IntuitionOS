@@ -30,7 +30,15 @@ episodes:
 anticipation:
   enabled: true
   debounce_ms: 180
-  match_threshold: 0.6
+  match_threshold: 0.6   # superseded by thresholds.free when that block is set
+
+# What the predictor learns from, and when it starts trusting itself.
+prediction:
+  half_life_s: 604800    # one week: fast enough to follow a change of project,
+                         # slow enough that Monday still remembers Friday
+  min_episodes: 50       # below this the learned scores are noise and the
+                         # original prefix heuristics are used instead
+  replay_limit: 5000     # episodes replayed at startup when no state is saved
 
 hardware:
   drivers:
