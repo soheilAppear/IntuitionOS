@@ -234,7 +234,7 @@ def main():
     cfg, brain, mem, sched, episodes, sensor, predictor, rules, calib_store = bootstrap()
     window = PredictionWindow()
     # Print banner
-    rprint(Panel.fit('IntuitionOS v1.0 - sandboxed exec + anticipator + fuzzy commands - type /help', title='IntuitionOS'))
+    rprint(Panel.fit('IntuitionOS - learned prediction + gated actions with /undo - type /help', title='IntuitionOS'))
 
     # Create prompt session
     session=PromptSession('> ')
