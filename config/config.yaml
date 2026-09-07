@@ -32,6 +32,17 @@ anticipation:
   debounce_ms: 180
   match_threshold: 0.6   # superseded by thresholds.free when that block is set
 
+# Cost-gated action thresholds. One threshold used to govern everything, which
+# meant a hunch's strength did no work in a system whose whole thesis is that
+# hunches vary in strength. The asymmetry between `free` and `reveal` is the
+# point: prewarming wrongly wastes a few background milliseconds, while revealing
+# wrongly costs the user the attention to notice and dismiss a bad suggestion.
+thresholds:
+  free:          0.30   # prewarm; being wrong costs cycles only
+  reveal:        0.70   # show a ghost hint; being wrong costs user attention
+  auto_execute:  0.95   # act without asking; reversible capabilities only
+  irreversible:  null   # never auto-execute, regardless of confidence
+
 # What the predictor learns from, and when it starts trusting itself.
 prediction:
   half_life_s: 604800    # one week: fast enough to follow a change of project,

@@ -27,6 +27,7 @@ from core.actions import (
 )
 from core.anticipator import Anticipator
 from core.brain import Brain
+from core.calibration import CalibrationStore, Calibrator, load_thresholds, reliability
 from core.capabilities import capabilities, is_safe_mode
 from core.context import ContextSensor
 from core.episodes import EpisodeLog, PredictionWindow
@@ -143,11 +144,18 @@ async def lifespan(app: FastAPI):
     episodes = EpisodeLog(mem, enabled=bool(ecfg.get("enabled", True)))
     sensor = ContextSensor(journal=get_journal())
 
+    thresholds = load_thresholds(cfg.get("thresholds"))
+    set_thresholds(thresholds)
+
+    calibration_store = CalibrationStore(mem)
+    calibrator = calibration_store.load()
+
     pcfg = cfg.get("prediction", {}) or {}
     predictor = Predictor(
         store=PredictorStore(mem),
         half_life_s=float(pcfg.get("half_life_s", 7 * 24 * 3600)),
         min_episodes=int(pcfg.get("min_episodes", 50)),
+        calibrator=calibrator,
     )
     if predictor.seen == 0:
         # No saved state: relearn from the log rather than starting cold.
@@ -188,7 +196,7 @@ async def lifespan(app: FastAPI):
         enabled=bool(a.get("enabled", True)),
         debounce_ms=int(a.get("debounce_ms", 180)),
         match_threshold=float(a.get("match_threshold", 0.6)),
-        thresholds=cfg.get("thresholds"),
+        thresholds=thresholds,
     )
     ant.start()
 
@@ -197,7 +205,6 @@ async def lifespan(app: FastAPI):
     # "shut down my pc" — typed or spoken — reached shutdown /s /t 30 with no
     # gate, no confirmation and no record. They now come with a declared cost.
     register_os_capabilities()
-    set_thresholds(cfg.get("thresholds"))
 
     # ── Voice ────────────────────────────────────────────────────────────
     voice: VoiceRecognizer | None = None
@@ -213,7 +220,8 @@ async def lifespan(app: FastAPI):
 
     _state.update({"cfg": cfg, "brain": brain, "mem": mem, "sched": sched, "ant": ant,
                    "voice": voice, "episodes": episodes, "sensor": sensor,
-                   "predictor": predictor})
+                   "predictor": predictor, "calibrator": calibrator,
+                   "calibration_store": calibration_store, "thresholds": thresholds})
 
     # Pre-load Whisper model in background so first voice use is instant
     if voice:
@@ -613,6 +621,7 @@ _KNOWN_CMDS = [
     "/config", "/reload", "/tasks", "/done", "/delete", "/snooze",
     "/hw", "/task_payload", "/safe", "/exec", "/write", "/read",
     "/undo", "/journal", "/capabilities", "/forget", "/episodes",
+    "/calibration", "/thresholds",
 ]
 
 
@@ -744,6 +753,25 @@ async def _handle_command(ws: WebSocket, text: str):
 
     if text == "/actions":
         await ws.send_json({"type": "reply", "text": ", ".join(sorted(actions.names))})
+        return
+
+    if text == "/calibration":
+        episodes = _state.get("episodes")
+        if not episodes:
+            await ws.send_json({"type": "error", "text": "episode log unavailable"})
+            return
+        report = await loop.run_in_executor(
+            _executor, lambda: reliability(episodes.shown_predictions())
+        )
+        await ws.send_json({"type": "reply", "text": report.table()})
+        return
+
+    if text == "/thresholds":
+        th = _state.get("thresholds") or {}
+        lines = [f"  {k:<14} {'never' if v is None else format(float(v), '.2f')}"
+                 for k, v in th.items()]
+        await ws.send_json({"type": "reply", "text":
+                            "Cost-gated thresholds" + chr(10) + "\n".join(lines)})
         return
 
     if text == "/forget":
@@ -975,7 +1003,8 @@ async def _maybe_send_anticipation(ws: WebSocket, text: str):
         if float(pre.get("confidence", 0.0)) < ant.reveal_threshold:
             return
         try:
-            await ws.send_json({"type": "anticipation", "data": pre, "text": text})
+            await ws.send_json({"type": "anticipation", "data": pre, "text": text,
+                                "reveal_threshold": ant.reveal_threshold})
         except Exception:
             return
         # Recorded only once the send succeeded: a hint that never reached the

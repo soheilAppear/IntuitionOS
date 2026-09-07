@@ -137,7 +137,14 @@ function onThinking() {
   clearStream();
   thinkingEl.classList.add('active');
   hud.classList.remove('anticipating');
+  clearGhost();
+}
+
+function clearGhost() {
   ghostHint.textContent = '';
+  ghostHint.title = '';
+  ghostHint.style.opacity = '';
+  ghostHint.classList.remove('confident');
 }
 
 function onReply(msg) {
@@ -145,7 +152,7 @@ function onReply(msg) {
   clearStream();
   if (pendingConfirm) clearConfirm();
   hud.classList.remove('anticipating');
-  ghostHint.textContent = '';
+  clearGhost();
 
   const plan  = Array.isArray(msg.plan) ? msg.plan : [];
   const text  = msg.text || '';
@@ -195,6 +202,18 @@ function onAnticipation(msg) {
 
   ghostHint.textContent = '→ ' + hint;
   ghostHint.title = d.why || '';
+
+  // Render how sure it is, rather than showing every hint identically. A binary
+  // hint claims the same certainty for a hunch and for a near-certainty; opacity
+  // tied to the calibrated probability is the honest version, and after Phase 5
+  // that probability is one the reliability curve has actually checked.
+  const floor = typeof msg.reveal_threshold === 'number' ? msg.reveal_threshold : 0.7;
+  const conf  = typeof d.confidence === 'number' ? d.confidence : floor;
+  const span  = Math.max(1e-6, 1 - floor);
+  const t     = Math.max(0, Math.min(1, (conf - floor) / span));
+
+  ghostHint.style.opacity = (0.42 + 0.58 * t).toFixed(3);
+  ghostHint.classList.toggle('confident', t > 0.6);
 }
 
 function onMemory(rows) {
@@ -370,7 +389,7 @@ function showToast(text) {
 // ── Input ──
 cmdInput.addEventListener('input', () => {
   const val = cmdInput.value;
-  ghostHint.textContent = '';
+  clearGhost();
 
   if (!val.trim()) {
     hud.classList.remove('anticipating');
@@ -397,7 +416,7 @@ cmdInput.addEventListener('keydown', (e) => {
     if (!text) return;
     lastCommand = text;
     cmdInput.value = '';
-    ghostHint.textContent = '';
+    clearGhost();
     hud.classList.remove('anticipating');
     clearTimeout(bufferTimer);
     send({ type: 'input', text });
@@ -411,7 +430,7 @@ cmdInput.addEventListener('keydown', (e) => {
       if (tasksOpen)  toggleTasks();
     } else {
       cmdInput.value = '';
-      ghostHint.textContent = '';
+      clearGhost();
       hud.classList.remove('anticipating');
     }
   }

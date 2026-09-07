@@ -511,3 +511,10 @@ html, body {
   color: rgba(255, 255, 255, 0.62);
   white-space: pre-wrap;
 }
+
+/* A hint the predictor is unusually sure of. The opacity carries the fine
+   gradient; this is the coarse signal that survives a glance. */
+.ghost-hint.confident {
+  color: rgba(120, 220, 255, 0.9);
+  text-shadow: 0 0 8px rgba(80, 200, 255, 0.35);
+}

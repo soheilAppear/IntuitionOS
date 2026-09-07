@@ -13,6 +13,7 @@ from core.actions import (
     actions, set_scheduler, set_memory, set_logger, set_safe_mode_action,
     set_thresholds, undo_last, journal_recent, get_journal,
 )
+from core.calibration import CalibrationStore, load_thresholds, reliability
 from core.capabilities import capabilities
 from core.context import ContextSensor
 from core.episodes import Episode, EpisodeLog, PredictionWindow
@@ -59,6 +60,8 @@ def show_help():
         '/safe on|off - toggle Safe Mode',
         '/undo - reverse the last reversible action',
         '/journal [n] - show recent gated actions',
+        '/calibration - reliability of stated confidence',
+        '/thresholds - show the cost-gated thresholds',
         '/episodes - show what the episode log has recorded',
         '/forget - erase the episode log',
         '/capabilities - list actions with their declared cost',
@@ -72,7 +75,7 @@ def show_help():
 
 def fuzzy_slash(base:str)->str:
     # Known slash commands for fuzzy matching
-    known=['/help','/exit','/memory','/dream','/save','/recall','/actions','/config','/reload','/tasks','/done','/delete','/snooze','/hw','/task_payload','/safe','/exec','/write','/read','/undo','/journal','/capabilities','/forget','/episodes']
+    known=['/help','/exit','/memory','/dream','/save','/recall','/actions','/config','/reload','/tasks','/done','/delete','/snooze','/hw','/task_payload','/safe','/exec','/write','/read','/undo','/journal','/capabilities','/forget','/episodes','/calibration','/thresholds']
     # Return exact match if present
     if base in known:
         return base
@@ -115,7 +118,8 @@ def bootstrap():
     set_logger(logger)
     set_memory(mem)
 
-    set_thresholds(cfg.get('thresholds'))
+    thresholds = load_thresholds(cfg.get('thresholds'))
+    set_thresholds(thresholds)
 
     llm=LLMClient(cfg.get('backend','ollama'), cfg.get('model','gpt-oss:20b'), cfg.get('temperature',0.2), cfg.get('max_tokens',600))
     bcfg=cfg.get('brain',{}) or {}
@@ -164,10 +168,12 @@ def bootstrap():
     episodes = EpisodeLog(mem, enabled=bool(ecfg.get('enabled', True)))
     sensor = ContextSensor(journal=get_journal())
 
+    calibration_store = CalibrationStore(mem)
     pcfg = cfg.get('prediction', {}) or {}
     predictor = Predictor(store=PredictorStore(mem),
                           half_life_s=float(pcfg.get('half_life_s', 7*24*3600)),
-                          min_episodes=int(pcfg.get('min_episodes', 50)))
+                          min_episodes=int(pcfg.get('min_episodes', 50)),
+                          calibrator=calibration_store.load())
     if predictor.seen == 0:
         # No saved state: relearn from the log rather than starting cold.
         predictor.fit(episodes.recent(limit=int(pcfg.get('replay_limit', 5000))))
@@ -339,6 +345,12 @@ def main():
                 rprint(actions.call('create_task', text=None, when=when, repeat='', payload=payload))
             except Exception as e:
                 rprint(f"usage: /task_payload '{{...json...}}' <when>. error: {e}")
+            continue
+        if user=='/calibration':
+            rprint(reliability(episodes.shown_predictions()).table()); continue
+        if user=='/thresholds':
+            for k, v in (cfg.get('thresholds') or {}).items():
+                rprint(f"  {k:<14} {'never' if v is None else v}")
             continue
         if user=='/forget':
             rprint(f'Forgot {episodes.forget()} episode(s).'); continue
