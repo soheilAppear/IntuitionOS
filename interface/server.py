@@ -112,12 +112,16 @@ async def lifespan(app: FastAPI):
             loop,
         )
 
-    def execute(payload: dict):
-        name = payload.get("action")
-        kwargs = payload.get("kwargs", {})
-        if name in {"hw_call"}:
-            res = actions.call(name, **kwargs)
-            mem.add("tool", json.dumps({"scheduled": True, "action": name, "result": res})[:2000])
+    def execute(outcome: dict):
+        # The scheduler now dispatches through the gate itself, as actor
+        # "scheduler", so this is a report rather than a second execution path
+        # with its own private allowlist.
+        mem.add("tool", json.dumps({"scheduled": True, **outcome}, default=str)[:2000])
+        asyncio.run_coroutine_threadsafe(
+            _broadcast({"type": "reply",
+                        "text": f"Scheduled action {outcome.get('action')} ran."}),
+            loop,
+        )
 
     sched = Scheduler(
         db_path=cfg.get("memory_db_path", "data/intuition.db"),
@@ -125,6 +129,8 @@ async def lifespan(app: FastAPI):
         tick_seconds=10,
         notify_cb=notify,
         execute_cb=execute,
+        logger=logger,
+        dispatcher=actions,
     )
     set_scheduler(sched)
 
@@ -587,7 +593,7 @@ async def _resolve_confirmation(ws: WebSocket, token: str, granted: bool):
     text = _format_os_result(pending, res, {}) if pending else _summarise(res)
     await ws.send_json({"type": "reply", "text": text})
     await ws.send_json({"type": "status", "safe_mode": is_safe_mode(),
-                        "tasks_count": len(mem.list_tasks(status="pending"))})
+                        "tasks_count": len(mem.list_open())})
 
 
 def _token_sink(ws: WebSocket, loop):
@@ -656,8 +662,7 @@ async def _handle_command(ws: WebSocket, text: str):
         return
 
     if text == "/tasks":
-        result = actions.call("list_tasks", status="pending")
-        await ws.send_json({"type": "tasks", "rows": result.get("result", [])})
+        await ws.send_json({"type": "tasks", "rows": mem.list_open()})
         return
 
     if text == "/dream":
@@ -745,7 +750,7 @@ async def _handle_command(ws: WebSocket, text: str):
             actions.call("complete_task", task_id=tid)
             await ws.send_json({"type": "reply", "text": f"Task {tid} marked done."})
             await ws.send_json({"type": "status",
-                                "tasks_count": len(mem.list_tasks(status="pending")),
+                                "tasks_count": len(mem.list_open()),
                                 "safe_mode": is_safe_mode()})
         except Exception:
             await ws.send_json({"type": "error", "text": "usage: /done <id>"})
@@ -783,7 +788,7 @@ async def _handle_command(ws: WebSocket, text: str):
             await ws.send_json({
                 "type": "status",
                 "safe_mode": safe_on,
-                "tasks_count": len(mem.list_tasks(status="pending")),
+                "tasks_count": len(mem.list_open()),
                 "text": res.get("result", ""),
             })
         else:
@@ -1095,7 +1100,7 @@ async def ws_endpoint(ws: WebSocket):
     await ws.send_json({
         "type": "status",
         "safe_mode": is_safe_mode(),
-        "tasks_count": len(mem.list_tasks(status="pending")),
+        "tasks_count": len(mem.list_open()),
         "version": "1.0",
     })
 
@@ -1124,7 +1129,7 @@ async def ws_endpoint(ws: WebSocket):
                 await ws.send_json({
                     "type": "status",
                     "safe_mode": is_safe_mode(),
-                    "tasks_count": len(mem.list_tasks(status="pending")),
+                    "tasks_count": len(mem.list_open()),
                 })
 
             elif t == "voice_start":

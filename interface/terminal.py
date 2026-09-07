@@ -141,17 +141,18 @@ def bootstrap():
         rprint(Panel.fit(f'Remind #{task_id}: {title}', title='Reminder'))
         mem.add('reminder', f'#{task_id} {title}', tags='reminder')
 
-    def execute(payload:dict):
-        # whitelist payload execution
-        allowed={'hw_call'}
-        name=payload.get('action')
-        kwargs=payload.get('kwargs',{})
-        if name in allowed:
-            res=actions.call(name, **kwargs)
-            mem.add('tool', json.dumps({'scheduled':True,'action':name,'kwargs':kwargs,'result':res})[:2000])
-            rprint(Panel.fit(f'Scheduled action {name} -> {res}', title='Run'))
+    def execute(outcome:dict):
+        # The scheduler dispatches through the gate itself now, as actor
+        # 'scheduler', so this reports rather than being a second execution path
+        # with its own private allowlist.
+        mem.add('tool', json.dumps({'scheduled':True, **outcome}, default=str)[:2000])
+        rprint(Panel.fit(f"Scheduled action {outcome.get('action')} -> {outcome.get('result')}",
+                         title='Run'))
 
-    sched=Scheduler(db_path=cfg.get('memory_db_path','data/intuition.db'), tz=cfg.get('timezone','America/New_York'), tick_seconds=10, notify_cb=notify, execute_cb=execute)
+    sched=Scheduler(db_path=cfg.get('memory_db_path','data/intuition.db'),
+                    tz=cfg.get('timezone','America/New_York'), tick_seconds=10,
+                    notify_cb=notify, execute_cb=execute, logger=logger,
+                    dispatcher=actions)
     set_scheduler(sched)
 
     # Register hardware drivers
@@ -355,7 +356,14 @@ def main():
                     rprint(f'  - {n.text}')
             continue
         if user=='/tasks':
-            rprint(actions.call('list_tasks', status='pending')); continue
+            rows=mem.list_open()
+            if not rows:
+                rprint('No open tasks.')
+            for t in rows:
+                when=time.strftime('%b %d %H:%M', time.localtime(t['due']))
+                mark=' [fired]' if t['status']=='fired' else ''
+                rprint(f"#{t['id']} {t['title']}  ({when}){mark}")
+            continue
         if user.startswith('/done '):
             try:
                 tid=int(user.split(' ',1)[1]); rprint(actions.call('complete_task', task_id=tid))

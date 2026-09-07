@@ -116,6 +116,16 @@ class Memory:
         # Map to dicts
         return [{"id": tid, "title": title, "due": due_ts, "status": st} for tid, title, due_ts, st in rows]
 
+    def list_open(self):
+        # Pending plus already-fired-but-not-completed. A reminder that fired
+        # while the app was closed is still the user's to deal with, so it must
+        # not vanish from the list the moment it rang.
+        rows = self.query(
+            "SELECT id, title, due_ts, status FROM tasks WHERE status IN ('pending','fired')"
+            " ORDER BY due_ts ASC"
+        )
+        return [{"id": tid, "title": title, "due": due_ts, "status": st} for tid, title, due_ts, st in rows]
+
     def get_task(self, task_id: int):
         # Fetch one task or None
         rows = self.query("SELECT id, title, due_ts, status, payload FROM tasks WHERE id=?", (task_id,))

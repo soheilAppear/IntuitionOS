@@ -170,12 +170,17 @@
     },
     {
       "name": "list_tasks",
-      "summary": "List reminders by status.",
+      "summary": "List reminders. Defaults to open ones (pending or already fired).",
       "args": {
         "type": "object",
         "properties": {
           "status": {
-            "type": "string"
+            "enum": [
+              "open",
+              "pending",
+              "fired",
+              "done"
+            ]
           }
         },
         "required": [],

@@ -296,8 +296,12 @@ def create_task(text: str = None, when: str = None, repeat: str = "", payload: d
     return _scheduler.create(title=title, when=when, payload=payload or {}, repeat=repeat)
 
 
-def list_tasks(status: str = "pending"):
-    # List tasks by status
+def list_tasks(status: str = "open"):
+    # List tasks by status. "open" means pending plus already-fired-but-not-done:
+    # a reminder that rang while the app was closed is still the user's to deal
+    # with, and asking for "pending" alone would hide it.
+    if status == "open":
+        return {"result": _memory.list_open()}
     return {"result": _memory.list_tasks(status=status)}
 
 
@@ -505,8 +509,8 @@ _cap("write_file", write_file,
      path_scope="project", path_args=("path",),
      capture_undo=_capture_write, undo=_undo_write)
 
-_cap("list_tasks", list_tasks, _schema({"status": {"type": "string"}}), "free", 5, False,
-     "List reminders by status.")
+_cap("list_tasks", list_tasks, _schema({"status": {"enum": ["open", "pending", "fired", "done"]}}),
+     "free", 5, False, "List reminders. Defaults to open ones (pending or already fired).")
 
 _cap("create_task", create_task,
      _schema({"text": {"type": ["string", "null"]}, "when": {"type": ["string", "null"]},
