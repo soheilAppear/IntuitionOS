@@ -118,8 +118,16 @@ def _check_port_available():
     )
 
 
-def _wait_for_backend(server, timeout=STARTUP_TIMEOUT):
+def _wait_for_backend(server, timeout=None):
     """Wait for completed API startup while checking the exact child we spawned."""
+    if timeout is None:
+        timeout = STARTUP_TIMEOUT
+        if os.environ.get("INTUITION_SHELL", "").lower() in {"powershell", "pwsh"}:
+            from core.shell_environment import POWERSHELL_DISCOVERY_TIMEOUT
+
+            # Shell discovery runs before /health becomes available. Allow its
+            # complete setup budget in addition to ordinary backend startup.
+            timeout += POWERSHELL_DISCOVERY_TIMEOUT
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         code = server.poll()

@@ -115,6 +115,25 @@ def test_readiness_timeout_is_actionable(monkeypatch):
         launcher._wait_for_backend(Child(), timeout=1)
 
 
+@pytest.mark.parametrize("shell", ["powershell", "pwsh"])
+def test_powershell_cold_discovery_can_finish_before_launcher_deadline(shell, monkeypatch):
+    monkeypatch.setenv("INTUITION_SHELL", shell)
+    times = iter([0, 0, 61])
+    monkeypatch.setattr(launcher.time, "monotonic", lambda: next(times))
+    responses = iter([False, True])
+    monkeypatch.setattr(launcher, "_backend_healthy", lambda: next(responses))
+    launcher._wait_for_backend(Child())
+
+
+def test_cmd_keeps_normal_startup_deadline(monkeypatch):
+    monkeypatch.setenv("INTUITION_SHELL", "cmd")
+    times = iter([0, 0, 61])
+    monkeypatch.setattr(launcher.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(launcher, "_backend_healthy", lambda: False)
+    with pytest.raises(RuntimeError, match="within 60 seconds"):
+        launcher._wait_for_backend(Child())
+
+
 def prepare_main(monkeypatch, children):
     monkeypatch.setattr(launcher, "_check_port_available", lambda: None)
     monkeypatch.setattr(launcher, "_ensure_electron", lambda: "electron.exe")

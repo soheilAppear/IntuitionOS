@@ -6,7 +6,7 @@ on `phase-0-hygiene` at `c756848`, and the original prototype on
 
 The consolidation retains both development histories through a merge commit.
 The supported root application is the current local Ollama/HUD implementation.
-All 21 files of the earlier prototype are preserved under
+All 20 files of the earlier prototype are preserved under
 [`archive/prototype-2025`](../archive/README.md); its conflicting cloud-model
 configuration, packaging, launchers and documentation do not replace the current
 application. Original prototype content is retained, including its limitations.
@@ -19,6 +19,8 @@ application. Original prototype content is retained, including its limitations.
   jobs and evaluation passed. Cold discovery now allows a bounded 120 seconds,
   retains the full installed-command scan, and reports actionable timeout errors.
   Warm discovery is cached; changing `PSModulePath` or `PATHEXT` invalidates it.
+  When PowerShell is selected, the HUD launcher also allows that discovery
+  budget before declaring backend startup failed; CMD keeps its 60-second limit.
   This does not change shell action execution timeouts. Full installed-command
   enumeration follows [PowerShell Get-Command behavior](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/get-command).
 - A shell catalog containing a JSON array, scalar or null raised an unexpected
@@ -48,7 +50,7 @@ The starting local suite passed 552 tests with one POSIX-only skip. The first
 18 added regression cases all failed against that implementation, independently
 reproducing the defects above. The focused suites passed after the fixes.
 
-Final local Windows verification: **572 Python tests passed, 1 POSIX-only test
+Final local Windows verification: **575 Python tests passed, 1 POSIX-only test
 skipped**, and **17 renderer tests passed**. JavaScript syntax and generated
 capability manifest checks passed. The prediction/tool-loop gate passed (12/12
 plans), and the chronological correction gate passed (96.2% top-1, 100% top-3,

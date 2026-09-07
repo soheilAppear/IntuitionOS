@@ -1,6 +1,6 @@
 # Historical prototype
 
-`prototype-2025/` preserves all 21 files from the former
+`prototype-2025/` preserves all 20 files from the former
 `copilot/add-intuition-model-os` branch at commit
 `932149582c53dfce52c00179d6c1f577e436b6ac`. Its complete commit history is also
 an ancestor of the consolidated `main` branch.
