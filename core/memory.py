@@ -63,6 +63,16 @@ class Memory:
             [(now, role, text, tags) for role, text, tags in entries],
         )
 
+    def close(self):
+        # Release the file handle. Mostly this process lives as long as the
+        # database does, but a temporary database — a test, an eval run — has to
+        # be closable or Windows will refuse to delete the directory holding it.
+        with self._lock:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+
     def has_table(self, name: str) -> bool:
         # Used by migrations to tell a fresh database from an existing one
         return bool(self.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)))

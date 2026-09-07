@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    name: pytest (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The path jail, the scheduler's timezone handling and the OS sandbox all
+        # behave differently across platforms, and this project is developed on
+        # Windows — so both are tested rather than assumed.
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Check the generated manifest is current
+        # config/planner_schema.json is generated from the capability manifest.
+        # A capability added without regenerating it means the model is shown a
+        # tool list that disagrees with what the gate will permit.
+        run: |
+          python -m core.gen_manifest
+          git diff --exit-code config/planner_schema.json
+
+  eval:
+    name: evaluation harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run the evaluation
+        run: python -m eval.run
+
+      - name: Assert the learned predictor still beats the baseline
+        # The point of the harness is to be able to say no. If a change makes
+        # prediction worse than the pre-Phase-4 if-chain, or breaks a tool-loop
+        # failure mode, CI fails rather than letting the README keep quoting a
+        # number that no longer holds.
+        run: python -m eval.check

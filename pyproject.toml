@@ -11,7 +11,7 @@ readme = "README.md"
 license = { file = "LICENSE" }
 
 [tool.setuptools]
-packages = ["core", "interface", "plugins"]
+packages = ["core", "interface", "plugins", "eval"]
 
 [tool.pytest.ini_options]
 # Resolve `core.*` / `interface.*` imports from the repo root without a PYTHONPATH hack.
