@@ -9,7 +9,7 @@
 <body>
   <div class="hud" id="hud">
 
-    <!-- ── Status bar (draggable) ── -->
+    <!-- Status bar (draggable) -->
     <div class="status-bar" id="status-bar">
       <div class="status-left">
         <span class="safe-dot" id="safe-dot"></span>
@@ -20,30 +20,26 @@
       </div>
       <div class="status-right">
         <span class="tasks-badge" id="tasks-badge">0</span>
-        <button class="icon-btn" id="tasks-btn" title="Tasks (T)">≡</button>
-        <button class="icon-btn" id="memory-btn" title="Memory (M)">◎</button>
-        <button class="icon-btn close-btn" id="close-btn" title="Hide (Alt+Space)">×</button>
+        <button class="icon-btn" id="tasks-btn" title="Tasks (T)">&#x2261;</button>
+        <button class="icon-btn" id="memory-btn" title="Memory (M)">&#x25CE;</button>
+        <button class="icon-btn close-btn" id="close-btn" title="Hide (Alt+Space)">&#x00D7;</button>
       </div>
     </div>
 
-    <!-- ── Expandable panel ── -->
+    <!-- Expandable panel -->
     <div class="expand-panel" id="expand-panel">
 
-      <!-- Plan hint strip -->
       <div class="plan-strip" id="plan-strip"></div>
 
-      <!-- Main reply / output -->
       <div class="output-area" id="output-area">
         <div class="output-text" id="output-text"></div>
       </div>
 
-      <!-- Memory panel -->
       <div class="side-panel" id="memory-panel">
         <div class="panel-header">Memory</div>
         <div class="panel-list" id="memory-list"></div>
       </div>
 
-      <!-- Tasks panel -->
       <div class="side-panel" id="tasks-panel">
         <div class="panel-header">Tasks</div>
         <div class="panel-list" id="tasks-list"></div>
@@ -51,12 +47,12 @@
 
     </div>
 
-    <!-- ── Input bar ── -->
+    <!-- Input bar -->
     <div class="input-bar">
-      <span class="prompt-char" id="prompt-char">›</span>
+      <span class="prompt-char" id="prompt-char">&#x203A;</span>
       <div class="input-wrap">
         <input type="text" id="cmd-input"
-               placeholder="Ask or command…"
+               placeholder="Ask, command, or Alt+V to speak..."
                autocomplete="off"
                spellcheck="false">
         <span class="ghost-hint" id="ghost-hint"></span>
@@ -64,11 +60,17 @@
       <div class="thinking-indicator" id="thinking-indicator">
         <span></span><span></span><span></span>
       </div>
+      <button class="mic-btn" id="mic-btn" title="Voice input (Alt+V)">&#x25C9;</button>
+    </div>
+
+    <!-- Recording indicator (shown while mic is active) -->
+    <div class="recording-bar" id="recording-bar">
+      <span class="rec-dot"></span>
+      <span class="rec-label" id="rec-label">Listening...</span>
     </div>
 
   </div>
 
-  <!-- Reminder toast container -->
   <div id="toast-root"></div>
 
   <script src="app.js"></script>

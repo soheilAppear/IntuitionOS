@@ -3,6 +3,7 @@ import difflib
 import json
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
@@ -17,6 +18,8 @@ from core.logger import make_logger
 from core.llm import LLMClient
 from core.memory import Memory
 from core.scheduler import Scheduler
+from core.voice import VoiceRecognizer
+import core.os_sandbox as _os
 
 _state: dict = {}
 _clients: set = set()
@@ -100,6 +103,10 @@ async def lifespan(app: FastAPI):
             from plugins.gpu_nvml import GPUNVML
             from core.actions import register_driver
             register_driver(GPUNVML(enabled=True))
+        if d.get("name") == "cpu_info" and d.get("enabled", True):
+            from plugins.cpu_info import CPUInfo
+            from core.actions import register_driver
+            register_driver(CPUInfo())
 
     def predict(buf: str):
         t = buf.strip()
@@ -137,7 +144,43 @@ async def lifespan(app: FastAPI):
     )
     ant.start()
 
-    _state.update({"cfg": cfg, "brain": brain, "mem": mem, "sched": sched, "ant": ant})
+    # ── OS sandbox actions ───────────────────────────────────────────────
+    for _fn_name in [
+        "open_app", "take_screenshot", "list_processes", "kill_process",
+        "get_clipboard", "set_clipboard", "system_info",
+        "type_text", "move_mouse", "click",
+        "set_volume", "get_volume",
+        "set_brightness", "get_brightness",
+        "get_battery", "get_network_info", "toggle_wifi",
+        "list_windows", "sleep_computer", "lock_screen",
+        "shutdown_computer", "restart_computer", "cancel_shutdown",
+    ]:
+        _fn = getattr(_os, _fn_name, None)
+        if _fn:
+            actions.register(f"os_{_fn_name}", _fn)
+
+    # ── Voice ────────────────────────────────────────────────────────────
+    voice: VoiceRecognizer | None = None
+    voice_cfg = cfg.get("voice", {}) or {}
+    if voice_cfg.get("enabled", True):
+        try:
+            voice = VoiceRecognizer(
+                model_size=voice_cfg.get("model", "base"),
+                language=voice_cfg.get("language", "en"),
+            )
+        except Exception:
+            voice = None
+
+    _state.update({"cfg": cfg, "brain": brain, "mem": mem, "sched": sched, "ant": ant, "voice": voice})
+
+    # Pre-load Whisper model in background so first voice use is instant
+    if voice:
+        def _preload():
+            try:
+                voice._load_model()
+            except Exception:
+                pass
+        threading.Thread(target=_preload, daemon=True, name="whisper-preload").start()
 
     yield
 
@@ -150,6 +193,277 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+_VOL_WORDS = {
+    'zero': 0, 'muted': 0, 'ten': 10, 'twenty': 20, 'thirty': 30,
+    'forty': 40, 'fifty': 50, 'half': 50, 'sixty': 60, 'seventy': 70,
+    'eighty': 80, 'ninety': 90, 'hundred': 100, 'full': 100, 'max': 100,
+    'maximum': 100, 'twenty five': 25, 'seventy five': 75,
+}
+
+# App names that should always route to os_open_app
+_KNOWN_APP_NAMES = {
+    'chrome', 'google chrome', 'google', 'firefox', 'edge', 'browser',
+    'web browser', 'my browser', 'vscode', 'vs code', 'visual studio code',
+    'code', 'notepad', 'calculator', 'calc', 'explorer', 'file explorer',
+    'terminal', 'cmd', 'spotify', 'discord', 'slack', 'teams',
+    'word', 'excel', 'powerpoint', 'paint', 'task manager', 'steam',
+    'obs', 'vlc', 'settings', 'control panel',
+}
+
+_APP_NAME_ALIAS = {
+    'google chrome': 'chrome', 'google': 'chrome',
+    'browser': 'chrome', 'web browser': 'chrome', 'my browser': 'chrome',
+    'vs code': 'vscode', 'visual studio code': 'vscode', 'code editor': 'vscode',
+    'windows terminal': 'terminal', 'command prompt': 'terminal', 'cmd': 'terminal',
+    'file manager': 'explorer', 'file explorer': 'explorer', 'files': 'explorer',
+    'calc': 'calculator',
+}
+
+
+def _try_os_intent(text: str):
+    """Match natural language OS commands. Returns (action, kwargs) or None."""
+    t = text.lower().strip()
+
+    # open / launch / start  (action-first: "open chrome") ────────────
+    m = re.match(
+        r'^(?:open|launch|start|run|execute)\s+(?:the\s+|my\s+|a\s+)?'
+        r'(.+?)(?:\s+(?:app(?:lication)?|program|browser))?[.!?]?$', t
+    )
+    if m:
+        name = m.group(1).strip().rstrip('.,!?')
+        name = _APP_NAME_ALIAS.get(name, name)
+        words = name.split()
+        if name in _KNOWN_APP_NAMES or (1 <= len(words) <= 3 and not any(
+            w in ('a', 'an', 'the', 'new', 'quick', 'file', 'search', 'question')
+            for w in words
+        )):
+            return ('os_open_app', {'name': name})
+
+    # open / launch  (name-first: "chrome open", "spotify launch") ─────
+    m = re.match(r'^(.+?)\s+(?:open|launch|start|run)[.!?]?$', t)
+    if m:
+        name = m.group(1).strip().rstrip('.,!?')
+        name = _APP_NAME_ALIAS.get(name, name)
+        words = name.split()
+        if name in _KNOWN_APP_NAMES or (1 <= len(words) <= 2):
+            return ('os_open_app', {'name': name})
+
+    # volume numeric — "set/put/change volume to/at/as X[%]" ──────────
+    m = re.search(
+        r'(?:set|put|change|turn|make|adjust)\s+(?:the\s+)?(?:volume|sound)\s+(?:to|at|as|=)\s*(\d+)',
+        t
+    ) or re.search(r'\bvolume\s+(?:to\s+|at\s+|=\s*)?(\d+)\b', t) \
+      or re.search(r'\b(\d+)\s*%?\s*(?:volume|loudness)\b', t)
+    if m:
+        return ('os_set_volume', {'level': int(m.group(1))})
+
+    # volume word numbers ("set volume to fifty") ───────────────────────
+    for phrase, num in _VOL_WORDS.items():
+        pesc = re.escape(phrase)
+        if re.search(rf'(?:volume|sound)\s+(?:to\s+|at\s+|=\s*)?{pesc}\b', t) or \
+           re.search(rf'(?:set|put|change|make)\s+(?:the\s+)?(?:volume|sound)\s+(?:to\s+|at\s+)?{pesc}\b', t) or \
+           re.search(rf'\b{pesc}\s*(?:percent\s+)?(?:volume|loudness)\b', t):
+            return ('os_set_volume', {'level': num})
+
+    # volume relative ───────────────────────────────────────────────────
+    if re.search(r'\bmute\b|\bno\s+sound\b|\bsilent(?:ce)?\b', t):
+        return ('os_set_volume', {'level': 0})
+    if re.search(r'(?:volume|sound)\s+(?:up|max|full|loud|higher|louder)', t) or \
+       re.search(r'turn\s+(?:up|the\s+volume\s+up|volume\s+up)', t) or \
+       re.search(r'turn\s+up\s+(?:the\s+)?(?:volume|sound)', t) or \
+       re.search(r'(?:raise|increase)\s+(?:the\s+)?(?:volume|sound)', t):
+        return ('os_set_volume', {'level': 90})
+    if re.search(r'(?:volume|sound)\s+(?:down|low|quiet(?:er)?|half|lower)', t) or \
+       re.search(r'turn\s+(?:down|the\s+volume\s+down|volume\s+down)', t) or \
+       re.search(r'turn\s+(?:the\s+)?(?:volume|sound)\s+down', t) or \
+       re.search(r'(?:lower|decrease|reduce)\s+(?:the\s+)?(?:volume|sound)', t):
+        return ('os_set_volume', {'level': 20})
+
+    # get/check current volume ──────────────────────────────────────────
+    if re.search(r'(?:what|check|get|show)\s+(?:is\s+)?(?:the\s+)?(?:current\s+)?(?:volume|sound\s+level)', t):
+        return ('os_get_volume', {})
+
+    # brightness ────────────────────────────────────────────────────────
+    m = re.search(
+        r'(?:set|put|change|adjust)\s+(?:the\s+)?brightness\s+(?:to|at|=)\s*(\d+)', t
+    ) or re.search(r'\bbrightness\s+(?:to\s+|at\s+)?(\d+)\b', t) \
+      or re.search(r'\b(\d+)\s*%?\s*brightness\b', t)
+    if m:
+        return ('os_set_brightness', {'level': int(m.group(1))})
+    if re.search(r'\bbrightness\s+(?:up|higher|brighter|max|full)\b', t) or \
+       re.search(r'(?:increase|raise|turn\s+up)\s+(?:the\s+)?brightness', t):
+        return ('os_set_brightness', {'level': 100})
+    if re.search(r'\bbrightness\s+(?:down|lower|dim|half|low)\b', t) or \
+       re.search(r'(?:decrease|lower|dim|reduce|turn\s+down)\s+(?:the\s+)?brightness', t):
+        return ('os_set_brightness', {'level': 30})
+    if re.search(r'(?:what|check|get|show)\s+(?:is\s+)?(?:the\s+)?(?:current\s+)?brightness', t):
+        return ('os_get_brightness', {})
+
+    # battery ───────────────────────────────────────────────────────────
+    if re.search(
+        r'\b(?:battery|charge|power\s+level|how\s+much\s+(?:battery|charge|power)|'
+        r'battery\s+(?:life|level|status|percentage|percent)|'
+        r'how\s+long\s+(?:until|till|before).*(?:battery|dies|dead))\b', t
+    ):
+        return ('os_get_battery', {})
+
+    # network / wifi ────────────────────────────────────────────────────
+    if re.search(
+        r'\b(?:network\s+info(?:rmation)?|(?:what(?:\'s|\s+is)\s+(?:my|the)\s+)?(?:ip|wifi|wi-fi|ssid|'
+        r'connection|internet)\s+(?:address|status|info|name)?|'
+        r'am\s+i\s+connected|what\s+network|which\s+wifi|show\s+network)\b', t
+    ):
+        return ('os_get_network_info', {})
+    if re.search(r'\b(?:enable|turn\s+on)\s+(?:the\s+)?(?:wifi|wi-fi|wireless)\b', t):
+        return ('os_toggle_wifi', {'state': 'on'})
+    if re.search(r'\b(?:disable|turn\s+off)\s+(?:the\s+)?(?:wifi|wi-fi|wireless)\b', t):
+        return ('os_toggle_wifi', {'state': 'off'})
+
+    # sleep / lock ──────────────────────────────────────────────────────
+    if re.search(
+        r'\b(?:sleep|hibernate|suspend)\s+(?:(?:the|my)\s+)?(?:computer|pc|machine|laptop)?\b', t
+    ) and 'wake' not in t:
+        return ('os_sleep_computer', {})
+    if re.search(
+        r'\b(?:lock\s+(?:(?:the|my)\s+)?(?:screen|computer|pc|machine|laptop)?|'
+        r'(?:screen\s+)?lock)\b', t
+    ):
+        return ('os_lock_screen', {})
+
+    # power / shutdown / restart ────────────────────────────────────────
+    if re.search(
+        r'\b(?:shut\s*down|shutdown|power\s*off|turn\s+off)\s+(?:(?:the|my|this|your)\s+)?(?:computer|pc|machine|system|laptop)\b',
+        t
+    ):
+        return ('os_shutdown_computer', {'delay_sec': 30})
+    if re.search(
+        r'\b(?:restart|reboot)\s+(?:(?:the|my|this|your)\s+)?(?:computer|pc|machine|system|laptop)\b', t
+    ):
+        return ('os_restart_computer', {'delay_sec': 30})
+    if re.search(r'\bcancel\s+(?:the\s+)?(?:shutdown|restart|reboot)\b', t):
+        return ('os_cancel_shutdown', {})
+
+    # screenshot ────────────────────────────────────────────────────────
+    if re.search(r'screenshot|screen\s+cap(?:ture)?|snap\s+(?:the\s+)?screen', t):
+        return ('os_take_screenshot', {})
+
+    # system info / resource report ────────────────────────────────────
+    if re.search(
+        r'\b(?:'
+        # direct terms
+        r'system\s+info(?:rmation)?|sys(?:tem)?\s+status|pc\s+info(?:rmation)?|'
+        r'hardware\s+info(?:rmation)?|computer\s+stats?|machine\s+info|'
+        # resource variants
+        r'(?:windows|system|pc|computer|my)\s+resources?|'
+        r'resource\s+(?:report|usage|status|info|check)|'
+        r'performance\s+(?:report|status|info|stats?)|'
+        # RAM / memory
+        r'ram(?:\s+(?:usage|status|info|report|check))?|'
+        r'memory\s+(?:usage|status|info|report|check|left)|'
+        r'how\s+much\s+(?:ram|memory|storage|disk\s+space)|'
+        # CPU
+        r'cpu(?:\s+(?:usage|load|status|info|report|check|temp(?:erature)?))?|'
+        r'processor\s+(?:usage|load|status|info)|'
+        # disk
+        r'disk\s+(?:space|usage|status|info)|storage\s+(?:space|status|info)|'
+        # catch-alls
+        r'tell\s+me\s+about\s+(?:my\s+)?(?:system|resources?|computer|pc)|'
+        r'(?:show|give\s+me|check)\s+(?:(?:my|the)\s+)?(?:system|resource|performance|pc|computer)\s+(?:report|status|info|stats?|usage)'
+        r')\b', t
+    ):
+        return ('os_system_info', {})
+
+    # processes ─────────────────────────────────────────────────────────
+    if re.search(
+        r'\b(?:(?:list|show|display|what(?:\'s|\s+is)?)\s+(?:running|'
+        r'(?:all\s+)?processes?|(?:open\s+)?apps?|programs?)|'
+        r'running\s+(?:processes?|apps?|programs?)|'
+        r'what\s+(?:apps?|programs?)\s+(?:are\s+)?(?:open|running))\b', t
+    ):
+        return ('os_list_processes', {})
+
+    # kill process ──────────────────────────────────────────────────────
+    m = re.match(
+        r'^(?:kill|close|stop|quit|end|terminate|force\s+close)\s+'
+        r'(?:the\s+)?(?:process\s+)?(.+?)(?:\s+(?:process|app))?[.!?]?$', t
+    )
+    if m:
+        name = m.group(1).strip().rstrip('.,!?')
+        if name not in ('window', 'panel', 'hud', 'overlay', 'this', 'app', 'application', 'it'):
+            return ('os_kill_process', {'name': name})
+
+    # clipboard ─────────────────────────────────────────────────────────
+    if re.search(
+        r'(?:what(?:\'s|\s+is)\s+in\s+(?:my\s+)?clipboard|'
+        r'read\s+clipboard|show\s+clipboard|get\s+clipboard|clipboard\s+content)', t
+    ):
+        return ('os_get_clipboard', {})
+
+    return None
+
+
+def _format_os_result(action: str, result: dict, kwargs: dict) -> str:
+    if result.get("error"):
+        return f"⚠  {result['error']}"
+    if action == "os_open_app":
+        # Show the friendly name the user requested, not the full exe path
+        return f"Opened {kwargs.get('name', result.get('launched', '?')).title()}"
+    if action == "os_set_volume":
+        return f"Volume set to {result.get('volume', kwargs.get('level', '?'))}%"
+    if action == "os_take_screenshot":
+        return f"Screenshot saved → {result.get('path', '?')}"
+    if action == "os_system_info":
+        r = result
+        return (
+            f"OS: {r.get('os')}\n"
+            f"RAM: {r.get('ram_used_pct')} used of {r.get('ram_total_gb')} GB\n"
+            f"Disk C:: {r.get('disk_used_pct')} used of {r.get('disk_total_gb')} GB\n"
+            f"Uptime: {r.get('uptime_hours')} h"
+        )
+    if action == "os_list_processes":
+        procs = result.get("processes", [])
+        return "\n".join(
+            f"{p['name']}  PID {p['pid']}  CPU {p['cpu']}  MEM {p['mem']}"
+            for p in procs[:15]
+        )
+    if action == "os_kill_process":
+        return f"Terminated {result.get('killed', '?')} (PID {result.get('pid', '?')})"
+    if action == "os_get_clipboard":
+        ct = result.get("text", "").strip()
+        return f"Clipboard: {ct}" if ct else "Clipboard is empty"
+    if action == "os_get_volume":
+        return f"Current volume: {result.get('volume', '?')}%"
+    if action == "os_set_brightness":
+        return f"Brightness set to {result.get('brightness', kwargs.get('level', '?'))}%"
+    if action == "os_get_brightness":
+        return f"Current brightness: {result.get('brightness', '?')}%"
+    if action == "os_get_battery":
+        r = result
+        charging = "charging" if r.get("charging") else "on battery"
+        return f"Battery: {r.get('percent')} ({charging}), {r.get('time_remaining', '')}"
+    if action == "os_get_network_info":
+        r = result
+        ifaces = ", ".join(f"{i['interface']} ({i['ip']})" for i in r.get("interfaces", []))
+        ssid = r.get("wifi_ssid")
+        return f"Network: {ifaces or 'none'}" + (f"\nWi-Fi: {ssid}" if ssid else "")
+    if action == "os_toggle_wifi":
+        return f"Wi-Fi turned {kwargs.get('state', '?')}"
+    if action == "os_list_windows":
+        wins = result.get("windows", [])
+        return "\n".join(f"{w['app']}: {w['title']}" for w in wins[:12])
+    if action == "os_sleep_computer":
+        return "Putting computer to sleep…"
+    if action == "os_lock_screen":
+        return "Screen locked."
+    if action == "os_shutdown_computer":
+        return f"Shutting down in {result.get('delay_sec', 30)} seconds. Type 'cancel shutdown' to abort."
+    if action == "os_restart_computer":
+        return f"Restarting in {result.get('delay_sec', 30)} seconds. Type 'cancel shutdown' to abort."
+    if action == "os_cancel_shutdown":
+        return "Shutdown/restart cancelled."
+    return str(result)
+
 
 _KNOWN_CMDS = [
     "/help", "/exit", "/memory", "/dream", "/save", "/recall", "/actions",
@@ -297,18 +611,57 @@ async def _handle_input(ws: WebSocket, text: str):
 
     m = re.match(r"^remind\s+me\s+(.+?)\s+((?:in|at)\s+\S.*)$", text, re.IGNORECASE)
     if m:
+        import datetime
         res = actions.call("create_task", text=m.group(1).strip(), when=m.group(2).strip())
-        await ws.send_json({"type": "reply", "text": json.dumps(res)})
+        if res.get("ok"):
+            due_str = datetime.datetime.fromtimestamp(res["due_ts"]).strftime("%I:%M %p, %b %d")
+            reply = f"Reminder set: \"{m.group(1).strip()}\" at {due_str}"
+        else:
+            reply = f"⚠  {res.get('error', 'Could not parse time')}"
+        await ws.send_json({"type": "reply", "text": reply})
         return
 
     if text == "ls":
         res = await loop.run_in_executor(_executor, lambda: actions.call("list_dir", path="."))
-        await ws.send_json({"type": "reply", "text": str(res)})
+        if isinstance(res, list):
+            lines = "\n".join(
+                f"{'📁' if r['type']=='dir' else '📄'} {r['name']}" for r in res
+            )
+        else:
+            lines = str(res)
+        await ws.send_json({"type": "reply", "text": lines})
         return
 
     if text == "tree":
         res = await loop.run_in_executor(_executor, lambda: actions.call("list_tree", path="."))
-        await ws.send_json({"type": "reply", "text": str(res)})
+        def _fmt(items, indent=0):
+            out = []
+            for item in items:
+                prefix = "  " * indent
+                if item["type"] == "dir":
+                    out.append(f"{prefix}📁 {item['name']}/")
+                    out.extend(_fmt(item.get("children", []), indent + 1))
+                else:
+                    out.append(f"{prefix}📄 {item['name']}")
+            return out
+        lines = "\n".join(_fmt(res)) if isinstance(res, list) else str(res)
+        await ws.send_json({"type": "reply", "text": lines})
+        return
+
+    # ── OS intent (runs before LLM so voice/text can control Windows) ────
+    os_intent = _try_os_intent(text)
+    if os_intent:
+        action_name, kwargs = os_intent
+        await ws.send_json({"type": "thinking"})
+        try:
+            result = await loop.run_in_executor(_executor, lambda: actions.call(action_name, **kwargs))
+        except Exception as e:
+            await ws.send_json({"type": "error", "text": str(e)})
+            return
+        reply = _format_os_result(action_name, result, kwargs)
+        mem.add("user", text)
+        mem.add("assistant", reply)
+        await ws.send_json({"type": "reply", "text": reply})
         return
 
     pre = ant.try_serve(text)
@@ -380,6 +733,42 @@ async def ws_endpoint(ws: WebSocket):
                     "safe_mode": os.environ.get("INTUITION_SAFE", "1") != "0",
                     "tasks_count": len(mem.list_tasks(status="pending")),
                 })
+
+            elif t == "voice_start":
+                voice = _state.get("voice")
+                if not voice:
+                    await ws.send_json({"type": "error", "text": "Voice unavailable — install faster-whisper and sounddevice"})
+                elif voice.is_recording():
+                    pass
+                else:
+                    _loop = asyncio.get_running_loop()
+
+                    def _on_silence():
+                        # mic closed, transcription starting
+                        asyncio.run_coroutine_threadsafe(
+                            ws.send_json({"type": "voice_recording", "active": False}),
+                            _loop,
+                        )
+
+                    def _on_complete(recognized_text: str):
+                        async def _finish():
+                            if recognized_text:
+                                await ws.send_json({"type": "voice_text", "text": recognized_text})
+                                await _handle_input(ws, recognized_text)
+                            else:
+                                await ws.send_json({"type": "error", "text": "No speech detected"})
+                        asyncio.run_coroutine_threadsafe(_finish(), _loop)
+
+                    try:
+                        voice.start_recording_vad(on_silence=_on_silence, on_complete=_on_complete)
+                        await ws.send_json({"type": "voice_recording", "active": True})
+                    except Exception as e:
+                        await ws.send_json({"type": "error", "text": f"Microphone error: {e}"})
+
+            elif t == "voice_stop":
+                voice = _state.get("voice")
+                if voice and voice.is_recording():
+                    voice.stop_now()  # signals VAD to stop; callbacks still fire
 
     except WebSocketDisconnect:
         _clients.discard(ws)

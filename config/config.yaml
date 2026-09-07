@@ -9,6 +9,11 @@ log_path: data/log.txt
 planner_schema_path: config/planner_schema.json
 system_prompt_path: config/system_prompt.txt
 
+voice:
+  enabled: true
+  model: base        # tiny (fastest) | base | small | medium (most accurate)
+  language: en
+
 anticipation:
   enabled: true
   debounce_ms: 180
@@ -20,4 +25,6 @@ hardware:
       simulate: true
       port: null
     - name: gpu_nvml
+      enabled: true
+    - name: cpu_info
       enabled: true

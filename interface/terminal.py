@@ -111,6 +111,10 @@ def bootstrap():
             from plugins.gpu_nvml import GPUNVML
             from core.actions import register_driver
             register_driver(GPUNVML(enabled=True))
+        if d.get('name')=='cpu_info' and d.get('enabled',True):
+            from plugins.cpu_info import CPUInfo
+            from core.actions import register_driver
+            register_driver(CPUInfo())
 
     return cfg, brain, mem, sched
 

@@ -12,3 +12,11 @@ dateparser>=1.2.0
 prompt_toolkit>=3.0.52
 # Optional GPU info
 nvidia-ml-py>=12.0.0
+# CPU info
+psutil>=5.9.0
+# Voice recognition
+faster-whisper>=1.0.0
+sounddevice>=0.4.6
+numpy>=1.24.0
+# OS sandbox
+pyautogui>=0.9.54

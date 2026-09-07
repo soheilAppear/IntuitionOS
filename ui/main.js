@@ -53,6 +53,12 @@ app.whenReady().then(() => {
   createWindow();
   globalShortcut.register('Alt+Space', toggleWindow);
   globalShortcut.register('CommandOrControl+Q', () => app.exit(0));
+  globalShortcut.register('Alt+V', () => {
+    if (win) {
+      if (!win.isVisible()) { win.show(); win.focus(); }
+      win.webContents.send('voice-toggle');
+    }
+  });
 });
 
 app.on('will-quit', () => globalShortcut.unregisterAll());

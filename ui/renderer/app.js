@@ -23,14 +23,18 @@ const tasksBtn     = document.getElementById('tasks-btn');
 const memoryBtn    = document.getElementById('memory-btn');
 const closeBtn     = document.getElementById('close-btn');
 const toastRoot    = document.getElementById('toast-root');
+const micBtn       = document.getElementById('mic-btn');
+const recordingBar = document.getElementById('recording-bar');
+const recLabel     = document.getElementById('rec-label');
 
 // ── State ──
 let ws = null;
-let bufferTimer = null;
-let memoryOpen  = false;
-let tasksOpen   = false;
-let expanded    = false;
-let lastCommand = '';
+let bufferTimer  = null;
+let memoryOpen   = false;
+let tasksOpen    = false;
+let expanded     = false;
+let lastCommand  = '';
+let isRecording  = false;
 
 // ── IPC ──
 ipcRenderer.on('focus-input', () => cmdInput.focus());
@@ -99,8 +103,11 @@ function handleMessage(msg) {
     case 'anticipation':onAnticipation(msg); break;
     case 'memory':      onMemory(msg.rows);  break;
     case 'tasks':       onTasks(msg.rows);   break;
-    case 'reminder':    onReminder(msg);     break;
-    case 'error':       onError(msg.text);   break;
+    case 'reminder':         onReminder(msg);            break;
+    case 'error':            onError(msg.text);          break;
+    case 'voice_recording':  onVoiceRecording(msg);      break;
+    case 'voice_transcribing': onVoiceTranscribing();    break;
+    case 'voice_text':       onVoiceText(msg.text);      break;
   }
 }
 
@@ -209,6 +216,59 @@ function onError(text) {
   outputArea.classList.add('visible');
   setTimeout(syncHeight, 16);
 }
+
+// ── Voice ──
+
+function startVoice() {
+  if (isRecording) { stopVoice(); return; }
+  isRecording = true;
+  micBtn.classList.add('recording');
+  recordingBar.classList.add('active');
+  recLabel.textContent = 'Listening...';
+  send({ type: 'voice_start' });
+  setTimeout(syncHeight, 16);
+}
+
+function stopVoice() {
+  if (!isRecording) return;
+  send({ type: 'voice_stop' });
+}
+
+function onVoiceRecording(msg) {
+  if (msg.active) {
+    recLabel.textContent = 'Listening…';
+  } else {
+    // mic closed — transcription in progress
+    isRecording = false;
+    micBtn.classList.remove('recording');
+    micBtn.classList.add('transcribing');
+    recLabel.textContent = 'Transcribing…';
+  }
+}
+
+function onVoiceTranscribing() {
+  recLabel.textContent = 'Transcribing…';
+}
+
+function onVoiceText(text) {
+  micBtn.classList.remove('recording', 'transcribing');
+  recordingBar.classList.remove('active');
+  isRecording = false;
+  if (text) {
+    lastCommand = text;  // cmd-echo will show what was heard above the reply
+    showToast(`Heard: "${text}"`);
+  }
+  setTimeout(syncHeight, 16);
+}
+
+micBtn.addEventListener('click', () => {
+  if (isRecording) stopVoice(); else startVoice();
+});
+
+// IPC from main process (Alt+V global shortcut)
+ipcRenderer.on('voice-toggle', () => {
+  if (isRecording) stopVoice(); else startVoice();
+});
 
 // ── Toast ──
 function showToast(text) {

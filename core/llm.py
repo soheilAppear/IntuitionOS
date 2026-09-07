@@ -18,27 +18,28 @@ class LLMClient:
         return "Ok. How can I help?"
 
     def _chat_ollama(self, messages):
-        # Build endpoint from env or default
         base = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
         url = f"{base}/api/chat"
-        # Compose payload
         payload = {
             "model": self.model,
             "messages": messages,
-            "options": {
-                "temperature": self.temperature,
-                "num_predict": self.max_tokens
-            },
-            "stream": False
+            "options": {"temperature": self.temperature, "num_predict": self.max_tokens},
+            "stream": False,
         }
         try:
-            # Post with timeout
             resp = requests.post(url, json=payload, timeout=60)
-            # Raise for HTTP errors
             resp.raise_for_status()
-            data = resp.json()
-            # Return the assistant content if available
-            return data.get("message", {}).get("content", "").strip() or "Ok."
+            content = resp.json().get("message", {}).get("content", "").strip()
+            return content or "Ok."
+        except requests.exceptions.ConnectionError:
+            raise RuntimeError(
+                f"Cannot reach Ollama at {base} — run: ollama serve"
+            )
+        except requests.exceptions.HTTPError as e:
+            code = e.response.status_code if e.response else "?"
+            raise RuntimeError(
+                f"Ollama returned HTTP {code} for model '{self.model}' — "
+                f"is the model pulled? Run: ollama pull {self.model}"
+            )
         except Exception as e:
-            # On error, fall back to a short string
-            return f"(local model error: {e})"
+            raise RuntimeError(f"LLM error: {e}")
