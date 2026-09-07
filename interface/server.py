@@ -1,3 +1,14 @@
+"""Local FastAPI/WebSocket adapter for the Electron HUD.
+
+The application lifespan owns shared services; each socket owns its draft,
+prediction window, and correction session. Client revisions identify edited
+drafts on the wire. Core correction tokens bind a displayed selection, while
+separate capability tokens authorize actions through the existing gate.
+
+Blocking model/action work runs in the executor. WebSocket state and message
+delivery stay on the event loop, including callbacks from scheduler/voice work.
+"""
+
 import asyncio
 import datetime
 import json
@@ -26,13 +37,16 @@ from core.actions import (
 )
 from core.anticipator import Anticipator
 from core.brain import Brain
-from core.calibration import CalibrationStore, Calibrator, load_thresholds, reliability
+from core.calibration import CalibrationStore, load_thresholds, reliability
 from core.capabilities import capabilities, is_safe_mode
 from core.consolidation import RuleStore, consolidate, render_rules
 from core.context import ContextSensor
 from core.os_intents import _try_os_intent
 from core.command_resolver import (
-    KNOWN_COMMANDS, CorrectionSession, create_default_resolver, legacy_fuzzy_slash,
+    KNOWN_COMMANDS,
+    CorrectionSession,
+    create_default_resolver,
+    legacy_fuzzy_slash,
     learning_text,
 )
 from core.episodes import EpisodeLog, PredictionWindow
@@ -43,16 +57,19 @@ from core.memory import Memory
 from core.retrieval import Retriever
 from core.scheduler import Scheduler
 from core.voice import VoiceRecognizer
-import core.os_sandbox as _os
 
+# Shared services are created during lifespan, rather than per HUD connection.
 _state: dict = {}
 _clients: set = set()
 # One prediction window per connection: what the user is typing, and what we put
 # in front of them. Keyed by socket so two HUDs do not credit each other's hints.
 _windows: dict = {}
+# Socket-owned selection state is separate from the renderer's draft revision.
 _resolutions: dict = {}
 _connections: dict = {}
+# Gate tokens carry socket/selection ownership until answered or invalidated.
 _confirmations: dict = {}
+# A dispatch fills in the outcome of the input currently handled on that socket.
 _active_notes: dict = {}
 _executor = ThreadPoolExecutor(max_workers=4)
 
@@ -73,6 +90,7 @@ def _read_json(path: str) -> dict:
 
 
 async def _broadcast(msg: dict):
+    """Send a server event to connected HUDs and discard failed recipients."""
     dead = set()
     for ws in list(_clients):
         try:
@@ -84,6 +102,7 @@ async def _broadcast(msg: dict):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Create shared services, then stop workers and save enabled learning."""
     loop = asyncio.get_running_loop()
     cfg = _load_config()
     sys_prompt = _read_text(cfg.get("system_prompt_path", "config/system_prompt.txt"))
@@ -104,7 +123,11 @@ async def lifespan(app: FastAPI):
     rcfg = cfg.get("retrieval", {}) or {}
     retriever = Retriever(mem, budget_tokens=int(rcfg.get("budget_tokens", 700)))
     brain = Brain(
-        llm, mem, sys_prompt, schema, logger=logger,
+        llm,
+        mem,
+        sys_prompt,
+        schema,
+        logger=logger,
         max_iters=int(bcfg.get("max_iters", 5)),
         budget_ms=int(bcfg.get("budget_ms", 20000)),
         history_turns=int(bcfg.get("history_turns", 6)),
@@ -126,8 +149,12 @@ async def lifespan(app: FastAPI):
         # with its own private allowlist.
         mem.add("tool", json.dumps({"scheduled": True, **outcome}, default=str)[:2000])
         asyncio.run_coroutine_threadsafe(
-            _broadcast({"type": "reply",
-                        "text": f"Scheduled action {outcome.get('action')} ran."}),
+            _broadcast(
+                {
+                    "type": "reply",
+                    "text": f"Scheduled action {outcome.get('action')} ran.",
+                }
+            ),
             loop,
         )
 
@@ -146,14 +173,19 @@ async def lifespan(app: FastAPI):
         if d.get("name") == "led_strip":
             from plugins.led_strip import LEDStrip
             from core.actions import register_driver
-            register_driver(LEDStrip(simulate=d.get("simulate", True), port=d.get("port")))
+
+            register_driver(
+                LEDStrip(simulate=d.get("simulate", True), port=d.get("port"))
+            )
         if d.get("name") == "gpu_nvml" and d.get("enabled", True):
             from plugins.gpu_nvml import GPUNVML
             from core.actions import register_driver
+
             register_driver(GPUNVML(enabled=True))
         if d.get("name") == "cpu_info" and d.get("enabled", True):
             from plugins.cpu_info import CPUInfo
             from core.actions import register_driver
+
             register_driver(CPUInfo())
 
     # ── Prediction ───────────────────────────────────────────────────────
@@ -195,19 +227,42 @@ async def lifespan(app: FastAPI):
         conf = prediction.confidence
 
         def warm(name, args):
-            return str(actions.dispatch(name, args, actor="anticipator", confidence=conf))[:4000]
+            return str(
+                actions.dispatch(name, args, actor="anticipator", confidence=conf)
+            )[:4000]
 
         t = text.strip()
         if t == "tree" or t.startswith("tree "):
-            return (text, {"reply": warm("list_tree", {"path": "."}), "confidence": conf,
-                           "why": prediction.why, "action": text})
+            return (
+                text,
+                {
+                    "reply": warm("list_tree", {"path": "."}),
+                    "confidence": conf,
+                    "why": prediction.why,
+                    "action": text,
+                },
+            )
         if t == "ls":
-            return (text, {"reply": warm("list_dir", {"path": "."}), "confidence": conf,
-                           "why": prediction.why, "action": text})
+            return (
+                text,
+                {
+                    "reply": warm("list_dir", {"path": "."}),
+                    "confidence": conf,
+                    "why": prediction.why,
+                    "action": text,
+                },
+            )
         if t.startswith("read file "):
-            path = t[len("read file "):].strip()
-            return (text, {"reply": warm("read_file", {"path": path}), "confidence": conf,
-                           "why": prediction.why, "action": text})
+            path = t[len("read file ") :].strip()
+            return (
+                text,
+                {
+                    "reply": warm("read_file", {"path": path}),
+                    "confidence": conf,
+                    "why": prediction.why,
+                    "action": text,
+                },
+            )
         # Anything else is still worth predicting even though there is nothing
         # cheap to precompute: the hint alone has value.
         return (text, {"confidence": conf, "why": prediction.why, "action": text})
@@ -242,23 +297,41 @@ async def lifespan(app: FastAPI):
         except Exception:
             voice = None
 
-    _state.update({"cfg": cfg, "brain": brain, "mem": mem, "sched": sched, "ant": ant,
-                   "voice": voice, "episodes": episodes, "sensor": sensor,
-                   "predictor": predictor, "calibrator": calibrator,
-                   "calibration_store": calibration_store, "thresholds": thresholds,
-                   "rules": rule_store, "retriever": retriever, "resolver": resolver})
+    _state.update(
+        {
+            "cfg": cfg,
+            "brain": brain,
+            "mem": mem,
+            "sched": sched,
+            "ant": ant,
+            "voice": voice,
+            "episodes": episodes,
+            "sensor": sensor,
+            "predictor": predictor,
+            "calibrator": calibrator,
+            "calibration_store": calibration_store,
+            "thresholds": thresholds,
+            "rules": rule_store,
+            "retriever": retriever,
+            "resolver": resolver,
+        }
+    )
 
-    # Pre-load Whisper model in background so first voice use is instant
+    # Preload off the event loop to reduce the first voice request's latency.
     if voice:
+
         def _preload():
             try:
                 voice._load_model()
             except Exception:
                 pass
+
         threading.Thread(target=_preload, daemon=True, name="whisper-preload").start()
 
     yield
 
+    # Read replaceable services from _state: /forget may have replaced the
+    # initial predictor/anticipator while this lifespan was active.
     _state["ant"].stop()
     try:
         if _state["episodes"].enabled:
@@ -272,9 +345,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
+
 
 def _format_os_result(action: str, result: dict, kwargs: dict) -> str:
+    """Render an OS action result using user-facing names and useful fields."""
     if result.get("error"):
         return f"⚠  {result['error']}"
     if action == "os_open_app":
@@ -306,16 +383,22 @@ def _format_os_result(action: str, result: dict, kwargs: dict) -> str:
     if action == "os_get_volume":
         return f"Current volume: {result.get('volume', '?')}%"
     if action == "os_set_brightness":
-        return f"Brightness set to {result.get('brightness', kwargs.get('level', '?'))}%"
+        return (
+            f"Brightness set to {result.get('brightness', kwargs.get('level', '?'))}%"
+        )
     if action == "os_get_brightness":
         return f"Current brightness: {result.get('brightness', '?')}%"
     if action == "os_get_battery":
         r = result
         charging = "charging" if r.get("charging") else "on battery"
-        return f"Battery: {r.get('percent')} ({charging}), {r.get('time_remaining', '')}"
+        return (
+            f"Battery: {r.get('percent')} ({charging}), {r.get('time_remaining', '')}"
+        )
     if action == "os_get_network_info":
         r = result
-        ifaces = ", ".join(f"{i['interface']} ({i['ip']})" for i in r.get("interfaces", []))
+        ifaces = ", ".join(
+            f"{i['interface']} ({i['ip']})" for i in r.get("interfaces", [])
+        )
         ssid = r.get("wifi_ssid")
         return f"Network: {ifaces or 'none'}" + (f"\nWi-Fi: {ssid}" if ssid else "")
     if action == "os_toggle_wifi":
@@ -336,11 +419,11 @@ def _format_os_result(action: str, result: dict, kwargs: dict) -> str:
     return str(result)
 
 
-
 # ── Gated dispatch ───────────────────────────────────────────────────────────
 
 
 def _outcome(result):
+    """Reduce action results to categories; None means approval is still pending."""
     if result is None:
         return "pending"
     if isinstance(result, dict):
@@ -354,13 +437,16 @@ def _outcome(result):
 
 
 def _park_confirmation(ws, token, capability, resume_token=None):
+    """Bind a gate token to its socket, input revision, and feedback records."""
     session = _resolutions.get(ws)
     note = _active_notes.get(ws, {})
     note["outcome"] = "pending"
     _confirmations[token] = {
-        "ws": ws, "revision": session.revision if session else None,
+        "ws": ws,
+        "revision": session.revision if session else None,
         "client_revision": _connections.get(ws, {}).get("client_revision"),
-        "capability": capability, "resume_token": resume_token,
+        "capability": capability,
+        "resume_token": resume_token,
         "feedback_id": session.feedback_id if session else None,
         "episode_id": note.get("episode_id"),
     }
@@ -368,6 +454,7 @@ def _park_confirmation(ws, token, capability, resume_token=None):
 
 
 def _finish_feedback(meta, outcome):
+    """Complete the correction and episode records for a parked action."""
     store = getattr(_state.get("resolver"), "feedback", None)
     if store and meta.get("feedback_id"):
         store.record_outcome(meta["feedback_id"], outcome)
@@ -394,19 +481,27 @@ async def _invalidate_input(ws, *, notify=False, resolution=True):
 
 
 async def _show_resolution(ws, text, client_revision=None):
+    """Publish a core selection snapshot tagged with the renderer's draft ID."""
     meta = _connections.setdefault(ws, {})
     if meta.get("text") != text or meta.get("client_revision") != client_revision:
+        # With changed text, session.update retains the prior display long
+        # enough to record a manual edit. Either change still revokes approvals.
         await _invalidate_input(ws, resolution=meta.get("text") == text)
     meta.update(text=text, client_revision=client_revision)
     session = _resolutions.setdefault(ws, CorrectionSession(_state["resolver"]))
     # No LLM or candidate subprocess is consulted by this hot path.
     session.update(text, context={"cwd": os.getcwd(), "ts": time.time()})
-    await ws.send_json({"type": "resolution", **session.snapshot(),
-                        "client_revision": client_revision})
+    await ws.send_json(
+        {"type": "resolution", **session.snapshot(), "client_revision": client_revision}
+    )
 
 
 async def _reset_learning_views():
-    """Drop every connection's displayed suggestions and all in-memory models."""
+    """Rebuild learning views after persisted learning is erased or disabled.
+
+    Invalidate every peer before replacing the resolver, then stop the old
+    worker before starting a predictor that can no longer read forgotten state.
+    """
     for peer in list(_resolutions):
         await _invalidate_input(peer, notify=True)
     mem = _state["mem"]
@@ -417,10 +512,13 @@ async def _reset_learning_views():
         _windows[peer] = PredictionWindow()
     cfg = _state["cfg"].get("prediction", {}) or {}
     calibrator = _state["calibration_store"].load()
-    predictor = Predictor(store=PredictorStore(mem) if episodes.enabled else None,
-                          half_life_s=float(cfg.get("half_life_s", 7 * 24 * 3600)),
-                          min_episodes=int(cfg.get("min_episodes", 50)),
-                          calibrator=calibrator, rules=_state["rules"])
+    predictor = Predictor(
+        store=PredictorStore(mem) if episodes.enabled else None,
+        half_life_s=float(cfg.get("half_life_s", 7 * 24 * 3600)),
+        min_episodes=int(cfg.get("min_episodes", 50)),
+        calibrator=calibrator,
+        rules=_state["rules"],
+    )
     _state.update(predictor=predictor, calibrator=calibrator)
     old_ant = _state["ant"]
     old_ant.stop()
@@ -428,7 +526,8 @@ async def _reset_learning_views():
     _state["sensor"] = ContextSensor(journal=get_journal())
     cfg = _state["cfg"].get("anticipation", {}) or {}
     ant = Anticipator(
-        prewarm_fn=old_ant.prewarm_fn, predictor=predictor,
+        prewarm_fn=old_ant.prewarm_fn,
+        predictor=predictor,
         context_fn=lambda: _state["sensor"].snapshot(),
         enabled=bool(cfg.get("enabled", True)),
         debounce_ms=int(cfg.get("debounce_ms", 180)),
@@ -439,8 +538,9 @@ async def _reset_learning_views():
     ant.start()
 
 
-async def _dispatch(ws: WebSocket, name: str, kwargs: dict, actor: str = "user",
-                    confidence: float = 1.0):
+async def _dispatch(
+    ws: WebSocket, name: str, kwargs: dict, actor: str = "user", confidence: float = 1.0
+):
     """Run one action through the gate, surfacing a confirmation if it needs one.
 
     Returns the action's result dict, or None when the action was parked awaiting
@@ -454,31 +554,45 @@ async def _dispatch(ws: WebSocket, name: str, kwargs: dict, actor: str = "user",
     )
     note = _active_notes.get(ws)
     if note is not None:
-        note.update(capability=name, outcome=_outcome(res),
-                    exit_code=res.get("returncode") if isinstance(res, dict) else None)
+        note.update(
+            capability=name,
+            outcome=_outcome(res),
+            exit_code=res.get("returncode") if isinstance(res, dict) else None,
+        )
     if isinstance(res, dict) and res.get("needs_confirmation"):
         binding = _park_confirmation(ws, res["token"], res["capability"])
-        await ws.send_json({
-            "type": "confirm_request",
-            "token": res["token"],
-            "capability": res["capability"],
-            "args": res.get("args", {}),
-            "reason": res.get("reason", ""),
-            "reversibility": res.get("reversibility", ""),
-            "summary": res.get("summary", ""),
-            "client_revision": binding["client_revision"],
-        })
+        await ws.send_json(
+            {
+                "type": "confirm_request",
+                "token": res["token"],
+                "capability": res["capability"],
+                "args": res.get("args", {}),
+                "reason": res.get("reason", ""),
+                "reversibility": res.get("reversibility", ""),
+                "summary": res.get("summary", ""),
+                "client_revision": binding["client_revision"],
+            }
+        )
         return None
     return res
 
 
 async def _resolve_confirmation(ws: WebSocket, token: str, granted: bool):
+    """Resolve an owned, current gate token and finish its action or model turn."""
     loop = asyncio.get_running_loop()
     meta = _confirmations.get(token)
     session = _resolutions.get(ws)
-    if (not meta or meta["ws"] is not ws
-            or (session and meta["revision"] != session.revision)):
-        await ws.send_json({"type": "error", "text": "Confirmation expired, changed, or belongs to another connection."})
+    if (
+        not meta
+        or meta["ws"] is not ws
+        or (session and meta["revision"] != session.revision)
+    ):
+        await ws.send_json(
+            {
+                "type": "error",
+                "text": "Confirmation expired, changed, or belongs to another connection.",
+            }
+        )
         return
     _confirmations.pop(token, None)
 
@@ -489,13 +603,18 @@ async def _resolve_confirmation(ws: WebSocket, token: str, granted: bool):
     if resume_token is not None:
         brain: Brain = _state["brain"]
         out = await loop.run_in_executor(
-            _executor, lambda: brain.resume(resume_token, granted, on_token=_token_sink(ws, loop))
+            _executor,
+            lambda: brain.resume(resume_token, granted, on_token=_token_sink(ws, loop)),
         )
-        _finish_feedback(meta, "ok" if granted and not out.get("error") else "cancelled")
+        _finish_feedback(
+            meta, "ok" if granted and not out.get("error") else "cancelled"
+        )
         await _send_brain_result(ws, out)
         return
 
-    res = await loop.run_in_executor(_executor, lambda: actions.confirm(token, granted=granted))
+    res = await loop.run_in_executor(
+        _executor, lambda: actions.confirm(token, granted=granted)
+    )
     _finish_feedback(meta, _outcome(res))
     mem: Memory = _state["mem"]
     if res.get("error"):
@@ -505,10 +624,19 @@ async def _resolve_confirmation(ws: WebSocket, token: str, granted: bool):
         await ws.send_json({"type": "reply", "text": f"Cancelled {res['capability']}."})
         return
     pending = meta["capability"]
-    text = _format_os_result(pending, res, {}) if pending.startswith("os_") else _summarise(res)
+    text = (
+        _format_os_result(pending, res, {})
+        if pending.startswith("os_")
+        else _summarise(res)
+    )
     await ws.send_json({"type": "reply", "text": text})
-    await ws.send_json({"type": "status", "safe_mode": is_safe_mode(),
-                        "tasks_count": len(mem.list_open())})
+    await ws.send_json(
+        {
+            "type": "status",
+            "safe_mode": is_safe_mode(),
+            "tasks_count": len(mem.list_open()),
+        }
+    )
 
 
 def _token_sink(ws: WebSocket, loop):
@@ -517,30 +645,41 @@ def _token_sink(ws: WebSocket, loop):
     With a tool loop a single turn can take several seconds per iteration, so
     without this the user watches a still panel and assumes it has hung.
     """
+
     def sink(piece: str):
-        asyncio.run_coroutine_threadsafe(ws.send_json({"type": "token", "text": piece}), loop)
+        asyncio.run_coroutine_threadsafe(
+            ws.send_json({"type": "token", "text": piece}), loop
+        )
+
     return sink
 
 
 async def _send_brain_result(ws: WebSocket, out: dict):
     """Deliver a Brain result: a reply, or a confirmation that suspended it."""
     if out.get("needs_confirmation"):
-        binding = _park_confirmation(ws, out["confirm_token"], out["capability"], out["resume_token"])
-        await ws.send_json({
-            "type": "confirm_request",
-            "token": out["confirm_token"],
-            "capability": out["capability"],
-            "args": out.get("args", {}),
-            "reason": out.get("reason", ""),
-            "reversibility": out.get("reversibility", ""),
-            "summary": "",
-            "client_revision": binding["client_revision"],
-        })
+        binding = _park_confirmation(
+            ws, out["confirm_token"], out["capability"], out["resume_token"]
+        )
+        await ws.send_json(
+            {
+                "type": "confirm_request",
+                "token": out["confirm_token"],
+                "capability": out["capability"],
+                "args": out.get("args", {}),
+                "reason": out.get("reason", ""),
+                "reversibility": out.get("reversibility", ""),
+                "summary": "",
+                "client_revision": binding["client_revision"],
+            }
+        )
         return
-    await ws.send_json({"type": "reply", "text": out.get("reply", ""), "plan": out.get("plan", [])})
+    await ws.send_json(
+        {"type": "reply", "text": out.get("reply", ""), "plan": out.get("plan", [])}
+    )
 
 
 def _summarise(res: dict) -> str:
+    """Produce the generic response used when no action-specific renderer exists."""
     if not isinstance(res, dict):
         return str(res)
     if res.get("error"):
@@ -557,54 +696,81 @@ def _fuzzy_cmd(base: str) -> str:
 
 
 async def _handle_command(ws: WebSocket, text: str):
+    """Handle an already committed IntuitionOS slash command without correction."""
     mem: Memory = _state["mem"]
     brain: Brain = _state["brain"]
     loop = asyncio.get_running_loop()
 
     if text == "/help":
-        await ws.send_json({"type": "reply", "text":
-            "Commands: " + ", ".join(_KNOWN_CMDS) + "\n"
-            "Type gti status or git statsu to preview a correction. "
-            "Up/Down or Ctrl+N/P selects alternatives; Escape keeps the original; "
-            "Enter submits the displayed choice. Shell commands use the capability gate.\n"
-            "/exec <command> (or /exec \"command\" [cwd]); /write <path> \"text\"; "
-            "/read <path>; /hw schema <device>; /task_payload '{JSON}' <when>."})
+        await ws.send_json(
+            {
+                "type": "reply",
+                "text": "Commands: " + ", ".join(_KNOWN_CMDS) + "\n"
+                "Type gti status or git statsu to preview a correction. "
+                "Up/Down or Ctrl+N/P selects alternatives; Escape keeps the original; "
+                "Enter submits the displayed choice. Shell commands use the capability gate.\n"
+                '/exec <command> (or /exec "command" [cwd]); /write <path> "text"; '
+                "/read <path>; /hw schema <device>; /task_payload '{JSON}' <when>.",
+            }
+        )
         return
 
     if text == "/exit":
         await _invalidate_input(ws)
-        await ws.send_json({"type": "exit", "text": "HUD hidden. Backend remains available."})
+        await ws.send_json(
+            {"type": "exit", "text": "HUD hidden. Backend remains available."}
+        )
         return
 
     if text == "/config":
-        await ws.send_json({"type": "reply", "text": yaml.safe_dump(_state.get("cfg", {}), sort_keys=False)})
+        await ws.send_json(
+            {
+                "type": "reply",
+                "text": yaml.safe_dump(_state.get("cfg", {}), sort_keys=False),
+            }
+        )
         return
 
     if text == "/reload":
         cfg = _load_config()
         # Live settings and prompts are safe to replace. Database, voice and
         # hardware wiring require a restart rather than orphaning live workers.
-        brain.system_prompt = _read_text(cfg.get("system_prompt_path", "config/system_prompt.txt"))
-        brain.schema = _read_json(cfg.get("planner_schema_path", "config/planner_schema.json"))
+        brain.system_prompt = _read_text(
+            cfg.get("system_prompt_path", "config/system_prompt.txt")
+        )
+        brain.schema = _read_json(
+            cfg.get("planner_schema_path", "config/planner_schema.json")
+        )
         _state["cfg"] = cfg
         episodes = _state["episodes"]
         episodes.enabled = bool((cfg.get("episodes") or {}).get("enabled", True))
         thresholds = load_thresholds(cfg.get("thresholds"))
         set_thresholds(thresholds)
         _state["thresholds"] = thresholds
-        _state["ant"].enabled = bool((cfg.get("anticipation") or {}).get("enabled", True))
+        _state["ant"].enabled = bool(
+            (cfg.get("anticipation") or {}).get("enabled", True)
+        )
         await _reset_learning_views()
-        await ws.send_json({"type": "reply", "text":
-            "Reloaded prompts, logging, anticipation and execution thresholds. "
-            "Restart the backend for model, database, voice or hardware changes."})
+        await ws.send_json(
+            {
+                "type": "reply",
+                "text": "Reloaded prompts, logging, anticipation and execution thresholds. "
+                "Restart the backend for model, database, voice or hardware changes.",
+            }
+        )
         return
 
     if text == "/memory":
         rows = mem.recent(limit=12)
-        await ws.send_json({"type": "memory", "rows": [
-            {"id": r[0], "ts": r[1], "role": r[2], "text": r[3], "tags": r[4]}
-            for r in reversed(rows)
-        ]})
+        await ws.send_json(
+            {
+                "type": "memory",
+                "rows": [
+                    {"id": r[0], "ts": r[1], "role": r[2], "text": r[3], "tags": r[4]}
+                    for r in reversed(rows)
+                ],
+            }
+        )
         return
 
     if text == "/tasks":
@@ -619,15 +785,18 @@ async def _handle_command(ws: WebSocket, text: str):
             return
         await ws.send_json({"type": "thinking"})
         ccfg = (_state.get("cfg") or {}).get("consolidation", {}) or {}
-        report = await loop.run_in_executor(_executor, lambda: consolidate(
-            episodes.recent(limit=int(ccfg.get("window", 2000))),
-            rules,
-            llm=_state["brain"].llm,
-            min_support=int(ccfg.get("min_support", 4)),
-            min_confidence=float(ccfg.get("min_confidence", 0.5)),
-            calibrator=_state.get("calibrator"),
-            calibration_store=_state.get("calibration_store"),
-        ))
+        report = await loop.run_in_executor(
+            _executor,
+            lambda: consolidate(
+                episodes.recent(limit=int(ccfg.get("window", 2000))),
+                rules,
+                llm=_state["brain"].llm,
+                min_support=int(ccfg.get("min_support", 4)),
+                min_confidence=float(ccfg.get("min_confidence", 0.5)),
+                calibrator=_state.get("calibrator"),
+                calibration_store=_state.get("calibration_store"),
+            ),
+        )
         await ws.send_json({"type": "reply", "text": report.summary()})
         return
 
@@ -641,15 +810,24 @@ async def _handle_command(ws: WebSocket, text: str):
             try:
                 rule_id = int(parts[2])
             except ValueError:
-                await ws.send_json({"type": "error", "text": "usage: /rules delete <id>"})
+                await ws.send_json(
+                    {"type": "error", "text": "usage: /rules delete <id>"}
+                )
                 return
             ok = rules.delete(rule_id)
-            await ws.send_json({"type": "reply", "text":
-                                f"Deleted rule #{rule_id}." if ok else f"No rule #{rule_id}."})
+            await ws.send_json(
+                {
+                    "type": "reply",
+                    "text": f"Deleted rule #{rule_id}."
+                    if ok
+                    else f"No rule #{rule_id}.",
+                }
+            )
             return
         show_all = len(parts) >= 2 and parts[1] in ("--all", "all")
-        await ws.send_json({"type": "reply",
-                            "text": render_rules(rules.all(active_only=not show_all))})
+        await ws.send_json(
+            {"type": "reply", "text": render_rules(rules.all(active_only=not show_all))}
+        )
         return
 
     if text.startswith("/save "):
@@ -671,23 +849,48 @@ async def _handle_command(ws: WebSocket, text: str):
         if not hits and retriever:
             hits = retriever.search(term, limit=12)
         if not hits:
-            hits = [type("R", (), {"id": r[0], "ts": r[1], "role": r[2], "text": r[3],
-                                   "tags": r[4]})() for r in mem.search(term, limit=12)]
+            hits = [
+                type(
+                    "R",
+                    (),
+                    {"id": r[0], "ts": r[1], "role": r[2], "text": r[3], "tags": r[4]},
+                )()
+                for r in mem.search(term, limit=12)
+            ]
 
-        await ws.send_json({"type": "memory", "rows": [
-            {"id": h.id, "ts": h.ts, "role": h.role, "text": h.text, "tags": h.tags}
-            for h in hits
-        ]})
+        await ws.send_json(
+            {
+                "type": "memory",
+                "rows": [
+                    {
+                        "id": h.id,
+                        "ts": h.ts,
+                        "role": h.role,
+                        "text": h.text,
+                        "tags": h.tags,
+                    }
+                    for h in hits
+                ],
+            }
+        )
 
         # And show what the situation alone would have surfaced, which is the
         # point of cue-driven retrieval: you should not have needed to ask.
         if retriever and snapshot is not None:
-            cued = [n for n in retriever.retrieve("", snapshot, k=2)
-                    if all(n.id != h.id for h in hits)]
+            cued = [
+                n
+                for n in retriever.retrieve("", snapshot, k=2)
+                if all(n.id != h.id for h in hits)
+            ]
             if cued:
-                await ws.send_json({"type": "reply", "text":
-                                    "Also relevant here right now:" + chr(10)
-                                    + chr(10).join(f"- {n.text}" for n in cued)})
+                await ws.send_json(
+                    {
+                        "type": "reply",
+                        "text": "Also relevant here right now:"
+                        + chr(10)
+                        + chr(10).join(f"- {n.text}" for n in cued),
+                    }
+                )
         return
 
     if text.startswith("/done "):
@@ -695,9 +898,13 @@ async def _handle_command(ws: WebSocket, text: str):
             tid = int(text.split(" ", 1)[1])
             actions.call("complete_task", task_id=tid)
             await ws.send_json({"type": "reply", "text": f"Task {tid} marked done."})
-            await ws.send_json({"type": "status",
-                                "tasks_count": len(mem.list_open()),
-                                "safe_mode": is_safe_mode()})
+            await ws.send_json(
+                {
+                    "type": "status",
+                    "tasks_count": len(mem.list_open()),
+                    "safe_mode": is_safe_mode(),
+                }
+            )
         except Exception:
             await ws.send_json({"type": "error", "text": "usage: /done <id>"})
         return
@@ -721,9 +928,13 @@ async def _handle_command(ws: WebSocket, text: str):
         try:
             parts = text.split(" ")
             actions.call("snooze_task", task_id=int(parts[1]), delta=parts[2])
-            await ws.send_json({"type": "reply", "text": f"Task {parts[1]} snoozed {parts[2]}."})
+            await ws.send_json(
+                {"type": "reply", "text": f"Task {parts[1]} snoozed {parts[2]}."}
+            )
         except Exception:
-            await ws.send_json({"type": "error", "text": "usage: /snooze <id> <15m|2h|1d>"})
+            await ws.send_json(
+                {"type": "error", "text": "usage: /snooze <id> <15m|2h|1d>"}
+            )
         return
 
     if text.startswith("/safe"):
@@ -731,12 +942,14 @@ async def _handle_command(ws: WebSocket, text: str):
         if len(parts) >= 2:
             res = set_safe_mode_action(state=parts[1])
             safe_on = is_safe_mode()
-            await ws.send_json({
-                "type": "status",
-                "safe_mode": safe_on,
-                "tasks_count": len(mem.list_open()),
-                "text": res.get("result", ""),
-            })
+            await ws.send_json(
+                {
+                    "type": "status",
+                    "safe_mode": safe_on,
+                    "tasks_count": len(mem.list_open()),
+                    "text": res.get("result", ""),
+                }
+            )
         else:
             await ws.send_json({"type": "error", "text": "usage: /safe on|off"})
         return
@@ -749,7 +962,7 @@ async def _handle_command(ws: WebSocket, text: str):
             idx = rest.find('"', 1)
             if idx != -1:
                 cmd = rest[1:idx]
-                cwd = rest[idx + 1:].strip() or "."
+                cwd = rest[idx + 1 :].strip() or "."
                 action_name = "run_local"
         if not cmd:
             cmd = rest
@@ -761,21 +974,25 @@ async def _handle_command(ws: WebSocket, text: str):
         return
 
     if text.startswith("/write "):
-        match = re.fullmatch(r'/write\s+(?:"([^"]+)"|(\S+))\s+"(.*)"\s*', text, re.DOTALL)
+        match = re.fullmatch(
+            r'/write\s+(?:"([^"]+)"|(\S+))\s+"(.*)"\s*', text, re.DOTALL
+        )
         if not match:
             await ws.send_json({"type": "error", "text": 'usage: /write <path> "text"'})
             return
-        result = await _dispatch(ws, "write_file", {"path": match[1] or match[2], "text": match[3]})
+        result = await _dispatch(
+            ws, "write_file", {"path": match[1] or match[2], "text": match[3]}
+        )
         if result is not None:
             await ws.send_json({"type": "reply", "text": _summarise(result)})
         return
 
     if text.startswith("/task_payload "):
-        rest = text[len("/task_payload "):].lstrip()
+        rest = text[len("/task_payload ") :].lstrip()
         try:
             quote = rest[0] if rest.startswith(("'", '"')) else ""
             payload, end = json.JSONDecoder().raw_decode(rest[1:] if quote else rest)
-            tail = rest[1 + end:] if quote else rest[end:]
+            tail = rest[1 + end :] if quote else rest[end:]
             if quote:
                 if not tail.startswith(quote):
                     raise ValueError("missing closing quote")
@@ -783,26 +1000,42 @@ async def _handle_command(ws: WebSocket, text: str):
             when = tail.strip()
             if not when:
                 raise ValueError("missing time")
-            result = await _dispatch(ws, "create_task", {"text": None, "when": when,
-                                                       "repeat": "", "payload": payload})
+            result = await _dispatch(
+                ws,
+                "create_task",
+                {"text": None, "when": when, "repeat": "", "payload": payload},
+            )
             if result is not None:
                 await ws.send_json({"type": "reply", "text": _summarise(result)})
         except (ValueError, IndexError) as error:
-            await ws.send_json({"type": "error", "text": f"usage: /task_payload '{{JSON}}' <when>: {error}"})
+            await ws.send_json(
+                {
+                    "type": "error",
+                    "text": f"usage: /task_payload '{{JSON}}' <when>: {error}",
+                }
+            )
         return
 
     if text.startswith("/read "):
         path = text.split(" ", 1)[1].strip()
-        res = await loop.run_in_executor(_executor, lambda: actions.call("read_file", path=path))
-        await ws.send_json({"type": "reply", "text": res.get("text", res.get("error", ""))})
+        res = await loop.run_in_executor(
+            _executor, lambda: actions.call("read_file", path=path)
+        )
+        await ws.send_json(
+            {"type": "reply", "text": res.get("text", res.get("error", ""))}
+        )
         return
 
     if text == "/hw":
-        await ws.send_json({"type": "reply", "text": json.dumps(actions.call("hw_list"), indent=2)})
+        await ws.send_json(
+            {"type": "reply", "text": json.dumps(actions.call("hw_list"), indent=2)}
+        )
         return
 
     if text.startswith("/hw schema "):
-        result = await _dispatch(ws, "hw_schema", {"device": text[len("/hw schema "):]})
+        result = await _dispatch(
+            ws, "hw_schema", {"device": text[len("/hw schema ") :]}
+        )
         if result is not None:
             await ws.send_json({"type": "reply", "text": _summarise(result)})
         return
@@ -824,10 +1057,16 @@ async def _handle_command(ws: WebSocket, text: str):
 
     if text == "/thresholds":
         th = _state.get("thresholds") or {}
-        lines = [f"  {k:<14} {'never' if v is None else format(float(v), '.2f')}"
-                 for k, v in th.items()]
-        await ws.send_json({"type": "reply", "text":
-                            "Cost-gated thresholds" + chr(10) + "\n".join(lines)})
+        lines = [
+            f"  {k:<14} {'never' if v is None else format(float(v), '.2f')}"
+            for k, v in th.items()
+        ]
+        await ws.send_json(
+            {
+                "type": "reply",
+                "text": "Cost-gated thresholds" + chr(10) + "\n".join(lines),
+            }
+        )
         return
 
     if text == "/forget":
@@ -847,16 +1086,25 @@ async def _handle_command(ws: WebSocket, text: str):
             return
         rows = episodes.recent(limit=15)
         if not rows:
-            await ws.send_json({"type": "reply", "text":
-                                "No episodes recorded yet." if episodes.enabled
-                                else "Episode logging is disabled in config.yaml."})
+            await ws.send_json(
+                {
+                    "type": "reply",
+                    "text": "No episodes recorded yet."
+                    if episodes.enabled
+                    else "Episode logging is disabled in config.yaml.",
+                }
+            )
             return
         lines = []
         for e in rows:
             when = datetime.datetime.fromtimestamp(e.ts).strftime("%H:%M:%S")
             hint = ""
             if e.accepted_prediction is not None:
-                hint = "  hint taken" if e.accepted_prediction else f"  hint ignored ({e.predicted})"
+                hint = (
+                    "  hint taken"
+                    if e.accepted_prediction
+                    else f"  hint ignored ({e.predicted})"
+                )
             lines.append(f"{when}  {e.action}{hint}")
         await ws.send_json({"type": "reply", "text": "\n".join(lines)})
         return
@@ -866,8 +1114,12 @@ async def _handle_command(ws: WebSocket, text: str):
         if res.get("error"):
             await ws.send_json({"type": "error", "text": res["error"]})
         else:
-            await ws.send_json({"type": "reply",
-                                "text": f"Undid {res['capability']} (journal #{res['id']})."})
+            await ws.send_json(
+                {
+                    "type": "reply",
+                    "text": f"Undid {res['capability']} (journal #{res['id']}).",
+                }
+            )
         return
 
     if text.startswith("/journal"):
@@ -881,8 +1133,10 @@ async def _handle_command(ws: WebSocket, text: str):
         for r in rows:
             when = datetime.datetime.fromtimestamp(r["ts"]).strftime("%H:%M:%S")
             mark = " (undone)" if r["undone_at"] else (" ↩" if r["undo"] else "")
-            lines.append(f"#{r['id']} {when} {r['actor']}/{r['capability']} "
-                         f"{r['decision']}{'/' + r['outcome'] if r['outcome'] else ''}{mark}")
+            lines.append(
+                f"#{r['id']} {when} {r['actor']}/{r['capability']} "
+                f"{r['decision']}{'/' + r['outcome'] if r['outcome'] else ''}{mark}"
+            )
         await ws.send_json({"type": "reply", "text": "\n".join(lines)})
         return
 
@@ -921,7 +1175,11 @@ async def _handle_input(ws: WebSocket, text: str):
     for key in ("keystroke_prefix", "predicted"):
         if signals.get(key):
             signals[key] = learning_text(signals[key])
-    episode_id = episodes.record(learned, ctx, **signals) if episodes and text.strip() != "/forget" else None
+    episode_id = (
+        episodes.record(learned, ctx, **signals)
+        if episodes and text.strip() != "/forget"
+        else None
+    )
     note["episode_id"] = episode_id
     _active_notes[ws] = note
 
@@ -949,22 +1207,34 @@ async def _handle_input(ws: WebSocket, text: str):
     predictor = _state.get("predictor")
     if predictor is not None and episodes and episodes.enabled:
         from core.episodes import Episode as _Episode
-        predictor.update(_Episode(
-            ts=time.time(), action=learned, context=ctx,
-            keystroke_prefix=signals.get("keystroke_prefix") or learned,
-        ))
+
+        predictor.update(
+            _Episode(
+                ts=time.time(),
+                action=learned,
+                context=ctx,
+                keystroke_prefix=signals.get("keystroke_prefix") or learned,
+            )
+        )
 
     # A write may have invalidated something prewarmed against the old state.
     session = _resolutions.get(ws)
     if session:
         session.outcome(note.get("outcome", "ok"))
-    if note.get("capability") in ("write_file", "/write", "/exec", "run_local", "run_command"):
+    if note.get("capability") in (
+        "write_file",
+        "/write",
+        "/exec",
+        "run_local",
+        "run_command",
+    ):
         ant = _state.get("ant")
         if ant:
             ant.invalidate()
 
 
 async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
+    """Route committed text through shell, built-in, OS-intent, or model paths."""
     brain: Brain = _state["brain"]
     mem: Memory = _state["mem"]
     ant: Anticipator = _state["ant"]
@@ -973,11 +1243,21 @@ async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
     # Parsing/ranking never authorizes a replacement here: `text` is exactly
     # the raw input or a candidate already displayed and explicitly committed.
     resolution = _state["resolver"].resolve(text, context={"cwd": os.getcwd()})
-    if not text.lstrip().startswith("/") and ((resolution.namespace == "git" and resolution.status != "unsupported") or (resolution.namespace == "shell" and resolution.status == "exact")):
+    if not text.lstrip().startswith("/") and (
+        (resolution.namespace == "git" and resolution.status != "unsupported")
+        or (resolution.namespace == "shell" and resolution.status == "exact")
+    ):
         result = await _dispatch(ws, "run_command", {"cmd": text, "cwd": "."})
         if result is not None:
-            await ws.send_json({"type": "reply", "text":
-                result.get("stdout") or result.get("stderr") or result.get("error") or _summarise(result)})
+            await ws.send_json(
+                {
+                    "type": "reply",
+                    "text": result.get("stdout")
+                    or result.get("stderr")
+                    or result.get("error")
+                    or _summarise(result),
+                }
+            )
         return
 
     if text.lstrip().startswith("/"):
@@ -990,7 +1270,12 @@ async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
 
     if resolution.status in ("correction", "incomplete", "ambiguous"):
         note["outcome"] = "error"
-        await ws.send_json({"type": "error", "text": "Original input kept unchanged; command is not recognized. Choose a displayed correction or edit it."})
+        await ws.send_json(
+            {
+                "type": "error",
+                "text": "Original input kept unchanged; command is not recognized. Choose a displayed correction or edit it.",
+            }
+        )
         return
 
     if resolution.status == "unsupported" and resolution.namespace in ("shell", "git"):
@@ -1001,10 +1286,14 @@ async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
     m = re.match(r"^remind\s+me\s+(.+?)\s+((?:in|at)\s+\S.*)$", text, re.IGNORECASE)
     if m:
         note["capability"] = "create_task"
-        res = actions.call("create_task", text=m.group(1).strip(), when=m.group(2).strip())
+        res = actions.call(
+            "create_task", text=m.group(1).strip(), when=m.group(2).strip()
+        )
         if res.get("ok"):
-            due_str = datetime.datetime.fromtimestamp(res["due_ts"]).strftime("%I:%M %p, %b %d")
-            reply = f"Reminder set: \"{m.group(1).strip()}\" at {due_str}"
+            due_str = datetime.datetime.fromtimestamp(res["due_ts"]).strftime(
+                "%I:%M %p, %b %d"
+            )
+            reply = f'Reminder set: "{m.group(1).strip()}" at {due_str}'
         else:
             reply = f"⚠  {res.get('error', 'Could not parse time')}"
         await ws.send_json({"type": "reply", "text": reply})
@@ -1012,10 +1301,12 @@ async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
 
     if text.strip() == "ls":
         note["capability"] = "list_dir"
-        res = await loop.run_in_executor(_executor, lambda: actions.call("list_dir", path="."))
+        res = await loop.run_in_executor(
+            _executor, lambda: actions.call("list_dir", path=".")
+        )
         if isinstance(res, list):
             lines = "\n".join(
-                f"{'📁' if r['type']=='dir' else '📄'} {r['name']}" for r in res
+                f"{'📁' if r['type'] == 'dir' else '📄'} {r['name']}" for r in res
             )
         else:
             lines = str(res)
@@ -1024,7 +1315,10 @@ async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
 
     if text.strip() == "tree":
         note["capability"] = "list_tree"
-        res = await loop.run_in_executor(_executor, lambda: actions.call("list_tree", path="."))
+        res = await loop.run_in_executor(
+            _executor, lambda: actions.call("list_tree", path=".")
+        )
+
         def _fmt(items, indent=0):
             out = []
             for item in items:
@@ -1035,6 +1329,7 @@ async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
                 else:
                     out.append(f"{prefix}📄 {item['name']}")
             return out
+
         lines = "\n".join(_fmt(res)) if isinstance(res, list) else str(res)
         await ws.send_json({"type": "reply", "text": lines})
         return
@@ -1065,12 +1360,14 @@ async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
     pre = ant.try_serve(text)
     if pre and isinstance(pre, dict) and ("reply" in pre or "plan" in pre):
         mem.add("assistant", pre.get("reply", ""))
-        await ws.send_json({
-            "type": "reply",
-            "text": pre.get("reply", ""),
-            "plan": pre.get("plan", []),
-            "from_cache": True,
-        })
+        await ws.send_json(
+            {
+                "type": "reply",
+                "text": pre.get("reply", ""),
+                "plan": pre.get("plan", []),
+                "from_cache": True,
+            }
+        )
         return
 
     await ws.send_json({"type": "thinking"})
@@ -1087,6 +1384,7 @@ async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
 
 
 async def _maybe_send_anticipation(ws: WebSocket, text: str):
+    """Reveal a sufficiently confident warmed prediction and record its display."""
     await asyncio.sleep(0.35)
     ant = _state.get("ant")
     if not ant:
@@ -1099,8 +1397,14 @@ async def _maybe_send_anticipation(ws: WebSocket, text: str):
         if float(pre.get("confidence", 0.0)) < ant.reveal_threshold:
             return
         try:
-            await ws.send_json({"type": "anticipation", "data": pre, "text": text,
-                                "reveal_threshold": ant.reveal_threshold})
+            await ws.send_json(
+                {
+                    "type": "anticipation",
+                    "data": pre,
+                    "text": text,
+                    "reveal_threshold": ant.reveal_threshold,
+                }
+            )
         except Exception:
             return
         # Recorded only once the send succeeded: a hint that never reached the
@@ -1111,6 +1415,11 @@ async def _maybe_send_anticipation(ws: WebSocket, text: str):
 
 
 async def _submit_input(ws, data):
+    """Validate displayed text before dispatch, or preserve exact legacy input.
+
+    A correction commitment accepts a selection only. Capability permission is
+    checked later by the selected action's normal dispatch path.
+    """
     original = data.get("text", "")
     if not isinstance(original, str) or not original.strip():
         return
@@ -1121,14 +1430,26 @@ async def _submit_input(ws, data):
         try:
             snapshot = session.snapshot()
             index = data.get("candidate_index")
-            expected = (snapshot["original"] if index is None
-                        else snapshot["candidates"][index]["text"])
+            expected = (
+                snapshot["original"]
+                if index is None
+                else snapshot["candidates"][index]["text"]
+            )
             if data.get("selected_text", expected) != expected:
                 raise ValueError("Displayed command does not match this selection")
-            text = session.commit(original, token=data["token"],
-                                  revision=data.get("revision"), candidate_index=index)
+            text = session.commit(
+                original,
+                token=data["token"],
+                revision=data.get("revision"),
+                candidate_index=index,
+            )
         except (ValueError, KeyError, TypeError, IndexError) as error:
-            await ws.send_json({"type": "error", "text": f"Stale or invalid correction: {error}. Review the current input again."})
+            await ws.send_json(
+                {
+                    "type": "error",
+                    "text": f"Stale or invalid correction: {error}. Review the current input again.",
+                }
+            )
             return
     else:
         # Older clients can still submit exact commands. A misspelling is only
@@ -1138,7 +1459,9 @@ async def _submit_input(ws, data):
             await _show_resolution(ws, original, data.get("client_revision"))
             return
         await _invalidate_input(ws)
-        _connections[ws].update(text=original, client_revision=data.get("client_revision"))
+        _connections[ws].update(
+            text=original, client_revision=data.get("client_revision")
+        )
         session.update(original, context={"cwd": os.getcwd()})
         session.commit(original, token=session.token, revision=session.revision)
         text = original
@@ -1147,6 +1470,7 @@ async def _submit_input(ws, data):
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    """Own one HUD connection and revoke its parked work when it disconnects."""
     await ws.accept()
     _clients.add(ws)
     _windows[ws] = PredictionWindow()
@@ -1154,12 +1478,14 @@ async def ws_endpoint(ws: WebSocket):
     _connections[ws] = {"text": "", "client_revision": None}
 
     mem: Memory = _state["mem"]
-    await ws.send_json({
-        "type": "status",
-        "safe_mode": is_safe_mode(),
-        "tasks_count": len(mem.list_open()),
-        "version": "1.0",
-    })
+    await ws.send_json(
+        {
+            "type": "status",
+            "safe_mode": is_safe_mode(),
+            "tasks_count": len(mem.list_open()),
+            "version": "1.0",
+        }
+    )
 
     try:
         while True:
@@ -1182,25 +1508,36 @@ async def ws_endpoint(ws: WebSocket):
                 asyncio.create_task(_maybe_send_anticipation(ws, buf))
 
             elif t == "resolve":
-                await _show_resolution(ws, data.get("text", ""), data.get("client_revision"))
+                await _show_resolution(
+                    ws, data.get("text", ""), data.get("client_revision")
+                )
 
             elif t == "input":
                 await _submit_input(ws, data)
 
             elif t == "confirm":
-                await _resolve_confirmation(ws, data.get("token", ""), bool(data.get("granted")))
+                await _resolve_confirmation(
+                    ws, data.get("token", ""), bool(data.get("granted"))
+                )
 
             elif t == "get_status":
-                await ws.send_json({
-                    "type": "status",
-                    "safe_mode": is_safe_mode(),
-                    "tasks_count": len(mem.list_open()),
-                })
+                await ws.send_json(
+                    {
+                        "type": "status",
+                        "safe_mode": is_safe_mode(),
+                        "tasks_count": len(mem.list_open()),
+                    }
+                )
 
             elif t == "voice_start":
                 voice = _state.get("voice")
                 if not voice:
-                    await ws.send_json({"type": "error", "text": "Voice unavailable — install faster-whisper and sounddevice"})
+                    await ws.send_json(
+                        {
+                            "type": "error",
+                            "text": "Voice unavailable — install faster-whisper and sounddevice",
+                        }
+                    )
                 elif voice.is_recording():
                     pass
                 else:
@@ -1216,18 +1553,27 @@ async def ws_endpoint(ws: WebSocket):
                     def _on_complete(recognized_text: str):
                         async def _finish():
                             if recognized_text:
-                                await ws.send_json({"type": "voice_text", "text": recognized_text})
+                                await ws.send_json(
+                                    {"type": "voice_text", "text": recognized_text}
+                                )
                                 # Speech is editable draft input, subject to the
                                 # same visible correction/Enter flow as typing.
                             else:
-                                await ws.send_json({"type": "error", "text": "No speech detected"})
+                                await ws.send_json(
+                                    {"type": "error", "text": "No speech detected"}
+                                )
+
                         asyncio.run_coroutine_threadsafe(_finish(), _loop)
 
                     try:
-                        voice.start_recording_vad(on_silence=_on_silence, on_complete=_on_complete)
+                        voice.start_recording_vad(
+                            on_silence=_on_silence, on_complete=_on_complete
+                        )
                         await ws.send_json({"type": "voice_recording", "active": True})
                     except Exception as e:
-                        await ws.send_json({"type": "error", "text": f"Microphone error: {e}"})
+                        await ws.send_json(
+                            {"type": "error", "text": f"Microphone error: {e}"}
+                        )
 
             elif t == "voice_stop":
                 voice = _state.get("voice")
@@ -1246,4 +1592,5 @@ async def ws_endpoint(ws: WebSocket):
 
 @app.get("/health")
 async def health():
+    """Report that the local API is responsive without querying other services."""
     return {"ok": True, "version": "1.0"}

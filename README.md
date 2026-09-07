@@ -15,6 +15,11 @@ your own hardware via Ollama, and none of it leaves the machine.
 
 The claims in this README are measured. See [Does it work?](#does-it-work).
 
+For the code itself, start with the [architecture and component guide](docs/architecture.md),
+then the [command-resolution API and protocol](docs/command-resolution.md) and
+[contributor guide](docs/development.md). The [dated milestone report](docs/2026-09-07-command-resolution.md)
+contains test feedback, evaluation results, and the HUD showcase.
+
 ---
 
 ## Two interfaces
@@ -37,7 +42,8 @@ A frameless, always-on-top ambient overlay that lives at the top of your screen.
 
 A REPL with visible command correction, Rich-formatted output, and the same brain,
 memory, predictor and gate as the HUD. Confirmations are answered at the prompt
-instead of in a bar; everything else behaves identically.
+instead of in a bar. The HUD additionally provides voice input, panels, and
+direct Windows intention routing; both interfaces share the core action policy.
 
 ---
 
@@ -269,11 +275,11 @@ So it comes with an off switch and an eraser:
 |---|---|
 | See what has been recorded | `/episodes` |
 | Erase episodes and derived prediction/correction learning | `/forget` |
-| Stop recording entirely | set `episodes.enabled: false` in `config/config.yaml` |
+| Stop episode/correction learning | set `episodes.enabled: false` in `config/config.yaml` |
 
-The action journal (`/journal`) is separate and smaller: it records only actions
-that changed something, so that `/undo` has something to reverse and so that
-"scoped exec" has an audit trail behind it.
+The action journal (`/journal`) is separate: it records attempted non-free
+actions, including denied, declined, and failed actions. Successful undoable
+actions also retain the data needed by `/undo`.
 
 Correction events share the same SQLite database. They retain the original
 command token, candidate tokens, explicit selection or manual edit, project key,
@@ -402,7 +408,7 @@ never submit, so it is not allowed to change anything at all.
 | `/hw schema <name>` | Show device schema |
 | `/actions` | List all registered actions |
 | `/config` | Print current config |
-| `/reload` | Reload config without restart |
+| `/reload` | Reload supported settings; HUD model/database/voice/hardware changes require restart |
 | `/help` | Show help |
 | `/exit` | Quit terminal mode |
 | `remind me <title> in/at <when>` | Natural language scheduling |

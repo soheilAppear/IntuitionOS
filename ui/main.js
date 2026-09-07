@@ -1,9 +1,19 @@
+/**
+ * Electron's native HUD shell.
+ *
+ * This process owns one window, global shortcuts, and height/visibility IPC.
+ * The renderer owns its content and communicates with the local backend, which
+ * owns command execution. Hiding the HUD preserves the existing renderer;
+ * CommandOrControl+Q exits the process and releases global shortcuts.
+ */
+
 const { app, BrowserWindow, globalShortcut, ipcMain, screen } = require('electron');
 const path = require('path');
 
 const HUD_W = 680;
 let win = null;
 
+/** Create the single HUD on the primary display and retain it when closed. */
 function createWindow() {
   const { width } = screen.getPrimaryDisplay().workAreaSize;
 
@@ -27,7 +37,9 @@ function createWindow() {
   });
 
   // Windows 11 acrylic blur — ignore if unavailable
-  try { win.setBackgroundMaterial('acrylic'); } catch (_) {}
+  try {
+    win.setBackgroundMaterial('acrylic');
+  } catch (_) {}
 
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 
@@ -38,6 +50,7 @@ function createWindow() {
   });
 }
 
+/** Toggle native visibility and return keyboard focus to the existing draft. */
 function toggleWindow() {
   if (!win) return;
   if (win.isVisible()) {
@@ -55,7 +68,10 @@ app.whenReady().then(() => {
   globalShortcut.register('CommandOrControl+Q', () => app.exit(0));
   globalShortcut.register('Alt+V', () => {
     if (win) {
-      if (!win.isVisible()) { win.show(); win.focus(); }
+      if (!win.isVisible()) {
+        win.show();
+        win.focus();
+      }
       win.webContents.send('voice-toggle');
     }
   });
@@ -67,9 +83,11 @@ app.on('will-quit', () => globalShortcut.unregisterAll());
 app.on('window-all-closed', (e) => e.preventDefault());
 
 // Renderer × button → hide window
-ipcMain.on('hide-window', () => { if (win) win.hide(); });
+ipcMain.on('hide-window', () => {
+  if (win) win.hide();
+});
 
-// Renderer → resize native window height
+// The renderer requests its content height; the native shell enforces bounds.
 ipcMain.on('resize', (event, height) => {
   if (!win) return;
   const { height: maxH } = screen.getPrimaryDisplay().workAreaSize;

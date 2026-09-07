@@ -52,8 +52,20 @@ def test_the_server_starts_and_stops_cleanly(app_dir):
     state = asyncio.run(boot())
 
     # Every collaborator the request handlers reach for must actually be there.
-    for key in ("cfg", "brain", "mem", "sched", "ant", "episodes", "sensor",
-                "predictor", "calibrator", "calibration_store", "thresholds", "rules"):
+    for key in (
+        "cfg",
+        "brain",
+        "mem",
+        "sched",
+        "ant",
+        "episodes",
+        "sensor",
+        "predictor",
+        "calibrator",
+        "calibration_store",
+        "thresholds",
+        "rules",
+    ):
         assert state.get(key) is not None, f"startup did not provide {key!r}"
 
 
@@ -79,7 +91,9 @@ def test_the_predictor_is_wired_to_the_rules_and_the_calibrator(app_dir):
 
     predictor = asyncio.run(boot())
     assert predictor.rules is not None, "consolidation rules never reach the predictor"
-    assert predictor.calibrator is not None, "the calibrator never reaches the predictor"
+    assert predictor.calibrator is not None, (
+        "the calibrator never reaches the predictor"
+    )
 
 
 def test_a_websocket_round_trip_works(app_dir):
@@ -167,10 +181,47 @@ def test_the_terminal_bootstraps(app_dir):
     forgotten call site is a real risk."""
     from interface import terminal
 
-    cfg, brain, mem, sched, episodes, sensor, predictor, rules, calib = terminal.bootstrap()
+    cfg, brain, mem, sched, episodes, sensor, predictor, rules, calib = (
+        terminal.bootstrap()
+    )
     try:
         assert cfg and brain and mem and episodes and sensor and predictor
         assert rules.all() == []
         assert predictor.rules is rules
     finally:
         sched.stop()
+
+
+def test_terminal_startup_wires_reminders_to_the_shared_memory(app_dir):
+    """Memory is created before the scheduler; binding must work in that order."""
+    from core.actions import actions
+    from interface import terminal
+
+    _, _, mem, sched, *_ = terminal.bootstrap()
+    try:
+        result = actions.call(
+            "create_task", text="verify terminal wiring", when="in 10m"
+        )
+        assert result.get("ok"), result
+        assert sched.memory is mem
+        assert mem.get_task(result["id"])["title"] == "verify terminal wiring"
+    finally:
+        sched.stop()
+
+
+def test_hud_startup_can_create_a_reminder_without_a_prior_session(app_dir):
+    """Exercise fresh startup through the same socket command a person uses."""
+    from fastapi.testclient import TestClient
+    from interface import server
+
+    with TestClient(server.app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.receive_json()
+            ws.send_json(
+                {"type": "input", "text": "remind me verify HUD wiring in 10m"}
+            )
+            reply = ws.receive_json()
+            assert reply["type"] == "reply"
+            assert "Reminder set" in reply["text"], reply
+            assert server._state["sched"].memory is server._state["mem"]
+            assert server._state["mem"].list_open()[0]["title"] == "verify HUD wiring"

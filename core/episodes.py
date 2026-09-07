@@ -1,26 +1,20 @@
-"""The episode log: involuntary encoding of what actually happened.
+"""Submitted actions and prediction observations stored in the local database.
 
-This is the primitive the project was missing. `/save` and `/recall` are voluntary
-— nothing is stored unless the user types it, and nothing is retrieved unless the
-user asks. Human episodic memory does not work that way: it encodes without being
-asked, binds what happened to the situation it happened in, and is retrieved by
-cues rather than by queries.
+Each episode binds an action representation to context and any previously shown
+prediction. Interfaces provide argument-free command text through ``learning_text``;
+this storage API does not redact arbitrary values supplied by other callers.
 
-An episode row is one submitted input, bound to the Context it arrived in, and —
-crucially — to what the system had predicted just beforehand. That last column is
-the whole point. A prediction that was shown and ignored records
-accepted_prediction = 0, and that negative signal is what lets Phase 4 learn from
-being wrong rather than only from being right.
-
-Recording everything a person types needs an off switch and an honest disclosure,
-so there is `enabled`, `/forget`, and a paragraph in the README.
+Prediction acceptance has three states: 1 means taken, 0 means shown but ignored,
+and None means not shown. Command-correction acceptance is separate and belongs
+to CorrectionFeedbackStore; ignored corrections are not automatic rejections.
+``enabled`` controls recording, while forgetting also clears derived learning.
 """
 
 from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from .context import Context
@@ -46,6 +40,8 @@ CREATE INDEX IF NOT EXISTS idx_episodes_action ON episodes(action);
 
 @dataclass
 class Episode:
+    """One recorded submission; optional fields allow older database rows."""
+
     id: Optional[int] = None
     ts: float = 0.0
     context: Optional[Context] = None
@@ -64,6 +60,12 @@ class Episode:
 
 
 class EpisodeLog:
+    """Migrate and access episode rows through the shared Memory connection.
+
+    Live models and workers belong to the interfaces. After ``forget``, they must
+    replace those objects so an old worker cannot restore deleted observations.
+    """
+
     def __init__(self, memory, enabled: bool = True):
         self.mem = memory
         self.enabled = enabled
@@ -104,7 +106,11 @@ class EpisodeLog:
         hesitation_ms: Optional[int] = None,
         accepted_prediction: Optional[int] = None,
     ) -> Optional[int]:
-        """Encode one submitted input. Returns the row id, or None if disabled."""
+        """Store a prepared action/context and return its ID, or None if disabled.
+
+        Callers are responsible for preparing argument-free action, prediction
+        and keystroke strings. This method stores the supplied values verbatim.
+        """
         if not self.enabled:
             return None
         return self.mem.insert(
@@ -126,19 +132,27 @@ class EpisodeLog:
         )
 
     def set_outcome(self, episode_id: int, outcome: str) -> None:
+        """Attach the execution result category; None IDs represent disabled logging."""
         if episode_id is None:
             return
-        self.mem.execute("UPDATE episodes SET outcome=? WHERE id=?", (outcome, episode_id))
+        self.mem.execute(
+            "UPDATE episodes SET outcome=? WHERE id=?", (outcome, episode_id)
+        )
 
     def set_capability(self, episode_id: int, capability: str) -> None:
+        """Attach the action chosen by the interface once dispatch is known."""
         if episode_id is None:
             return
-        self.mem.execute("UPDATE episodes SET capability=? WHERE id=?", (capability, episode_id))
+        self.mem.execute(
+            "UPDATE episodes SET capability=? WHERE id=?", (capability, episode_id)
+        )
 
     # ── Reading ──────────────────────────────────────────────────────────
 
-    _COLUMNS = ("id, ts, context_json, keystroke_prefix, predicted, predicted_conf,"
-                " action, capability, outcome, hesitation_ms, accepted_prediction")
+    _COLUMNS = (
+        "id, ts, context_json, keystroke_prefix, predicted, predicted_conf,"
+        " action, capability, outcome, hesitation_ms, accepted_prediction"
+    )
 
     def recent(self, limit: int = 200) -> list:
         rows = self.mem.query(
@@ -186,10 +200,16 @@ class EpisodeLog:
             if self.mem.has_table(table):
                 self.mem.execute(f"DELETE FROM {table}")
         from .command_resolver import CorrectionFeedbackStore
+
         CorrectionFeedbackStore(self.mem, enabled=self.enabled).forget()
         return n
 
     def forget_before(self, ts: float) -> int:
+        """Erase older episodes/corrections and discard aggregates that used them.
+
+        Callers that keep live predictors must rebuild them from surviving rows.
+        The returned count is removed episodes, not all derived database rows.
+        """
         n = self.mem.query("SELECT COUNT(*) FROM episodes WHERE ts<?", (ts,))[0][0]
         self.mem.execute("DELETE FROM episodes WHERE ts<?", (ts,))
         # Aggregates cannot subtract old observations reliably; rebuild them
@@ -198,6 +218,7 @@ class EpisodeLog:
             if self.mem.has_table(table):
                 self.mem.execute(f"DELETE FROM {table}")
         from .command_resolver import CorrectionFeedbackStore
+
         CorrectionFeedbackStore(self.mem, enabled=self.enabled).forget(before=ts)
         return n
 
@@ -210,9 +231,17 @@ def _row_to_episode(r) -> Episode:
         except Exception:
             ctx = None
     return Episode(
-        id=r[0], ts=r[1], context=ctx, keystroke_prefix=r[3] or "",
-        predicted=r[4], predicted_conf=r[5], action=r[6] or "",
-        capability=r[7], outcome=r[8], hesitation_ms=r[9], accepted_prediction=r[10],
+        id=r[0],
+        ts=r[1],
+        context=ctx,
+        keystroke_prefix=r[3] or "",
+        predicted=r[4],
+        predicted_conf=r[5],
+        action=r[6] or "",
+        capability=r[7],
+        outcome=r[8],
+        hesitation_ms=r[9],
+        accepted_prediction=r[10],
     )
 
 
@@ -229,7 +258,7 @@ class PredictionWindow:
     def __init__(self):
         self.buffer = ""
         self.last_keystroke_ts: Optional[float] = None
-        self.shown: Optional[str] = None       # the buffer a hint was shown for
+        self.shown: Optional[str] = None  # the buffer a hint was shown for
         self.shown_conf: Optional[float] = None
 
     def note_keystroke(self, text: str) -> None:

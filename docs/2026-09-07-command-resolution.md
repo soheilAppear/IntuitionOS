@@ -172,6 +172,36 @@ node --check ui/renderer/app.js
 .\.venv\Scripts\python.exe -m eval.command_resolution --showcase
 ```
 
+## Documentation and code-polish follow-up — 2026-09-07
+
+The follow-up adds an [architecture and component guide](architecture.md),
+[resolver API/protocol reference](command-resolution.md), and
+[contributor guide](development.md), linked from the README. Module and public
+API docstrings explain ownership, inputs, return values and lifecycle rules.
+Formatting expands dense control flow; comments explain argument preservation,
+review/approval tokens, shell metadata, locking and forgetting. Unused imports
+were removed. Core ranking, shell discovery, wire fields and policy are unchanged.
+
+Tracing startup uncovered a reminder bug: both interfaces installed memory
+before creating the scheduler, but only the reverse binding order connected
+them. `set_scheduler` now attaches the already-installed memory. Two new tests
+first reproduced the missing-memory failure and then passed: one through the
+terminal bootstrap, the other through the HUD's real WebSocket reminder path.
+
+| Follow-up check | Result |
+|---|---|
+| Full Python suite | **515 passed, 1 skipped**, 19.25 seconds |
+| Renderer keyboard/state tests | **6 passed** |
+| Prediction and tool-loop gate | Passed; **12/12** plans |
+| Chronological correction gate | Passed; **96.2% top-1**, **100% top-3**, **0/14** valid inputs changed |
+| Documentation links | All **61** local links in the README and three new guides resolved |
+| Source checks | Python formatting/import/name checks, both JavaScript syntax checks, and patch whitespace passed |
+
+The skip and existing TestClient deprecation warning are unchanged. These are
+local Windows results; no remote CI outcome is claimed. The earlier raw metrics
+and showcase above remain the original milestone evidence. The code polish does
+not change the displayed UI, so its reviewed screenshot remains representative.
+
 ## Remaining limits
 
 - The parser deliberately does not repair shell expressions, filenames, flags,

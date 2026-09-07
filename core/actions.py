@@ -1,15 +1,19 @@
-# Action registry and safe helpers used by the terminal, the HUD and the planner.
-#
-# The plain functions below are unchanged in spirit: they do one thing and return
-# a dict. What changed is how they are reached. Every dispatch now goes through
-# ActionRegistry.dispatch, which asks core.capabilities.gate for a verdict first
-# and writes a core.journal row for anything that is not free. The functions stay
-# plain on purpose — they remain directly importable and directly testable, and
-# the policy lives in exactly one place instead of being re-improvised at each
-# call site the way it was when run_local, write_file and hw_call each had their
-# own idea of what "safe" meant.
+"""Capability-gated action dispatch shared by both interfaces and the model.
 
-import os, json, re, shlex, subprocess, sys, shutil, time
+Register an implementation together with a Capability near the end of this
+module. Callers use ``actions.call`` or ``actions.dispatch`` so validation,
+permissions, confirmation and journalling run before the implementation.
+``actions.confirm`` consumes a parked token and checks the current gate again.
+
+The implementations remain plain functions for testing, not an alternative
+execution API. Application code must use the registry to preserve the gate.
+"""
+
+import os
+import re
+import shlex
+import subprocess
+import sys
 
 from .capabilities import (
     Capability,
@@ -24,14 +28,20 @@ from .logger import make_logger
 
 
 class ActionRegistry:
+    """Dispatch registered actions while keeping execution policy in one place.
+
+    The registry stores callable names; ``capabilities`` supplies each action's
+    argument schema, reversibility, confirmation requirements and path scope.
+    Runtime dependencies are installed by either interface during bootstrap.
+    """
+
     def __init__(self):
-        # Registry of action names to callables
         self._actions = {}
-        # Expose names for UI
+        # Public names are also used by /actions and manifest-completeness tests.
         self.names = set()
 
     def register(self, name, fn):
-        # Register callable
+        """Add an implementation; dispatch still requires a Capability entry."""
         self._actions[name] = fn
         self.names.add(name)
 
@@ -46,31 +56,50 @@ class ActionRegistry:
         """
         return self.dispatch(name, kwargs, actor="user", confidence=1.0)
 
-    def dispatch(self, name, args=None, *, actor="user", confidence=1.0, confirmed=False):
-        """The one road to a side effect.
+    def dispatch(
+        self, name, args=None, *, actor="user", confidence=1.0, confirmed=False
+    ):
+        """Validate and gate an action before executing or parking it.
 
-        Returns the action's own dict on success, or one of:
+        Returns the implementation's result (which may be a list), or one of:
           {"error": ..., "denied": True}          — the gate refused
           {"needs_confirmation": True, "token": ...} — a human must say yes
+
+        ``confirmed`` is for resuming a consumed approval; ordinary callers
+        leave it false. It skips another confirmation prompt, never the gate.
+        ``confidence`` is action/prediction evidence, not a spelling rank.
         """
         cap = capabilities.get(name)
         if not cap:
             # A name that is registered but has no manifest entry is a bug, not a
             # reason to run it unjudged.
             if name in self._actions:
-                return {"error": f"action {name} has no capability manifest entry", "denied": True}
+                return {
+                    "error": f"action {name} has no capability manifest entry",
+                    "denied": True,
+                }
             return {"error": f"unknown action: {name}"}
 
-        decision = gate(cap, args or {}, confidence=confidence, actor=actor, thresholds=_thresholds)
+        decision = gate(
+            cap, args or {}, confidence=confidence, actor=actor, thresholds=_thresholds
+        )
 
         if decision.verdict == "deny":
-            _record(actor=actor, capability=name, args=args or {}, confidence=confidence,
-                    decision="deny", outcome=None)
+            _record(
+                actor=actor,
+                capability=name,
+                args=args or {},
+                confidence=confidence,
+                decision="deny",
+                outcome=None,
+            )
             _logger(f"gate DENY {actor}/{name}: {decision.reason}")
             return {"error": decision.reason, "denied": True, "capability": name}
 
         if decision.verdict == "confirm" and not confirmed:
-            p = pending_confirmations.put(name, decision.args, actor, confidence, decision.reason)
+            p = pending_confirmations.put(
+                name, decision.args, actor, confidence, decision.reason
+            )
             return {
                 "needs_confirmation": True,
                 "token": p.token,
@@ -85,7 +114,11 @@ class ActionRegistry:
         return self._execute(cap, decision.args, actor, confidence, label)
 
     def confirm(self, token, granted=True):
-        """Resolve a parked confirmation. The token is good for one use."""
+        """Consume a parked token and cancel or dispatch its stored arguments.
+
+        Current permissions are checked again on approval. New argument values
+        from a client are never read here, so a token cannot authorize an edit.
+        """
         p = pending_confirmations.take(token)
         if not p:
             return {"error": "confirmation expired or already used"}
@@ -93,18 +126,30 @@ class ActionRegistry:
         if not cap:
             return {"error": f"unknown capability: {p.capability}"}
         if not granted:
-            _record(actor=p.actor, capability=p.capability, args=p.args,
-                    confidence=p.confidence, decision="confirm_denied", outcome=None)
+            _record(
+                actor=p.actor,
+                capability=p.capability,
+                args=p.args,
+                confidence=p.confidence,
+                decision="confirm_denied",
+                outcome=None,
+            )
             return {"ok": True, "cancelled": True, "capability": p.capability}
         # The arguments in the store were already validated and jailed by the
         # gate, so they are executed as-is rather than re-read from the wire.
         # Permissions can change while the prompt is visible (for example,
         # another client enables Safe Mode). Approval binds the stored args,
         # but never bypasses a fresh gate decision.
-        return self.dispatch(p.capability, p.args, actor=p.actor,
-                             confidence=p.confidence, confirmed=True)
+        return self.dispatch(
+            p.capability, p.args, actor=p.actor, confidence=p.confidence, confirmed=True
+        )
 
     def _execute(self, cap, args, actor, confidence, decision_label):
+        """Run a gated action between undo-state capture and journal completion.
+
+        A nonzero shell exit is an execution failure even without an ``error``
+        field. Undo data is retained only after a successful, undoable action.
+        """
         undo_payload = {}
         if cap.capture_undo:
             try:
@@ -112,21 +157,33 @@ class ActionRegistry:
             except Exception as e:
                 # Without a reversal payload the action is not reversible, so
                 # refuse rather than quietly performing an unrepeatable write.
-                return {"error": f"could not capture undo state for {cap.name}: {e}", "denied": True}
+                return {
+                    "error": f"could not capture undo state for {cap.name}: {e}",
+                    "denied": True,
+                }
 
         entry_id = None
         if cap.reversibility != "free":
-            entry_id = _record(actor=actor, capability=cap.name, args=args,
-                               confidence=confidence, decision=decision_label, outcome=None)
+            entry_id = _record(
+                actor=actor,
+                capability=cap.name,
+                args=args,
+                confidence=confidence,
+                decision=decision_label,
+                outcome=None,
+            )
 
         try:
             result = cap.fn(**args)
         except Exception as e:
             result = {"error": str(e)}
 
-        outcome = "error" if isinstance(result, dict) and (
-            result.get("error") or result.get("returncode", 0) != 0
-        ) else "ok"
+        outcome = (
+            "error"
+            if isinstance(result, dict)
+            and (result.get("error") or result.get("returncode", 0) != 0)
+            else "ok"
+        )
 
         if outcome == "ok" and cap.capture_undo_result:
             try:
@@ -136,31 +193,42 @@ class ActionRegistry:
 
         if entry_id is not None:
             _journal_ref[0].finish(
-                entry_id, outcome,
-                undo=undo_payload if (outcome == "ok" and cap.undo and undo_payload) else None,
+                entry_id,
+                outcome,
+                undo=undo_payload
+                if (outcome == "ok" and cap.undo and undo_payload)
+                else None,
             )
         return result
 
 
 actions = ActionRegistry()
 
-# Globals set by terminal
+# Both interfaces install these process-wide collaborators during bootstrap.
+# Tests replace them with temporary stores; callers must not create per-command
+# registries that bypass the configured gate policy or write a different journal.
 _scheduler = None
 _memory = None
 _logger = make_logger("data/log.txt")
 _journal_ref = [None]
-# Cost-gated confidence thresholds, populated from config.yaml in Phase 5.
+# Cost-gated confidence thresholds from config/config.yaml.
 _thresholds = None
 
 
 def set_scheduler(s):
-    # Bind scheduler and tell it about memory later
+    """Install the scheduler and connect any memory already created at startup.
+
+    Both interfaces construct Memory first. Mirror ``set_memory`` so either
+    initialization order leaves reminder actions using the same database.
+    """
     global _scheduler
     _scheduler = s
+    if _scheduler is not None and _memory is not None:
+        _scheduler.set_memory(_memory)
 
 
 def set_memory(mem):
-    # Bind memory for actions that need it, and open the journal on the same db
+    """Bind actions and their journal to one Memory store; wire an existing scheduler."""
     global _memory
     _memory = mem
     _journal_ref[0] = Journal(mem)
@@ -169,18 +237,19 @@ def set_memory(mem):
 
 
 def set_logger(logger):
-    # Replace default logger
+    """Install the diagnostic sink used by dispatch and action implementations."""
     global _logger
     _logger = logger
 
 
 def set_thresholds(thresholds):
-    # Bind the cost-gated threshold policy (Phase 5)
+    """Replace the threshold policy used by subsequent gate decisions."""
     global _thresholds
     _thresholds = thresholds
 
 
 def get_journal():
+    """Return the configured Journal, or None before memory is installed."""
     return _journal_ref[0]
 
 
@@ -190,8 +259,7 @@ def _record(**kw):
 
 
 def _is_safe():
-    # Kept as a name other modules may import; the state itself now lives in
-    # core.capabilities rather than in os.environ (Appendix A #4).
+    """Compatibility accessor for process-local Safe Mode in capabilities."""
     return is_safe_mode()
 
 
@@ -208,6 +276,7 @@ def set_safe_mode_action(state: str):
 
 # File actions
 
+
 def list_dir(path: str = "."):
     # Return flat list of items in a directory
     try:
@@ -223,6 +292,7 @@ def list_dir(path: str = "."):
 def list_tree(path: str = ".", depth: int = 3):
     # Return nested tree with limited depth
     try:
+
         def walk(p, d):
             if d < 0:
                 return []
@@ -230,10 +300,13 @@ def list_tree(path: str = ".", depth: int = 3):
             for name in os.listdir(p):
                 full = os.path.join(p, name)
                 if os.path.isdir(full):
-                    items.append({"name": name, "type": "dir", "children": walk(full, d - 1)})
+                    items.append(
+                        {"name": name, "type": "dir", "children": walk(full, d - 1)}
+                    )
                 else:
                     items.append({"name": name, "type": "file"})
             return items
+
         return walk(path, depth)
     except Exception as e:
         return {"error": str(e)}
@@ -286,7 +359,9 @@ def _undo_write(payload):
             os.remove(path)
         return {"removed": path}
     if "text" not in payload:
-        raise RuntimeError(f"prior contents of {path} were not readable: {payload.get('unreadable')}")
+        raise RuntimeError(
+            f"prior contents of {path} were not readable: {payload.get('unreadable')}"
+        )
     with open(path, "w", encoding="utf-8") as f:
         f.write(payload["text"])
     return {"restored": path, "bytes": len(payload["text"].encode("utf-8"))}
@@ -294,12 +369,17 @@ def _undo_write(payload):
 
 # Task actions
 
-def create_task(text: str = None, when: str = None, repeat: str = "", payload: dict = None):
+
+def create_task(
+    text: str = None, when: str = None, repeat: str = "", payload: dict = None
+):
     # Create a reminder
     if not _scheduler or not _memory:
         return {"error": "scheduler not ready"}
     title = text or "reminder"
-    return _scheduler.create(title=title, when=when, payload=payload or {}, repeat=repeat)
+    return _scheduler.create(
+        title=title, when=when, payload=payload or {}, repeat=repeat
+    )
 
 
 def list_tasks(status: str = "open"):
@@ -336,6 +416,7 @@ def _delta_seconds(delta: str) -> int:
 
 # Exec action
 
+
 def run_local(cmd: str, cwd: str = "."):
     # The cwd jail is enforced by the gate (path_scope="project"). The old check
     # here was target.startswith(base_dir), which let /proj-evil pass for /proj;
@@ -367,20 +448,36 @@ def run_local(cmd: str, cwd: str = "."):
     if is_safe_mode():
         return {"error": "Safe Mode is ON — use /safe off first"}
     try:
-        result = subprocess.run(cmd, cwd=target, shell=True, capture_output=True, text=True, timeout=60)
-        return {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+        result = subprocess.run(
+            cmd, cwd=target, shell=True, capture_output=True, text=True, timeout=60
+        )
+        return {
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
     except Exception as e:
         return {"error": str(e)}
 
 
 def _swap_interpreter(cmd: str, py: str) -> str:
     """Replace a leading `python` token with our interpreter, and only a token."""
-    match = re.match(r'''^\s*(?:"(?:python3?|py)"|'(?:python3?|py)'|(?:python3?|py))(?=\s|$)''', cmd, re.IGNORECASE)
+    match = re.match(
+        r"""^\s*(?:"(?:python3?|py)"|'(?:python3?|py)'|(?:python3?|py))(?=\s|$)""",
+        cmd,
+        re.IGNORECASE,
+    )
     if not match:
         return cmd
-    quoted = f'"{py}"' if (" " in py and os.name == "nt") else shlex.quote(py) if os.name != "nt" else py
+    quoted = (
+        f'"{py}"'
+        if (" " in py and os.name == "nt")
+        else shlex.quote(py)
+        if os.name != "nt"
+        else py
+    )
     start = len(cmd) - len(cmd.lstrip())
-    return cmd[:start] + quoted + cmd[match.end():]
+    return cmd[:start] + quoted + cmd[match.end() :]
 
 
 def run_command(cmd: str, cwd: str = "."):
@@ -393,6 +490,7 @@ def run_command(cmd: str, cwd: str = "."):
     if is_safe_mode():
         return {"error": "Safe Mode is ON — use /safe off first"}
     from .shell_environment import execute_command
+
     try:
         return execute_command(cmd, cwd=os.path.abspath(cwd))
     except Exception as e:
@@ -495,8 +593,14 @@ def _cap(name, fn, schema, reversibility, cost, confirm, summary, **kw):
     actions.register(name, fn)
     return capabilities.register(
         Capability(
-            name=name, fn=fn, arg_schema=schema, reversibility=reversibility,
-            est_cost_ms=cost, requires_confirmation=confirm, summary=summary, **kw
+            name=name,
+            fn=fn,
+            arg_schema=schema,
+            reversibility=reversibility,
+            est_cost_ms=cost,
+            requires_confirmation=confirm,
+            summary=summary,
+            **kw,
         )
     )
 
@@ -512,69 +616,203 @@ def _schema(props, required=()):
     }
 
 
-_cap("list_dir", list_dir, _schema({"path": _PATH}), "free", 5, False,
-     "List the entries of one directory.", path_scope="project", path_args=("path",))
+_cap(
+    "list_dir",
+    list_dir,
+    _schema({"path": _PATH}),
+    "free",
+    5,
+    False,
+    "List the entries of one directory.",
+    path_scope="project",
+    path_args=("path",),
+)
 
-_cap("list_tree", list_tree, _schema({"path": _PATH, "depth": {"type": "integer", "minimum": 0, "maximum": 6}}),
-     "free", 60, False, "List a directory recursively to a bounded depth.",
-     path_scope="project", path_args=("path",))
+_cap(
+    "list_tree",
+    list_tree,
+    _schema({"path": _PATH, "depth": {"type": "integer", "minimum": 0, "maximum": 6}}),
+    "free",
+    60,
+    False,
+    "List a directory recursively to a bounded depth.",
+    path_scope="project",
+    path_args=("path",),
+)
 
-_cap("read_file", read_file, _schema({"path": _PATH}, ["path"]), "free", 10, False,
-     "Read a UTF-8 text file and return its contents.",
-     path_scope="project", path_args=("path",))
+_cap(
+    "read_file",
+    read_file,
+    _schema({"path": _PATH}, ["path"]),
+    "free",
+    10,
+    False,
+    "Read a UTF-8 text file and return its contents.",
+    path_scope="project",
+    path_args=("path",),
+)
 
-_cap("write_file", write_file,
-     _schema({"path": _PATH, "text": {"type": "string", "maxLength": MAX_WRITE_BYTES}}, ["path", "text"]),
-     "reversible", 15, False, "Overwrite a file with new text. Undoable from the journal.",
-     path_scope="project", path_args=("path",),
-     capture_undo=_capture_write, undo=_undo_write)
+_cap(
+    "write_file",
+    write_file,
+    _schema(
+        {"path": _PATH, "text": {"type": "string", "maxLength": MAX_WRITE_BYTES}},
+        ["path", "text"],
+    ),
+    "reversible",
+    15,
+    False,
+    "Overwrite a file with new text. Undoable from the journal.",
+    path_scope="project",
+    path_args=("path",),
+    capture_undo=_capture_write,
+    undo=_undo_write,
+)
 
-_cap("list_tasks", list_tasks, _schema({"status": {"enum": ["open", "pending", "fired", "done"]}}),
-     "free", 5, False, "List reminders. Defaults to open ones (pending or already fired).")
+_cap(
+    "list_tasks",
+    list_tasks,
+    _schema({"status": {"enum": ["open", "pending", "fired", "done"]}}),
+    "free",
+    5,
+    False,
+    "List reminders. Defaults to open ones (pending or already fired).",
+)
 
-_cap("create_task", create_task,
-     _schema({"text": {"type": ["string", "null"]}, "when": {"type": ["string", "null"]},
-              "repeat": {"type": "string"}, "payload": {"type": ["object", "null"]}}),
-     "reversible", 20, False, "Schedule a reminder for a time given in plain language.",
-     capture_undo_result=lambda args, result: ({"task_id": result["id"]} if result.get("ok") else {}),
-     undo=lambda p: (_memory.delete_task(p["task_id"]), {"deleted_task": p["task_id"]})[1])
+_cap(
+    "create_task",
+    create_task,
+    _schema(
+        {
+            "text": {"type": ["string", "null"]},
+            "when": {"type": ["string", "null"]},
+            "repeat": {"type": "string"},
+            "payload": {"type": ["object", "null"]},
+        }
+    ),
+    "reversible",
+    20,
+    False,
+    "Schedule a reminder for a time given in plain language.",
+    capture_undo_result=lambda args, result: (
+        {"task_id": result["id"]} if result.get("ok") else {}
+    ),
+    undo=lambda p: (_memory.delete_task(p["task_id"]), {"deleted_task": p["task_id"]})[
+        1
+    ],
+)
 
-_cap("complete_task", complete_task, _schema({"task_id": {"type": "integer"}}, ["task_id"]),
-     "reversible", 10, False, "Mark a reminder done.",
-     capture_undo=lambda args: {"task_id": args["task_id"],
-                                "status": (_memory.get_task(args["task_id"]) or {}).get("status", "pending")},
-     undo=lambda p: (_memory.set_task_status(p["task_id"], p["status"]), {"restored_task": p["task_id"]})[1])
+_cap(
+    "complete_task",
+    complete_task,
+    _schema({"task_id": {"type": "integer"}}, ["task_id"]),
+    "reversible",
+    10,
+    False,
+    "Mark a reminder done.",
+    capture_undo=lambda args: {
+        "task_id": args["task_id"],
+        "status": (_memory.get_task(args["task_id"]) or {}).get("status", "pending"),
+    },
+    undo=lambda p: (
+        _memory.set_task_status(p["task_id"], p["status"]),
+        {"restored_task": p["task_id"]},
+    )[1],
+)
 
-_cap("snooze_task", snooze_task,
-     _schema({"task_id": {"type": "integer"}, "delta": {"type": "string", "pattern": r"^\d+[mhd]?$"}},
-             ["task_id", "delta"]),
-     "reversible", 10, False, "Push a reminder later by 15m, 2h or 1d.",
-     capture_undo=lambda args: {"task_id": args["task_id"], "delta": args["delta"]},
-     undo=lambda p: (_memory.snooze_task(p["task_id"], -_delta_seconds(p["delta"])),
-                     {"unsnoozed_task": p["task_id"]})[1])
+_cap(
+    "snooze_task",
+    snooze_task,
+    _schema(
+        {
+            "task_id": {"type": "integer"},
+            "delta": {"type": "string", "pattern": r"^\d+[mhd]?$"},
+        },
+        ["task_id", "delta"],
+    ),
+    "reversible",
+    10,
+    False,
+    "Push a reminder later by 15m, 2h or 1d.",
+    capture_undo=lambda args: {"task_id": args["task_id"], "delta": args["delta"]},
+    undo=lambda p: (
+        _memory.snooze_task(p["task_id"], -_delta_seconds(p["delta"])),
+        {"unsnoozed_task": p["task_id"]},
+    )[1],
+)
 
-_cap("delete_task", delete_task, _schema({"task_id": {"type": "integer"}}, ["task_id"]),
-     "irreversible", 10, True, "Delete a reminder permanently.")
+_cap(
+    "delete_task",
+    delete_task,
+    _schema({"task_id": {"type": "integer"}}, ["task_id"]),
+    "irreversible",
+    10,
+    True,
+    "Delete a reminder permanently.",
+)
 
-_cap("run_local", run_local, _schema({"cmd": {"type": "string", "minLength": 1}, "cwd": _PATH}, ["cmd"]),
-     "irreversible", 500, True, "Run a shell command inside the project directory.",
-     path_scope="project", path_args=("cwd",))
+_cap(
+    "run_local",
+    run_local,
+    _schema({"cmd": {"type": "string", "minLength": 1}, "cwd": _PATH}, ["cmd"]),
+    "irreversible",
+    500,
+    True,
+    "Run a shell command inside the project directory.",
+    path_scope="project",
+    path_args=("cwd",),
+)
 
-_cap("run_command", run_command,
-     _schema({"cmd": {"type": "string", "minLength": 1}, "cwd": _PATH}, ["cmd"]),
-     "irreversible", 500, True, "Run the exact displayed command in the selected execution shell.",
-     path_scope="project", path_args=("cwd",))
+_cap(
+    "run_command",
+    run_command,
+    _schema({"cmd": {"type": "string", "minLength": 1}, "cwd": _PATH}, ["cmd"]),
+    "irreversible",
+    500,
+    True,
+    "Run the exact displayed command in the selected execution shell.",
+    path_scope="project",
+    path_args=("cwd",),
+)
 
-_cap("hw_list", hw_list, _schema({}), "free", 1, False, "List registered hardware devices.")
+_cap(
+    "hw_list",
+    hw_list,
+    _schema({}),
+    "free",
+    1,
+    False,
+    "List registered hardware devices.",
+)
 
-_cap("hw_schema", hw_schema, _schema({"device": {"type": "string"}}, ["device"]), "free", 1, False,
-     "Show the actions one hardware device declares.")
+_cap(
+    "hw_schema",
+    hw_schema,
+    _schema({"device": {"type": "string"}}, ["device"]),
+    "free",
+    1,
+    False,
+    "Show the actions one hardware device declares.",
+)
 
-_cap("hw_call", hw_call,
-     _schema({"device": {"type": "string"}, "action": {"type": "string"},
-              "args": {"type": ["object", "null"]}}, ["device", "action"]),
-     "reversible", 50, False, "Invoke a declared action on a hardware device.",
-     extra_validate=_validate_hw, dynamic_confirm=_hw_needs_confirmation)
+_cap(
+    "hw_call",
+    hw_call,
+    _schema(
+        {
+            "device": {"type": "string"},
+            "action": {"type": "string"},
+            "args": {"type": ["object", "null"]},
+        },
+        ["device", "action"],
+    ),
+    "reversible",
+    50,
+    False,
+    "Invoke a declared action on a hardware device.",
+    extra_validate=_validate_hw,
+    dynamic_confirm=_hw_needs_confirmation,
+)
 
 
 def _undo_screenshot(payload):
@@ -601,77 +839,252 @@ def register_os_capabilities():
         _logger(f"os sandbox unavailable: {e}")
         return []
 
-    def _os_cap(name, fn_name, reversibility, cost, confirm, summary, schema=None, **kw):
+    def _os_cap(
+        name, fn_name, reversibility, cost, confirm, summary, schema=None, **kw
+    ):
         fn = getattr(_os, fn_name, None)
         if fn is None:
             return None
-        return _cap(name, fn, schema or _schema({}), reversibility, cost, confirm, summary, **kw)
+        return _cap(
+            name, fn, schema or _schema({}), reversibility, cost, confirm, summary, **kw
+        )
 
-    level = _schema({"level": {"type": "integer", "minimum": 0, "maximum": 100}}, ["level"])
+    level = _schema(
+        {"level": {"type": "integer", "minimum": 0, "maximum": 100}}, ["level"]
+    )
 
     # Reads: cheap and harmless, so the anticipator may prewarm them.
-    _os_cap("os_system_info", "system_info", "free", 120, False, "Report OS, RAM, disk and uptime.")
-    _os_cap("os_get_volume", "get_volume", "free", 80, False, "Read the current master volume.")
-    _os_cap("os_get_brightness", "get_brightness", "free", 200, False, "Read display brightness.")
-    _os_cap("os_get_battery", "get_battery", "free", 20, False, "Read battery level and charge state.")
-    _os_cap("os_get_network_info", "get_network_info", "free", 400, False, "Report interfaces and Wi-Fi SSID.")
-    _os_cap("os_get_clipboard", "get_clipboard", "free", 300, False, "Read the clipboard.")
-    _os_cap("os_list_windows", "list_windows", "free", 600, False, "List visible window titles.")
-    _os_cap("os_list_processes", "list_processes", "free", 300, False, "List running processes.",
-            schema=_schema({"filter_name": {"type": "string"}}))
-    _os_cap("os_cancel_shutdown", "cancel_shutdown", "free", 50, False,
-            "Cancel a pending shutdown or restart.")
+    _os_cap(
+        "os_system_info",
+        "system_info",
+        "free",
+        120,
+        False,
+        "Report OS, RAM, disk and uptime.",
+    )
+    _os_cap(
+        "os_get_volume",
+        "get_volume",
+        "free",
+        80,
+        False,
+        "Read the current master volume.",
+    )
+    _os_cap(
+        "os_get_brightness",
+        "get_brightness",
+        "free",
+        200,
+        False,
+        "Read display brightness.",
+    )
+    _os_cap(
+        "os_get_battery",
+        "get_battery",
+        "free",
+        20,
+        False,
+        "Read battery level and charge state.",
+    )
+    _os_cap(
+        "os_get_network_info",
+        "get_network_info",
+        "free",
+        400,
+        False,
+        "Report interfaces and Wi-Fi SSID.",
+    )
+    _os_cap(
+        "os_get_clipboard", "get_clipboard", "free", 300, False, "Read the clipboard."
+    )
+    _os_cap(
+        "os_list_windows",
+        "list_windows",
+        "free",
+        600,
+        False,
+        "List visible window titles.",
+    )
+    _os_cap(
+        "os_list_processes",
+        "list_processes",
+        "free",
+        300,
+        False,
+        "List running processes.",
+        schema=_schema({"filter_name": {"type": "string"}}),
+    )
+    _os_cap(
+        "os_cancel_shutdown",
+        "cancel_shutdown",
+        "free",
+        50,
+        False,
+        "Cancel a pending shutdown or restart.",
+    )
 
     # Writes that can be put back, each with the prior value captured first.
-    _os_cap("os_set_volume", "set_volume", "reversible", 400, False, "Set master volume 0-100.",
-            schema=level,
-            capture_undo=lambda a: {"level": _os.get_volume().get("volume")},
-            undo=lambda p: _os.set_volume(p["level"]) if p.get("level") is not None else {"skipped": True})
-    _os_cap("os_set_brightness", "set_brightness", "reversible", 400, False, "Set display brightness 0-100.",
-            schema=level,
-            capture_undo=lambda a: {"level": _os.get_brightness().get("brightness")},
-            undo=lambda p: _os.set_brightness(p["level"]) if p.get("level") is not None else {"skipped": True})
-    _os_cap("os_set_clipboard", "set_clipboard", "reversible", 300, False, "Replace the clipboard contents.",
-            schema=_schema({"text": {"type": "string", "maxLength": 100_000}}, ["text"]),
-            capture_undo=lambda a: {"text": _os.get_clipboard().get("text", "")},
-            undo=lambda p: _os.set_clipboard(p["text"]))
-    _os_cap("os_toggle_wifi", "toggle_wifi", "reversible", 2000, True, "Enable or disable the Wi-Fi adapter.",
-            schema=_schema({"state": {"enum": ["on", "off"]}}, ["state"]),
-            capture_undo=lambda a: {"state": "off" if a["state"] == "on" else "on"},
-            undo=lambda p: _os.toggle_wifi(p["state"]))
-    _os_cap("os_take_screenshot", "take_screenshot", "reversible", 900, False,
-            "Capture the screen to data/screenshots.",
-            capture_undo_result=lambda a, r: ({"path": r["path"]} if r.get("path") else {}),
-            undo=_undo_screenshot)
+    _os_cap(
+        "os_set_volume",
+        "set_volume",
+        "reversible",
+        400,
+        False,
+        "Set master volume 0-100.",
+        schema=level,
+        capture_undo=lambda a: {"level": _os.get_volume().get("volume")},
+        undo=lambda p: (
+            _os.set_volume(p["level"])
+            if p.get("level") is not None
+            else {"skipped": True}
+        ),
+    )
+    _os_cap(
+        "os_set_brightness",
+        "set_brightness",
+        "reversible",
+        400,
+        False,
+        "Set display brightness 0-100.",
+        schema=level,
+        capture_undo=lambda a: {"level": _os.get_brightness().get("brightness")},
+        undo=lambda p: (
+            _os.set_brightness(p["level"])
+            if p.get("level") is not None
+            else {"skipped": True}
+        ),
+    )
+    _os_cap(
+        "os_set_clipboard",
+        "set_clipboard",
+        "reversible",
+        300,
+        False,
+        "Replace the clipboard contents.",
+        schema=_schema({"text": {"type": "string", "maxLength": 100_000}}, ["text"]),
+        capture_undo=lambda a: {"text": _os.get_clipboard().get("text", "")},
+        undo=lambda p: _os.set_clipboard(p["text"]),
+    )
+    _os_cap(
+        "os_toggle_wifi",
+        "toggle_wifi",
+        "reversible",
+        2000,
+        True,
+        "Enable or disable the Wi-Fi adapter.",
+        schema=_schema({"state": {"enum": ["on", "off"]}}, ["state"]),
+        capture_undo=lambda a: {"state": "off" if a["state"] == "on" else "on"},
+        undo=lambda p: _os.toggle_wifi(p["state"]),
+    )
+    _os_cap(
+        "os_take_screenshot",
+        "take_screenshot",
+        "reversible",
+        900,
+        False,
+        "Capture the screen to data/screenshots.",
+        capture_undo_result=lambda a, r: {"path": r["path"]} if r.get("path") else {},
+        undo=_undo_screenshot,
+    )
     # Launching an app is reversible by the person sitting there — they close the
     # window. It carries no automatic undo, because killing an application the
     # user has since started typing into is worse than leaving it open.
-    _os_cap("os_open_app", "open_app", "reversible", 800, False, "Launch an application by name.",
-            schema=_schema({"name": {"type": "string", "minLength": 1}}, ["name"]))
+    _os_cap(
+        "os_open_app",
+        "open_app",
+        "reversible",
+        800,
+        False,
+        "Launch an application by name.",
+        schema=_schema({"name": {"type": "string", "minLength": 1}}, ["name"]),
+    )
     # Likewise: the user unlocks or wakes the machine themselves.
-    _os_cap("os_lock_screen", "lock_screen", "reversible", 100, False, "Lock the screen.")
-    _os_cap("os_sleep_computer", "sleep_computer", "reversible", 100, True, "Put the computer to sleep.")
+    _os_cap(
+        "os_lock_screen", "lock_screen", "reversible", 100, False, "Lock the screen."
+    )
+    _os_cap(
+        "os_sleep_computer",
+        "sleep_computer",
+        "reversible",
+        100,
+        True,
+        "Put the computer to sleep.",
+    )
 
     # Cannot be taken back by anyone. These are the ones that were completely
     # ungated before, reachable from a single regex match on speech.
-    _os_cap("os_kill_process", "kill_process", "irreversible", 200, True, "Terminate a process by name.",
-            schema=_schema({"name": {"type": "string", "minLength": 1}}, ["name"]))
-    _os_cap("os_shutdown_computer", "shutdown_computer", "irreversible", 100, True, "Shut the computer down.",
-            schema=_schema({"delay_sec": {"type": "integer", "minimum": 0, "maximum": 3600}}))
-    _os_cap("os_restart_computer", "restart_computer", "irreversible", 100, True, "Restart the computer.",
-            schema=_schema({"delay_sec": {"type": "integer", "minimum": 0, "maximum": 3600}}))
-    _os_cap("os_type_text", "type_text", "irreversible", 500, True, "Type text as synthetic keystrokes.",
-            schema=_schema({"text": {"type": "string", "maxLength": 4000}}, ["text"]))
-    _os_cap("os_move_mouse", "move_mouse", "irreversible", 100, True, "Move the mouse pointer.",
-            schema=_schema({"x": {"type": "integer"}, "y": {"type": "integer"}}, ["x", "y"]))
-    _os_cap("os_click", "click", "irreversible", 100, True, "Click the mouse.",
-            schema=_schema({"x": {"type": ["integer", "null"]}, "y": {"type": ["integer", "null"]},
-                            "button": {"enum": ["left", "right", "middle"]}}))
+    _os_cap(
+        "os_kill_process",
+        "kill_process",
+        "irreversible",
+        200,
+        True,
+        "Terminate a process by name.",
+        schema=_schema({"name": {"type": "string", "minLength": 1}}, ["name"]),
+    )
+    _os_cap(
+        "os_shutdown_computer",
+        "shutdown_computer",
+        "irreversible",
+        100,
+        True,
+        "Shut the computer down.",
+        schema=_schema(
+            {"delay_sec": {"type": "integer", "minimum": 0, "maximum": 3600}}
+        ),
+    )
+    _os_cap(
+        "os_restart_computer",
+        "restart_computer",
+        "irreversible",
+        100,
+        True,
+        "Restart the computer.",
+        schema=_schema(
+            {"delay_sec": {"type": "integer", "minimum": 0, "maximum": 3600}}
+        ),
+    )
+    _os_cap(
+        "os_type_text",
+        "type_text",
+        "irreversible",
+        500,
+        True,
+        "Type text as synthetic keystrokes.",
+        schema=_schema({"text": {"type": "string", "maxLength": 4000}}, ["text"]),
+    )
+    _os_cap(
+        "os_move_mouse",
+        "move_mouse",
+        "irreversible",
+        100,
+        True,
+        "Move the mouse pointer.",
+        schema=_schema(
+            {"x": {"type": "integer"}, "y": {"type": "integer"}}, ["x", "y"]
+        ),
+    )
+    _os_cap(
+        "os_click",
+        "click",
+        "irreversible",
+        100,
+        True,
+        "Click the mouse.",
+        schema=_schema(
+            {
+                "x": {"type": ["integer", "null"]},
+                "y": {"type": ["integer", "null"]},
+                "button": {"enum": ["left", "right", "middle"]},
+            }
+        ),
+    )
 
     return [n for n in capabilities.names() if n.startswith("os_")]
 
 
 # ── Journal-backed commands ──────────────────────────────────────────────────
+
 
 def undo_last():
     """Reverse the most recent reversible action."""
