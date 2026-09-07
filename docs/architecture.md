@@ -61,11 +61,11 @@ atomically across processes.
 
 | Component | Source | Responsibility |
 |---|---|---|
-| HUD launcher | [start_ui.py](../start_ui.py) | Start the backend, launch Electron, terminate its backend when Electron exits |
+| HUD launcher | [start_ui.py](../start_ui.py) | Wait for backend health, launch native Electron, supervise and clean up owned child processes |
 | Terminal entry | [intuitionos.py](../intuitionos.py), [terminal.py](../interface/terminal.py) | Bootstrap collaborators, display reviewed commands, handle built-ins and confirmations |
 | Backend | [server.py](../interface/server.py) | FastAPI lifespan, WebSocket routing, per-client selections/approvals, streamed replies |
 | Desktop window | [main.js](../ui/main.js) | Window placement, visibility, resize IPC, global shortcuts |
-| HUD renderer | [app.js](../ui/renderer/app.js), [index.html](../ui/renderer/index.html), [style.css](../ui/renderer/style.css) | Input draft, highlighted alternatives, confirmation bar, memory/task panels |
+| HUD renderer | [app.js](../ui/renderer/app.js), [index.html](../ui/renderer/index.html), [style.css](../ui/renderer/style.css) | Input draft, highlighted alternatives, confirmation bar, panels, offline/reconnect and voice feedback |
 | Command resolution | [command_resolver.py](../core/command_resolver.py) | Available-command providers, safe replacement spans, spelling/context ranking, explicit feedback |
 | Execution environment | [shell_environment.py](../core/shell_environment.py) | Match shell discovery to execution; read PowerShell snapshots without invoking candidates |
 | OS intent grammar | [os_intents.py](../core/os_intents.py) | Reserve existing app phrases and map HUD natural-language Windows requests |
@@ -87,6 +87,26 @@ atomically across processes.
 | Windows operations | [os_sandbox.py](../core/os_sandbox.py) | Platform-specific app, clipboard, volume, screen, process and input operations |
 | Hardware adapters | [plugins/](../plugins) | Driver schemas and CPU/GPU/LED implementations; LED control is simulated by default |
 | Verification | [tests/](../tests), [eval/](../eval) | Behavioral regression tests, synthetic chronological evaluations, showcase output |
+
+## HUD startup and recovery
+
+`start_ui.py` owns one backend/Electron pair. It checks for an existing listener,
+starts the backend with its own Python interpreter, and waits for a valid
+`/health` response before opening the HUD. Startup failure and timeout are
+reported in the launcher terminal. On Windows it launches the native Electron
+binary, avoiding a CMD shim whose lifetime may differ from the window's.
+The launcher must remain running to supervise its children. Normal quit or an
+unexpected child exit triggers cleanup; Windows cleanup targets the owned PID
+trees so a venv redirector cannot leave its backend child behind. An unrelated
+process already using the port is diagnosed, not adopted or stopped.
+
+An independently launched renderer can outlive its backend. It displays
+`OFFLINE`, preserves the current draft, and clears stale correction, approval,
+and recording states when the socket closes. A failed send does not clear an
+unsent command. On reconnect it advances its draft revision and requests a new
+resolution of the current text. Commands and approvals are never replayed; the
+user must submit a freshly displayed selection. This is distinct from the
+launcher, which closes its own HUD if its backend exits unexpectedly.
 
 ## Follow one command
 
@@ -147,6 +167,21 @@ reminders `fired`; the user marks them done. Repeating reminders advance from th
 previous due time. Stored action payloads dispatch as `actor="scheduler"`;
 irreversible payloads are denied and actions requiring confirmation are not run
 unattended. The app must be running to deliver reminders.
+
+**Voice.** The backend owns one `VoiceRecognizer`; recording uses the Windows
+default input device through `sounddevice`. A worker captures audio, detects
+silence, and transcribes it locally with Whisper. Initial model preparation may
+download weights and happens independently of Ollama. A model-loading lock
+prevents concurrent setup. Microphone and transcription errors reach the HUD
+instead of leaving its recording/transcribing indicator active indefinitely.
+
+The initial `status` message includes `voice: {state, available, text}`.
+Subsequent transitions use `voice_status`, with states such as `loading`,
+`ready`, `recording`, `transcribing`, `disabled`, and `error`. Voice errors carry
+`source: "voice"`; recoverable capture failures leave retry available. The
+backend tracks the recording's owning socket and stops capture if that socket
+disconnects. A completed transcript is delivered as `voice_text`, which fills
+the editable input and starts command review without automatic submission.
 
 ## State ownership and persistence
 
@@ -211,3 +246,5 @@ work, not command-correction inference.
 
 Continue with the [contributor guide](development.md) for changes and checks, or
 the [measured milestone report](2026-09-07-command-resolution.md) for test results.
+The [HUD recovery report](2026-09-07-hud-recovery.md) records the launcher,
+connection, and microphone investigation with live verification.

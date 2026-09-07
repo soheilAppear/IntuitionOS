@@ -100,6 +100,36 @@ async def _broadcast(msg: dict):
     _clients.difference_update(dead)
 
 
+def _voice_info():
+    return dict(
+        _state.get(
+            "voice_status",
+            {
+                "state": "disabled",
+                "available": False,
+                "text": "Voice is disabled in config.yaml.",
+            },
+        )
+    )
+
+
+async def _set_voice_status(state, available, text):
+    """Voice workers report lifecycle on the event loop, including failures."""
+    info = {"state": state, "available": available, "text": text}
+    _state["voice_status"] = info
+    await _broadcast({"type": "voice_status", **info})
+
+
+def _queue_voice_callback(loop, callback):
+    if loop.is_closed():
+        return
+    future = asyncio.run_coroutine_threadsafe(callback(), loop)
+    # Delivery to a disconnected socket must not produce an unobserved future.
+    future.add_done_callback(
+        lambda done: done.exception() if not done.cancelled() else None
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Create shared services, then stop workers and save enabled learning."""
@@ -288,14 +318,29 @@ async def lifespan(app: FastAPI):
     # ── Voice ────────────────────────────────────────────────────────────
     voice: VoiceRecognizer | None = None
     voice_cfg = cfg.get("voice", {}) or {}
+    voice_status = {
+        "state": "disabled",
+        "available": False,
+        "text": "Voice is disabled in config.yaml.",
+    }
     if voice_cfg.get("enabled", True):
         try:
             voice = VoiceRecognizer(
                 model_size=voice_cfg.get("model", "base"),
                 language=voice_cfg.get("language", "en"),
             )
-        except Exception:
+            voice_status = {
+                "state": "loading",
+                "available": False,
+                "text": "Preparing voice model (first setup may download model files)…",
+            }
+        except Exception as error:
             voice = None
+            voice_status = {
+                "state": "error",
+                "available": False,
+                "text": f"Voice setup failed: {error}",
+            }
 
     _state.update(
         {
@@ -305,6 +350,8 @@ async def lifespan(app: FastAPI):
             "sched": sched,
             "ant": ant,
             "voice": voice,
+            "voice_status": voice_status,
+            "voice_owner": None,
             "episodes": episodes,
             "sensor": sensor,
             "predictor": predictor,
@@ -322,9 +369,18 @@ async def lifespan(app: FastAPI):
 
         def _preload():
             try:
-                voice._load_model()
-            except Exception:
-                pass
+                voice.prepare()
+                state, available, detail = "ready", True, "Voice is ready."
+            except Exception as error:
+                state, available = "error", False
+                detail = f"Voice setup failed ({voice.model_size}): {error}"
+                logger(detail)
+
+            async def report():
+                if _state.get("voice") is voice:
+                    await _set_voice_status(state, available, detail)
+
+            _queue_voice_callback(loop, report)
 
         threading.Thread(target=_preload, daemon=True, name="whisper-preload").start()
 
@@ -333,6 +389,8 @@ async def lifespan(app: FastAPI):
     # Read replaceable services from _state: /forget may have replaced the
     # initial predictor/anticipator while this lifespan was active.
     _state["ant"].stop()
+    if _state.get("voice"):
+        _state["voice"].stop_now()
     try:
         if _state["episodes"].enabled:
             _state["predictor"].save()
@@ -1484,6 +1542,7 @@ async def ws_endpoint(ws: WebSocket):
             "safe_mode": is_safe_mode(),
             "tasks_count": len(mem.list_open()),
             "version": "1.0",
+            "voice": _voice_info(),
         }
     )
 
@@ -1526,32 +1585,49 @@ async def ws_endpoint(ws: WebSocket):
                         "type": "status",
                         "safe_mode": is_safe_mode(),
                         "tasks_count": len(mem.list_open()),
+                        "voice": _voice_info(),
                     }
                 )
 
             elif t == "voice_start":
                 voice = _state.get("voice")
-                if not voice:
+                info = _voice_info()
+                if not voice or not info["available"]:
                     await ws.send_json(
                         {
                             "type": "error",
-                            "text": "Voice unavailable — install faster-whisper and sounddevice",
+                            "source": "voice",
+                            "text": info["text"],
                         }
                     )
-                elif voice.is_recording():
-                    pass
+                    await ws.send_json({"type": "voice_status", **info})
+                elif voice.is_busy():
+                    await ws.send_json(
+                        {
+                            "type": "error",
+                            "source": "voice",
+                            "text": "Voice is already recording or transcribing.",
+                        }
+                    )
                 else:
                     _loop = asyncio.get_running_loop()
+                    _state["voice_owner"] = ws
 
                     def _on_silence():
-                        # mic closed, transcription starting
-                        asyncio.run_coroutine_threadsafe(
-                            ws.send_json({"type": "voice_recording", "active": False}),
-                            _loop,
-                        )
+                        async def report():
+                            await _set_voice_status(
+                                "transcribing", True, "Transcribing speech…"
+                            )
+                            await ws.send_json(
+                                {"type": "voice_recording", "active": False}
+                            )
+
+                        _queue_voice_callback(_loop, report)
 
                     def _on_complete(recognized_text: str):
                         async def _finish():
+                            _state["voice_owner"] = None
+                            await _set_voice_status("ready", True, "Voice is ready.")
                             if recognized_text:
                                 await ws.send_json(
                                     {"type": "voice_text", "text": recognized_text}
@@ -1560,19 +1636,44 @@ async def ws_endpoint(ws: WebSocket):
                                 # same visible correction/Enter flow as typing.
                             else:
                                 await ws.send_json(
-                                    {"type": "error", "text": "No speech detected"}
+                                    {
+                                        "type": "error",
+                                        "source": "voice",
+                                        "text": "No speech detected. Check the selected Windows input device and microphone level.",
+                                    }
                                 )
 
-                        asyncio.run_coroutine_threadsafe(_finish(), _loop)
+                        _queue_voice_callback(_loop, _finish)
+
+                    def _on_error(detail):
+                        async def report():
+                            _state["voice_owner"] = None
+                            await _set_voice_status("error", True, detail)
+                            await ws.send_json(
+                                {"type": "error", "source": "voice", "text": detail}
+                            )
+
+                        _queue_voice_callback(_loop, report)
 
                     try:
-                        voice.start_recording_vad(
-                            on_silence=_on_silence, on_complete=_on_complete
-                        )
+                        # Announce capture before starting its worker: a fast
+                        # device failure must never be followed by stale "on".
+                        await _set_voice_status("recording", True, "Listening…")
                         await ws.send_json({"type": "voice_recording", "active": True})
+                        voice.start_recording_vad(
+                            on_silence=_on_silence,
+                            on_complete=_on_complete,
+                            on_error=_on_error,
+                        )
                     except Exception as e:
+                        _state["voice_owner"] = None
+                        await _set_voice_status("error", True, f"Microphone error: {e}")
                         await ws.send_json(
-                            {"type": "error", "text": f"Microphone error: {e}"}
+                            {
+                                "type": "error",
+                                "source": "voice",
+                                "text": f"Microphone error: {e}",
+                            }
                         )
 
             elif t == "voice_stop":
@@ -1583,6 +1684,8 @@ async def ws_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
+        if _state.get("voice_owner") is ws and _state.get("voice"):
+            _state["voice"].stop_now()
         await _invalidate_input(ws)
         _clients.discard(ws)
         _windows.pop(ws, None)

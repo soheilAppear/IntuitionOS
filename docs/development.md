@@ -4,6 +4,8 @@ Read [the architecture guide](architecture.md) for component ownership and
 [the resolver reference](command-resolution.md) for command-review contracts.
 The [README](../README.md) is the user-facing setup and command guide; dated
 reports in `docs/` describe measured results rather than API specifications.
+For the launcher and microphone fixes, see the
+[HUD recovery report](2026-09-07-hud-recovery.md).
 
 ## Set up and run
 
@@ -35,10 +37,41 @@ npm start
 ```
 
 Run project commands from the repository root except the renderer-only npm
-command. Backend port `7432` must be free before `start_ui.py` starts. The HUD
-toggle is Alt+Space; Ctrl+Q exits. Start Ollama separately for model-assisted
+command. Keep the `start_ui.py` terminal running: it waits for a valid local
+`/health` response before opening the native Electron binary and supervises both
+children. It reports startup failure or unexpected backend exit instead of
+leaving an unusable overlay. Ctrl+C in the launcher or Ctrl+Q in the HUD cleans
+up the processes it owns; on Windows this includes the child trees beneath
+venv redirectors. Alt+Space only hides or shows the HUD.
+
+Backend port `7432` must be free for a new full launch. An existing healthy
+backend can serve an overlay-only launch; the launcher diagnoses an occupied
+port without stopping its owner. Start Ollama separately for model-assisted
 requests and install the model named in `config/config.yaml`. Correction,
 ordinary built-ins and the automated test fixtures do not require Ollama.
+
+If the HUD shows `OFFLINE` or Enter appears ineffective, check the launcher
+terminal and the local endpoint:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:7432/health
+Get-NetTCPConnection -LocalPort 7432 -State Listen | Select-Object OwningProcess
+```
+
+The health reply must identify the running backend; a listening port alone does
+not establish application readiness. `npm start` launches only Electron. After
+reconnection, the renderer sends its current draft for fresh resolution and
+requires a newly displayed selection; it never replays an input or approval.
+Enter before that review arrives requests review without executing anything.
+
+Voice uses `faster-whisper` and `sounddevice` in this same Python environment.
+The initial Whisper model preparation may download weights, independently of
+Ollama. The HUD reports loading/readiness and setup/device/transcription errors;
+a recoverable capture error permits retry. Select and test the intended default
+input in Windows sound settings and allow microphone access for desktop apps.
+Voice text remains an editable draft and follows the normal Enter/review flow.
+Restart the backend after changing voice configuration; `/reload` does not
+recreate the voice service.
 
 For PowerShell aliases/functions, run the snapshot launcher from the intended
 session: `./scripts/start-intuition.ps1 -Interface terminal` or `-Interface hud`.
@@ -139,6 +172,8 @@ Local Windows success does not certify another OS or an unobserved CI run.
 | Prompt rendering and terminal dispatch | `tests/test_terminal_resolution.py` |
 | WebSocket state, confirmation and forgetting | `tests/test_hud_resolution.py` |
 | HUD keyboard/rendering behavior | `tests/hud_renderer_test.cjs` |
+| Launcher readiness, occupied ports, child supervision and cleanup | `tests/test_ui_launcher.py` |
+| Voice loading, capture/transcription failures and callback completion | `tests/test_voice.py` |
 | Component wiring and fresh reminder startup | `tests/test_startup.py` |
 | Gate policy, journal and reversal | `tests/test_capabilities.py`, `tests/test_journal.py` |
 | Memory use and learning | `tests/test_episodes.py`, `tests/test_retrieval.py`, `tests/test_predictor.py`, `tests/test_calibration.py`, `tests/test_consolidation.py` |
@@ -155,6 +190,13 @@ Tests for `Memory`'s raw helpers are not a substitute for startup coverage:
 the scheduler must receive that memory object in the actual interface bootstrap.
 Keep initialization order and reload/forget/shutdown transitions represented in
 integration tests.
+
+For connection changes, cover a HUD launched before its backend, draft edits
+while offline, failed sends, reconnection, and stale approvals. For voice,
+exercise setup failure and errors after recording has begun; the UI must leave
+its busy state on either failure. Automated voice tests use substitute devices
+and models. Record a live microphone check separately and state whether it
+actually captured and transcribed speech.
 
 ## Evaluate and show the result
 

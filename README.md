@@ -19,6 +19,8 @@ For the code itself, start with the [architecture and component guide](docs/arch
 then the [command-resolution API and protocol](docs/command-resolution.md) and
 [contributor guide](docs/development.md). The [dated milestone report](docs/2026-09-07-command-resolution.md)
 contains test feedback, evaluation results, and the HUD showcase.
+The [HUD recovery report](docs/2026-09-07-hud-recovery.md) covers launcher,
+connection, and microphone fixes with live verification.
 
 ---
 
@@ -79,9 +81,36 @@ python start_ui.py
 
 Use `Alt+Space` to toggle the HUD. `Ctrl+Q` to quit.
 
+**Keep the launcher terminal open.** `start_ui.py` waits for the backend's
+`/health` response before opening Electron and supervises both processes.
+Ctrl+C in the launcher or Ctrl+Q in the HUD stops the children it started;
+Windows cleanup includes their child process trees. If the backend crashes,
+the launcher closes its HUD and reports the backend error.
+
 If port `7432` is already occupied by an IntuitionOS backend, launch just the
-overlay with `cd ui` followed by `npm start`. A different service on that port
-must be identified first; starting another backend will fail.
+overlay with `cd ui` followed by `npm start`, keeping that backend's launcher
+running. `npm start` alone does not start Python. The full launcher checks an
+occupied port and explains whether an existing backend is healthy; it never
+stops another process to free the port.
+
+### HUD troubleshooting
+
+| Symptom | What to do |
+|---|---|
+| `OFFLINE`, reconnecting, or Enter cannot submit | Run `.\.venv\Scripts\python.exe start_ui.py` from the project root and keep its terminal open. Read any startup error there. The HUD preserves the draft and requests a fresh review when it reconnects. |
+| Enter shows a review instead of running the command | Wait for the current candidate to appear, then press Enter again. A newly edited command must be displayed before it can be submitted. |
+| Port `7432` is occupied | Check `http://127.0.0.1:7432/health`. If an existing IntuitionOS backend is healthy, use the overlay-only command above. Otherwise identify the listener or check the backend's startup output before retrying. |
+| Microphone is dimmed or preparing | Click or hover over it for the reason. Voice uses a separate Whisper model; first setup may download its files. Text commands remain usable while voice prepares. |
+| No speech is detected or a microphone error appears | Select the intended default input in Windows sound settings, check its input meter and microphone permission for desktop apps, then retry. A virtual or streaming input may be selected instead of your physical microphone. Restart the launcher after changing devices if needed. |
+
+Mic input uses the **Windows default input device**. Press Alt+V or click the
+mic to record; stop with the same control or pause for silence detection.
+Loading, device, and transcription failures now produce visible feedback and
+clear the recording indicator. Transcription runs locally after the model is
+available. Speech fills an editable draft—it is never submitted automatically.
+
+See the [recovery report](docs/2026-09-07-hud-recovery.md) for the observed failure,
+fixes, and live checks.
 
 ### Terminal
 

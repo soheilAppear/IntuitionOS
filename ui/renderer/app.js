@@ -33,6 +33,7 @@ const { ipcRenderer } = require('electron');
 
 const WS_URL = 'ws://127.0.0.1:7432/ws';
 const RECONNECT_MS = 2500;
+const DISCONNECTED_MESSAGE = 'The IntuitionOS backend is disconnected. Start the project launcher and wait for reconnection. Your text is preserved.';
 
 // ── DOM refs ──
 const hud = document.getElementById('hud');
@@ -68,6 +69,12 @@ const correctionChoices = document.getElementById('correction-choices');
 
 // ── State ──
 let ws = null;
+let reconnectTimer = null;
+let hasConnected = false;
+let connectionErrorVisible = false;
+let safeMode = null;
+let voiceAvailable = null;
+let voiceStatusText = '';
 let bufferTimer = null;
 let memoryOpen = false;
 let tasksOpen = false;
@@ -116,32 +123,97 @@ function collapsePanel() {
 // ── WebSocket ──
 /** Connect to the local backend and discard stale UI commitments on disconnect. */
 function connect() {
-  ws = new WebSocket(WS_URL);
+  const socket = new WebSocket(WS_URL);
+  ws = socket;
+  updateConnectionUI();
 
-  ws.onopen = () => {
+  socket.onopen = () => {
+    if (socket !== ws) return;
+    // A restarted backend cannot honor the previous connection's tokens.
+    clearResolution();
+    clearConfirm();
+    if (hasConnected) inputRevision += 1;
+    hasConnected = true;
+    voiceAvailable = null;
+    voiceStatusText = '';
     cmdInput.placeholder = 'Ask or command…';
+    updateConnectionUI();
+    if (connectionErrorVisible) {
+      outputText.innerHTML = 'Backend connected. Review your command, then press Enter.';
+      connectionErrorVisible = false;
+    }
+    // Refresh the exact current draft after recovery; never replay a submission
+    // or approval whose delivery became uncertain during a disconnect.
+    send({ type: 'buffer', text: cmdInput.value, client_revision: inputRevision });
   };
 
-  ws.onmessage = (e) => {
+  socket.onmessage = (e) => {
+    if (socket !== ws || socket.readyState !== WebSocket.OPEN) return;
     try {
       handleMessage(JSON.parse(e.data));
     } catch (_) {}
   };
 
-  ws.onclose = () => {
-    clearResolution();
-    clearConfirm();
-    cmdInput.placeholder = 'Reconnecting…';
-    setTimeout(connect, RECONNECT_MS);
-  };
-
-  ws.onerror = () => ws.close();
+  socket.onclose = () => disconnected(socket);
+  socket.onerror = () => socket.close();
 }
 
-/** Send one protocol message when connected; the backend validates its contents. */
+function isConnected() {
+  return ws && ws.readyState === WebSocket.OPEN;
+}
+
+/** Connection state remains visible even when the draft hides the placeholder. */
+function updateConnectionUI() {
+  const connected = isConnected();
+  safeLabel.textContent = connected
+    ? (safeMode === null ? 'CONNECTED' : safeMode ? 'SAFE' : 'UNSAFE')
+    : 'OFFLINE';
+  safeDot.classList.toggle('unsafe', connected && safeMode === false);
+  safeDot.style.opacity = connected ? '' : '0.35';
+  safeDot.title = connected ? 'Backend connected' : 'Backend disconnected';
+  const voiceBlocked = !connected || voiceAvailable === false;
+  // Keep the click handler reachable so an unavailable mic can explain why.
+  micBtn.setAttribute('aria-disabled', String(voiceBlocked));
+  micBtn.style.opacity = voiceBlocked ? '0.45' : '';
+  micBtn.title = !connected ? 'Voice unavailable: backend disconnected'
+    : voiceStatusText || 'Voice input (Alt+V)';
+}
+
+function disconnected(socket) {
+  if (socket !== ws) return;
+  safeMode = null;
+  clearGhost();
+  hud.classList.remove('anticipating');
+  cmdInput.placeholder = 'Backend disconnected — reconnecting…';
+  showDisconnected();
+  if (reconnectTimer === null) {
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, RECONNECT_MS);
+  }
+}
+
+function showDisconnected() {
+  clearResolution();
+  clearConfirm();
+  resetVoice();
+  updateConnectionUI();
+  onError(DISCONNECTED_MESSAGE);
+  connectionErrorVisible = true;
+}
+
+/** Return false on lost delivery so callers retain drafts and stop busy states. */
 function send(obj) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  if (!isConnected()) return false;
+  try {
     ws.send(JSON.stringify(obj));
+    return true;
+  } catch (_) {
+    const socket = ws;
+    socket.close();
+    disconnected(socket);
+    return false;
   }
 }
 
@@ -170,7 +242,10 @@ function handleMessage(msg) {
       onReminder(msg);
       break;
     case 'error':
-      onError(msg.text);
+      onError(msg.text, msg.source);
+      break;
+    case 'voice_status':
+      onVoiceStatus(msg);
       break;
     case 'voice_recording':
       onVoiceRecording(msg);
@@ -203,10 +278,10 @@ function handleMessage(msg) {
 // ── Handlers ──
 
 function onStatus(msg) {
+  if (msg.voice) onVoiceStatus(msg.voice);
   if (msg.safe_mode !== undefined) {
-    const safe = msg.safe_mode;
-    safeDot.classList.toggle('unsafe', !safe);
-    safeLabel.textContent = safe ? 'SAFE' : 'UNSAFE';
+    safeMode = msg.safe_mode;
+    updateConnectionUI();
   }
   if (msg.tasks_count !== undefined) {
     tasksBadge.textContent = msg.tasks_count;
@@ -219,6 +294,14 @@ function onThinking() {
   thinkingEl.classList.add('active');
   hud.classList.remove('anticipating');
   clearGhost();
+  // Replace the previous result while the model loads or produces its first token.
+  openPanel();
+  planStrip.innerHTML = '';
+  planStrip.classList.remove('visible');
+  const commandEcho = lastCommand ? `<div class="cmd-echo">› ${esc(lastCommand)}</div>` : '';
+  outputText.innerHTML = `${commandEcho}<div role="status" aria-live="polite">Thinking…</div>`;
+  outputArea.classList.add('visible');
+  setTimeout(syncHeight, 16);
 }
 
 function clearGhost() {
@@ -328,7 +411,10 @@ function onReminder(msg) {
   send({ type: 'get_status' });
 }
 
-function onError(text) {
+function onError(text, source) {
+  if (source === 'voice' || /^(Voice |Microphone |No speech detected|Transcription )/i.test(text || '')) {
+    resetVoice();
+  }
   thinkingEl.classList.remove('active');
   clearStream();
   openPanel();
@@ -395,7 +481,10 @@ function onConfirmRequest(msg) {
 /** Answer the gate token; selecting a correction never calls this implicitly. */
 function answerConfirm(granted) {
   if (!pendingConfirm) return;
-  send({ type: 'confirm', token: pendingConfirm.token, granted });
+  if (!send({ type: 'confirm', token: pendingConfirm.token, granted })) {
+    showDisconnected();
+    return;
+  }
   clearConfirm();
   if (granted) onThinking();
 }
@@ -413,26 +502,53 @@ confirmDeny.addEventListener('click',  () => answerConfirm(false));
 
 // ── Voice ──
 
+function resetVoice() {
+  isRecording = false;
+  micBtn.classList.remove('recording', 'transcribing');
+  recordingBar.classList.remove('active');
+}
+
+function onVoiceStatus(msg) {
+  voiceAvailable = msg.available;
+  voiceStatusText = msg.text || '';
+  if (['ready', 'disabled', 'error'].includes(msg.state)) resetVoice();
+  updateConnectionUI();
+}
+
 function startVoice() {
   if (isRecording) {
     stopVoice();
+    return;
+  }
+  if (!isConnected()) {
+    showDisconnected();
+    return;
+  }
+  if (voiceAvailable === false) {
+    onError(voiceStatusText || 'Voice input is unavailable.', 'voice');
+    return;
+  }
+  if (!send({ type: 'voice_start' })) {
+    showDisconnected();
     return;
   }
   isRecording = true;
   micBtn.classList.add('recording');
   recordingBar.classList.add('active');
   recLabel.textContent = 'Listening...';
-  send({ type: 'voice_start' });
   setTimeout(syncHeight, 16);
 }
 
 function stopVoice() {
   if (!isRecording) return;
-  send({ type: 'voice_stop' });
+  if (!send({ type: 'voice_stop' })) showDisconnected();
 }
 
 function onVoiceRecording(msg) {
   if (msg.active) {
+    isRecording = true;
+    micBtn.classList.add('recording');
+    recordingBar.classList.add('active');
     recLabel.textContent = 'Listening…';
   } else {
     // mic closed — transcription in progress
@@ -448,9 +564,7 @@ function onVoiceTranscribing() {
 }
 
 function onVoiceText(text) {
-  micBtn.classList.remove('recording', 'transcribing');
-  recordingBar.classList.remove('active');
-  isRecording = false;
+  resetVoice();
   if (text) {
     cmdInput.value = text;
     inputChanged();
@@ -601,14 +715,21 @@ cmdInput.addEventListener('keydown', (e) => {
     e.preventDefault();
     const text = cmdInput.value;
     if (!text.trim()) return;
+    if (!isConnected()) {
+      showDisconnected();
+      return;
+    }
     if (!resolution || resolution.original !== text || resolution.client_revision !== inputRevision) {
-      send({ type: 'resolve', text, client_revision: inputRevision });
+      if (!send({ type: 'resolve', text, client_revision: inputRevision })) showDisconnected();
       return;
     }
     const selectedText = selectedCorrection === null ? text : resolution.candidates[selectedCorrection].text;
+    if (!send({ type: 'input', text, selected_text: selectedText, token: resolution.token,
+      revision: resolution.revision, candidate_index: selectedCorrection, client_revision: inputRevision })) {
+      showDisconnected();
+      return;
+    }
     lastCommand = selectedText;
-    send({ type: 'input', text, selected_text: selectedText, token: resolution.token,
-      revision: resolution.revision, candidate_index: selectedCorrection, client_revision: inputRevision });
     // Clearing a submitted draft is not a new edit: an arriving approval still
     // belongs to this revision. The next real input event will invalidate it.
     cmdInput.value = '';
