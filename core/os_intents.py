@@ -8,6 +8,8 @@ Rule order is intentional because some natural-language patterns overlap.
 
 import re
 
+from core.file_intents import is_file_request, try_file_intent
+
 
 def is_app_command(text):
     """Return whether bare input belongs to the existing application grammar.
@@ -16,9 +18,13 @@ def is_app_command(text):
     being treated as OS requests. Explicit /exec routing is handled by callers.
     """
     stripped = text.strip()
+    if is_file_request(stripped) or _is_natural_action_request(stripped):
+        return True
     if stripped in {"ls", "tree"} or re.match(
         r"^(?:remind\s+me|read\s+file)\s+", stripped, re.I
     ):
+        return True
+    if _try_browser_intent(stripped) is not None or _looks_like_browser_request(stripped):
         return True
     # Phrase patterns search within sentences; restrict the initial word before
     # applying them to preserve command heads and their opaque arguments.
@@ -189,12 +195,128 @@ _APP_NAME_ALIAS = {
 }
 
 
+_BROWSER_PATTERN = (
+    r"(?P<browser>google\s+chrome|cvhrome|chrome|microsoft\s+edge|edge|"
+    r"mozilla\s+firefox|firefox|(?:default\s+|web\s+|my\s+)?browser)"
+)
+_BROWSER_ALIASES = {
+    "google chrome": "chrome", "cvhrome": "chrome",
+    "microsoft edge": "edge", "mozilla firefox": "firefox",
+    "browser": "default", "default browser": "default",
+    "web browser": "default", "my browser": "default",
+}
+_NAVIGATE_PATTERN = r"(?:go\s+to|goto(?:\s+to)?|navigate\s+to|browse\s+to|open|visit)"
+_BROWSER_CONNECTOR = r"\s*,?\s+(?:(?:and(?:\s+then)?|then)\s+)?"
+_BROWSER_REQUEST_PATTERNS = (
+    rf"(?:open|launch|start)\s*(?:the\s+|my\s+)?{_BROWSER_PATTERN}(?:\s+browser)?"
+    rf"(?:\s+for\s+me)?{_BROWSER_CONNECTOR}{_NAVIGATE_PATTERN}\s+(?P<url>\S+)",
+    rf"(?:go\s+to|goto(?:\s+to)?)\s+(?:the\s+|my\s+)?{_BROWSER_PATTERN}"
+    rf"\s*,?\s+(?:and\s+)?open\s+it(?:\s+for\s+me)?"
+    rf"{_BROWSER_CONNECTOR}{_NAVIGATE_PATTERN}\s+(?P<url>\S+)",
+    rf"(?:go\s+to|goto(?:\s+to)?)\s+(?:the\s+|my\s+)?{_BROWSER_PATTERN}"
+    rf"{_BROWSER_CONNECTOR}{_NAVIGATE_PATTERN}\s+(?P<url>\S+)",
+    rf"{_NAVIGATE_PATTERN}\s+(?P<url>\S+)"
+    rf"(?:\s+(?:in|with|using)\s+(?:the\s+|my\s+)?{_BROWSER_PATTERN})?",
+)
+
+
+def _browser_request_text(text: str) -> str:
+    return re.sub(
+        r"^(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?", "", text.strip(),
+        flags=re.I,
+    )
+
+
+def _try_browser_intent(text: str):
+    """Recognize complete website requests before generic app-name matching."""
+    original = _browser_request_text(text)
+    for pattern in _BROWSER_REQUEST_PATTERNS:
+        match = re.fullmatch(pattern + r"(?:\s+for\s+me)?(?:\s+please)?[.!]?", original, re.I)
+        if not match:
+            continue
+        raw_url = match.group("url")
+        # Sentence punctuation on a bare hostname is unambiguous; punctuation
+        # inside a URL path or query is data and must survive unchanged.
+        if re.fullmatch(r"(?:https?://)?[^/?#]+[.!?]", raw_url, re.I):
+            raw_url = raw_url.rstrip(".!?")
+        browser = match.groupdict().get("browser") or "default"
+        browser = " ".join(browser.lower().split())
+        browser = _BROWSER_ALIASES.get(browser, browser)
+        # A bare app/executable or local file remains in the existing app grammar.
+        # Explicit browser navigation also supports single-label intranet hosts.
+        if pattern == _BROWSER_REQUEST_PATTERNS[-1] and browser == "default" and "://" not in raw_url:
+            host = raw_url.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+            if (
+                "." not in host and not re.fullmatch(r"localhost(?::\d+)?|\[.+\](?::\d+)?", host, re.I)
+            ) or re.search(r"\.(?:exe|bat|cmd|ps1|py|txt|md|json|pdf|docx|xlsx)$", host, re.I):
+                continue
+        from core.os_sandbox import normalize_url
+        try:
+            url = normalize_url(raw_url)
+        except ValueError:
+            continue
+        return ("os_open_url", {"url": url, "browser": browser})
+    return None
+
+
+def _looks_like_browser_request(text: str) -> bool:
+    """Keep unsupported compound browser prose out of shell/partial OS routing."""
+    original = _browser_request_text(text)
+    # A browser task may describe the next action without naming a URL yet:
+    # "open the chrome and check the weather for me". Preserve the entire
+    # instruction for the model instead of correcting 'open' or launching only
+    # the browser. Requiring a conjunction leaves executable flags opaque.
+    browser_start = (
+        rf"(?:(?:open|launch|start)\s*|(?:go\s+to|goto(?:\s+to)?)\s+)"
+        rf"(?:the\s+|my\s+)?{_BROWSER_PATTERN}(?:\s+browser)?"
+        rf"(?:\s+for\s+me)?\s*,?\s+(?:and(?:\s+then)?|then)\s+\S"
+    )
+    if re.match(browser_start, original, re.I):
+        return True
+    for pattern in _BROWSER_REQUEST_PATTERNS:
+        match = re.match(pattern + r"(?=\s|$)", original, re.I)
+        if match and _try_browser_intent(original[:match.end()]) is not None:
+            return True
+    return False
+
+
+def _is_natural_action_request(text: str) -> bool:
+    """Protect grammatical requests without guessing the requested action.
+
+    Determiners and question lead-ins distinguish prose from executable flags,
+    paths, and bare arguments. Explicit /exec continues to select shell routing.
+    This only classifies the input; it neither executes nor rewrites anything.
+    """
+    original = _browser_request_text(text)
+    return re.match(
+        r"(?:check|show|find|tell)\s+(?:me\s+)?(?:about\s+)?"
+        r"(?:the|my|our|your|this|that|these|those|a|an|what|how|where|when|whether|if)\s+\S",
+        original,
+        re.I,
+    ) is not None
+
+
 def _try_os_intent(text: str):
     """Return (capability_name, argument_dict) for the first matching OS phrase.
 
     Unrecognized input returns None. Matching normalizes case and common aliases;
     validation and execution remain responsibilities of the capability gate.
     """
+    file_intent = try_file_intent(text)
+    if file_intent is not None:
+        return file_intent
+    if is_file_request(text):
+        return None
+
+    browser_intent = _try_browser_intent(text)
+    if browser_intent is not None:
+        return browser_intent
+    if _looks_like_browser_request(text):
+        return None
+    if _is_natural_action_request(text) and re.search(r"\b(?:and|then)\s+\S", text, re.I):
+        # The loose OS patterns below cannot fulfill a compound instruction.
+        return None
+
     t = text.lower().strip()
 
     # open / launch / start  (action-first: "open chrome") ────────────

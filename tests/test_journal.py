@@ -7,12 +7,19 @@ from core import actions as actions_mod
 from core.capabilities import capabilities, set_safe_mode
 
 
+@pytest.fixture
+def output(project):
+    folder = project / "CreatedFolder"
+    folder.mkdir()
+    return folder
+
+
 # ── Undo ────────────────────────────────────────────────────────────────────
 
 
-def test_undo_restores_a_file_overwritten_by_write_file(project, wired):
+def test_undo_restores_a_file_overwritten_by_write_file(project, output, wired):
     acts, journal, _mem = wired
-    target = project / "notes.txt"
+    target = output / "notes.txt"
     target.write_text("the original", encoding="utf-8")
 
     assert acts.call("write_file", path="notes.txt", text="clobbered").get("ok")
@@ -26,15 +33,15 @@ def test_undo_restores_a_file_overwritten_by_write_file(project, wired):
 def test_undo_removes_a_file_that_did_not_exist_before(project, wired):
     acts, _journal, _mem = wired
     acts.call("write_file", path="fresh.txt", text="new")
-    assert (project / "fresh.txt").exists()
+    assert (project / "CreatedFolder" / "fresh.txt").exists()
 
     assert actions_mod.undo_last().get("ok")
-    assert not (project / "fresh.txt").exists()
+    assert not (project / "CreatedFolder" / "fresh.txt").exists()
 
 
-def test_undo_is_one_shot(project, wired):
+def test_undo_is_one_shot(project, output, wired):
     acts, _journal, _mem = wired
-    (project / "a.txt").write_text("v1", encoding="utf-8")
+    (output / "a.txt").write_text("v1", encoding="utf-8")
     acts.call("write_file", path="a.txt", text="v2")
 
     assert actions_mod.undo_last().get("ok")
@@ -42,26 +49,26 @@ def test_undo_is_one_shot(project, wired):
     assert "error" in actions_mod.undo_last()
 
 
-def test_undo_walks_back_through_history(project, wired):
+def test_undo_walks_back_through_history(project, output, wired):
     acts, _journal, _mem = wired
-    (project / "a.txt").write_text("v1", encoding="utf-8")
+    (output / "a.txt").write_text("v1", encoding="utf-8")
     acts.call("write_file", path="a.txt", text="v2")
     acts.call("write_file", path="a.txt", text="v3")
 
     actions_mod.undo_last()
-    assert (project / "a.txt").read_text(encoding="utf-8") == "v2"
+    assert (output / "a.txt").read_text(encoding="utf-8") == "v2"
     actions_mod.undo_last()
-    assert (project / "a.txt").read_text(encoding="utf-8") == "v1"
+    assert (output / "a.txt").read_text(encoding="utf-8") == "v1"
 
 
 def test_nothing_to_undo_is_an_error_not_a_crash(project, wired):
     assert "error" in actions_mod.undo_last()
 
 
-def test_a_failed_action_leaves_no_undo_entry(project, wired):
+def test_a_failed_action_leaves_no_undo_entry(project, output, wired):
     acts, journal, _mem = wired
     # A directory where the file should go makes the write fail.
-    (project / "blocked").mkdir()
+    (output / "blocked").mkdir()
     res = acts.call("write_file", path="blocked", text="x")
     assert "error" in res
     assert journal.last_undoable() is None, "a failed write must not look undoable"
@@ -103,7 +110,7 @@ def test_denials_are_journalled_too(project, wired):
 def test_journal_records_the_resolved_path_not_the_relative_one(project, wired):
     acts, journal, _mem = wired
     acts.call("write_file", path="sub/a.txt", text="x")
-    assert journal.recent()[0]["args"]["path"] == str(project / "sub" / "a.txt")
+    assert journal.recent()[0]["args"]["path"] == str(project / "CreatedFolder" / "sub" / "a.txt")
 
 
 # ── The confirmation round trip ─────────────────────────────────────────────
@@ -191,4 +198,4 @@ def test_touched_files_reports_recent_writes(project, wired):
     acts.call("write_file", path="a.txt", text="x")
     acts.call("read_file", path="b.txt")
     touched = journal.touched_files(since_ts=0)
-    assert touched == [str(project / "a.txt")], "reads are free and stay out of the journal"
+    assert touched == [str(project / "CreatedFolder" / "a.txt")], "reads are free and stay out of the journal"

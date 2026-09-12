@@ -77,7 +77,7 @@ def submit(ws, snapshot, index=0, **overrides):
     ws.send_json(message)
 
 
-def test_hud_displays_raw_preserving_correction_and_safe_mode_blocks_execution(hud):
+def test_hud_displays_raw_preserving_correction_and_safe_mode_asks_permission(hud):
     set_safe_mode(True)
     client, _ = hud
     with client.websocket_connect("/ws") as ws:
@@ -89,14 +89,19 @@ def test_hud_displays_raw_preserving_correction_and_safe_mode_blocks_execution(h
         )
         assert shown["candidates"][0]["span"] == [2, 8]
         submit(ws, shown)
-        assert "Safe Mode" in receive(ws, "reply")["text"]
+        confirmation = receive(ws, "confirm_request")
+        assert confirmation["requires_safe_mode_off"] is True
+        assert confirmation["args"]["cmd"] == '  python\ttrain.py --key "secret-value"  '
+        assert not server.get_journal().recent()
+        ws.send_json({"type": "confirm", "token": confirmation["token"], "granted": False})
+        assert "Cancelled" in receive(ws, "reply")["text"]
         feedback = server._state["mem"].query(
             "SELECT original_token,selected_token,accepted,outcome,candidates_json FROM command_corrections"
         )
-        assert feedback[0][:4] == ("pyhton", "python", 1, "denied")
+        assert feedback[0][:4] == ("pyhton", "python", 1, "cancelled")
         assert "secret-value" not in str(feedback)
         assert "secret-value" not in str(server._state["episodes"].all())
-        assert server.get_journal().recent()[0]["decision"] == "deny"
+        assert server.get_journal().recent()[0]["decision"] == "confirm_denied"
 
 
 def test_hud_binds_confirmed_execution_to_displayed_arguments_once(hud, monkeypatch):
@@ -295,7 +300,7 @@ def test_advertised_hud_commands_have_handlers(hud):
             ws.send_json({"type": "input", "text": text})
             reply = receive(ws, "reply")
             assert "Unknown command" not in reply["text"]
-        assert Path("example.txt").read_text() == "hello review"
+        assert Path("CreatedFolder/example.txt").read_text() == "hello review"
 
 
 def test_voice_transcript_is_draft_and_never_executes(hud):

@@ -12,8 +12,12 @@
     <!-- Status bar (draggable) -->
     <div class="status-bar" id="status-bar">
       <div class="status-left">
-        <span class="safe-dot" id="safe-dot"></span>
-        <span class="status-label" id="safe-label">SAFE</span>
+        <button class="safe-toggle" id="safe-toggle" type="button" role="switch"
+                aria-label="Safe Mode" aria-checked="false" disabled
+                title="Connecting to IntuitionOS…">
+          <span class="safe-dot" id="safe-dot" aria-hidden="true"></span>
+          <span class="status-label" id="safe-label">CONNECTING</span>
+        </button>
       </div>
       <div class="status-center">
         <span class="app-name">IntuitionOS</span>
@@ -77,8 +81,8 @@
         <div class="confirm-title" id="confirm-title"></div>
         <div class="confirm-detail" id="confirm-detail"></div>
       </div>
-      <button class="confirm-btn deny" id="confirm-deny">Esc &#x2715;</button>
-      <button class="confirm-btn allow" id="confirm-allow">Enter &#x2713;</button>
+      <button class="confirm-btn deny" id="confirm-deny" title="Cancel (Esc)">No, cancel</button>
+      <button class="confirm-btn allow" id="confirm-allow" title="Approve (Enter)">Yes, run</button>
     </div>
 
     <!-- Recording indicator (shown while mic is active) -->

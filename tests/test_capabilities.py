@@ -95,10 +95,10 @@ def test_write_file_outside_the_project_is_denied(project):
     assert "outside" in d.reason
 
 
-def test_write_file_inside_the_project_is_allowed(project):
+def test_write_file_relative_path_uses_created_folder(project):
     d = gate(cap("write_file"), {"path": "notes/a.txt", "text": "x"}, confidence=1.0, actor="user")
     assert d.verdict == "allow"
-    assert Path(d.args["path"]) == (project / "notes" / "a.txt")
+    assert Path(d.args["path"]) == (project / "CreatedFolder" / "notes" / "a.txt")
 
 
 def test_traversal_out_of_the_project_is_denied(project):

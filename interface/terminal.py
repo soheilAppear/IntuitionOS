@@ -23,6 +23,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 
 from core.llm import LLMClient
+from core.file_intents import try_file_intent
 from core.memory import Memory
 from core.retrieval import Retriever
 from core.brain import Brain
@@ -334,7 +335,7 @@ def _execution_outcome(result):
     return "ok"
 
 
-def run_action(name, **kwargs):
+def run_action(name, /, **kwargs):
     """Dispatch through the gate, asking at the prompt if the gate says to.
 
     The REPL and the HUD answer a CONFIRM the same way — nothing has run when
@@ -612,7 +613,7 @@ def _run_terminal(cleanup):
 
         _outcome = {"value": "ok"}
 
-        def dispatch(name, **kwargs):
+        def dispatch(name, /, **kwargs):
             """Use the common approval flow and collect this episode's result."""
             result = run_action(name, **kwargs)
             episodes.set_capability(_episode_id, name)
@@ -969,6 +970,17 @@ def _run_terminal(cleanup):
                         when=_m.group(2).strip(),
                     )
                 )
+                continue
+
+            # File requests retain the user's filename and named destination.
+            file_intent = try_file_intent(raw_user)
+            if file_intent:
+                name, args = file_intent
+                result = dispatch(name, **args)
+                if isinstance(result, dict) and result.get("ok"):
+                    rprint(escape(f"Created empty file: {result['path']}"))
+                else:
+                    rprint(result)
                 continue
 
             # Try anticipator cache first

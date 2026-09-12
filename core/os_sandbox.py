@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
+import webbrowser
 
 import psutil
 
@@ -50,8 +52,12 @@ _WIN_EXTRA_PATHS: list[str] = [
     os.path.join(_LOCAL, "Google", "Chrome", "Application"),
     os.path.join(_PROG, "Google", "Chrome", "Application"),
     os.path.join(_PROG86, "Google", "Chrome", "Application"),
+    os.path.join(_LOCAL, "Microsoft", "Edge", "Application"),
+    os.path.join(_PROG, "Microsoft", "Edge", "Application"),
+    os.path.join(_PROG86, "Microsoft", "Edge", "Application"),
     os.path.join(_PROG, "Mozilla Firefox"),
     os.path.join(_PROG86, "Mozilla Firefox"),
+    os.path.join(_LOCAL, "Mozilla Firefox"),
     os.path.join(_LOCAL, "Programs", "Microsoft VS Code"),
     os.path.join(_PROG, "Microsoft VS Code"),
     os.path.join(_ROAMING, "Spotify"),
@@ -73,6 +79,25 @@ def _find_exe(exe: str) -> str | None:
         return found
     if sys.platform != "win32":
         return None
+    # App Paths covers registered applications (for example Office) that do not
+    # live on PATH. Read the executable itself; never dispatch through cmd/start.
+    if not any(separator in exe for separator in ("/", "\\")):
+        try:
+            import winreg
+            key_name = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}"
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                    try:
+                        with winreg.OpenKey(hive, key_name, 0, winreg.KEY_READ | view) as key:
+                            path, _ = winreg.QueryValueEx(key, None)
+                        if isinstance(path, str):
+                            path = os.path.expandvars(path).strip('"')
+                            if os.path.isfile(path):
+                                return path
+                    except OSError:
+                        continue
+        except ImportError:
+            pass
     import glob
     for base in _WIN_EXTRA_PATHS:
         # Handle glob patterns (e.g. Discord versioned dirs)
@@ -86,7 +111,11 @@ def _find_exe(exe: str) -> str | None:
 
 def open_app(name: str) -> dict:
     """Launch an application by friendly name or executable path."""
+    if not isinstance(name, str) or not name.strip():
+        return {"error": "An application name is required."}
     key = name.lower().strip()
+    if "://" in key:
+        return {"error": "Use the open URL action to open a website."}
     candidates = _APP_ALIASES.get(key, [name])
 
     for exe in candidates:
@@ -100,23 +129,97 @@ def open_app(name: str) -> dict:
         found = _find_exe(exe)
         if found:
             try:
-                os.startfile(found)  # ShellExecuteEx — the Windows-native way to open apps
+                if sys.platform == "win32":
+                    os.startfile(found)
+                else:
+                    subprocess.Popen([found], shell=False)
                 return {"ok": True, "launched": found}
             except Exception as e:
                 return {"error": str(e)}
 
-        if sys.platform == "win32":
-            # Last resort: Windows `start` command handles PATH + registry lookups
-            try:
-                subprocess.Popen(
-                    ["cmd.exe", "/c", "start", "", exe],
-                    creationflags=0x08000000,  # CREATE_NO_WINDOW
-                )
-                return {"ok": True, "launched": exe}
-            except Exception:
-                continue
-
     return {"error": f"Could not find '{name}'. Try typing the exact executable name."}
+
+
+def normalize_url(url: str) -> str:
+    """Validate an HTTP(S) destination and add HTTPS when no scheme is given.
+
+    Preserve the URL's spelling, including case-sensitive paths and queries.
+    This helper does not contact the destination or launch anything.
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("A website URL is required.")
+    value = url.strip()
+    if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError("Website URLs cannot contain spaces or control characters.")
+    if any(c in value for c in '\\<>"'):
+        raise ValueError("Use an HTTP or HTTPS website URL with a valid hostname.")
+    # Host:port is a destination, while arbitrary URI schemes are not.
+    if "://" not in value:
+        first = value.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+        if ":" in first and not first.startswith("["):
+            _, port = first.rsplit(":", 1)
+            if not port.isdigit():
+                raise ValueError("Only HTTP and HTTPS website URLs are supported.")
+        value = "https://" + value
+    try:
+        parts = urlsplit(value)
+        host = parts.hostname
+        port = parts.port  # Also checks invalid or out-of-range ports.
+    except ValueError as exc:
+        raise ValueError("Use a valid HTTP or HTTPS website URL.") from exc
+    if parts.scheme.lower() not in {"http", "https"}:
+        raise ValueError("Only HTTP and HTTPS website URLs are supported.")
+    if not host or parts.username is not None or parts.password is not None:
+        raise ValueError("Use a website URL with a hostname and no embedded credentials.")
+    if port == 0:
+        raise ValueError("Website ports must be between 1 and 65535.")
+    if ":" not in host:
+        try:
+            ascii_host = host.encode("idna").decode("ascii").rstrip(".")
+        except UnicodeError as exc:
+            raise ValueError("Use a website URL with a valid hostname.") from exc
+        labels = ascii_host.split(".")
+        if len(ascii_host) > 253 or any(
+            not label or len(label) > 63
+            or not label[0].isalnum() or not label[-1].isalnum()
+            or any(not (c.isalnum() or c == "-") for c in label)
+            for label in labels
+        ):
+            raise ValueError("Use a website URL with a valid hostname.")
+    return value
+
+
+def open_url(url: str, browser: str = "default") -> dict:
+    """Ask a browser to open an HTTP(S) URL, without claiming the page loaded."""
+    try:
+        destination = normalize_url(url)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if not isinstance(browser, str) or browser not in {"default", "chrome", "edge", "firefox"}:
+        return {"error": "Choose default, chrome, edge, or firefox as the browser."}
+    try:
+        if browser == "default":
+            if sys.platform == "win32":
+                os.startfile(destination)
+            elif not webbrowser.open(destination, new=2):
+                return {"error": "No default browser accepted the URL. Choose an installed browser."}
+        else:
+            executable = next(
+                (found for name in _APP_ALIASES[browser] if (found := _find_exe(name))),
+                None,
+            )
+            if executable is None:
+                return {"error": f"Could not find {browser}. Install it or choose another installed browser."}
+            subprocess.Popen([executable, destination], shell=False)
+    except Exception as exc:
+        return {"error": f"Could not open the website in {browser}: {exc}"}
+    return {
+        "ok": True,
+        "url": destination,
+        "browser": browser,
+        "status": "open_requested",
+        "message": f"Sent {destination} to {browser if browser != 'default' else 'your default browser'}. Page loading is not verified.",
+    }
 
 
 # ── Screenshot ────────────────────────────────────────────────────────────────

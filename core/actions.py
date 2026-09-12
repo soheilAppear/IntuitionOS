@@ -20,6 +20,7 @@ from .capabilities import (
     capabilities,
     gate,
     is_safe_mode,
+    jail_path,
     pending_confirmations,
     set_safe_mode,
 )
@@ -47,17 +48,20 @@ class ActionRegistry:
 
     # ── Gated dispatch ───────────────────────────────────────────────────
 
-    def call(self, name, **kwargs):
+    def call(self, name, /, **kwargs):
         """Backwards-compatible entry point: a human at the keyboard.
 
         Existing call sites in the terminal and the HUD pass their arguments as
         keywords, so this keeps working exactly as before — but it now carries an
         actor, which means even a typed command is judged and journalled.
+        The capability identifier is positional so tools can accept a `name`
+        argument of their own, such as the filename for create_empty_file.
         """
         return self.dispatch(name, kwargs, actor="user", confidence=1.0)
 
     def dispatch(
-        self, name, args=None, *, actor="user", confidence=1.0, confirmed=False
+        self, name, args=None, *, actor="user", confidence=1.0, confirmed=False,
+        offer_safe_mode_confirmation=False,
     ):
         """Validate and gate an action before executing or parking it.
 
@@ -81,7 +85,8 @@ class ActionRegistry:
             return {"error": f"unknown action: {name}"}
 
         decision = gate(
-            cap, args or {}, confidence=confidence, actor=actor, thresholds=_thresholds
+            cap, args or {}, confidence=confidence, actor=actor, thresholds=_thresholds,
+            offer_safe_mode_confirmation=offer_safe_mode_confirmation and not confirmed,
         )
 
         if decision.verdict == "deny":
@@ -98,7 +103,8 @@ class ActionRegistry:
 
         if decision.verdict == "confirm" and not confirmed:
             p = pending_confirmations.put(
-                name, decision.args, actor, confidence, decision.reason
+                name, decision.args, actor, confidence, decision.reason,
+                requires_safe_mode_off=decision.requires_safe_mode_off,
             )
             return {
                 "needs_confirmation": True,
@@ -108,17 +114,23 @@ class ActionRegistry:
                 "reason": decision.reason,
                 "reversibility": cap.reversibility,
                 "summary": cap.summary,
+                "requires_safe_mode_off": p.requires_safe_mode_off,
             }
 
         label = "confirm_granted" if decision.verdict == "confirm" else "allow"
         return self._execute(cap, decision.args, actor, confidence, label)
 
-    def confirm(self, token, granted=True):
+    def confirm(self, token, granted=True, *, on_safe_mode_change=None,
+                allow_safe_mode_change=True):
         """Consume a parked token and cancel or dispatch its stored arguments.
 
         Current permissions are checked again on approval. New argument values
         from a client are never read here, so a token cannot authorize an edit.
         """
+        if not isinstance(token, str) or type(granted) is not bool:
+            return {"error": "confirmation requires a token and a boolean decision"}
+        if type(allow_safe_mode_change) is not bool:
+            return {"error": "allow_safe_mode_change requires a boolean"}
         p = pending_confirmations.take(token)
         if not p:
             return {"error": "confirmation expired or already used"}
@@ -135,6 +147,20 @@ class ActionRegistry:
                 outcome=None,
             )
             return {"ok": True, "cancelled": True, "capability": p.capability}
+        if p.requires_safe_mode_off and allow_safe_mode_change:
+            # Only this consumed token can carry consent to change Safe Mode.
+            # A refreshed HUD may approve only the action after a manual mode
+            # change; that answer must not disable Safe Mode if it changes back.
+            # Validate again before changing any permission: paths or the
+            # capability may have changed while the prompt was displayed.
+            decision = gate(
+                cap, p.args, confidence=p.confidence, actor=p.actor,
+                thresholds=_thresholds, offer_safe_mode_confirmation=True,
+            )
+            if decision.verdict != "deny" and decision.requires_safe_mode_off:
+                set_safe_mode(False)
+                if on_safe_mode_change:
+                    on_safe_mode_change()
         # The arguments in the store were already validated and jailed by the
         # gate, so they are executed as-is rather than re-read from the wire.
         # Permissions can change while the prompt is visible (for example,
@@ -331,7 +357,15 @@ def write_file(path: str, text: str):
     try:
         if len(text.encode("utf-8")) > MAX_WRITE_BYTES:
             return {"error": f"refusing to write more than {MAX_WRITE_BYTES} bytes"}
+        path, problem = jail_path(path, "created")
+        if problem:
+            return {"error": problem}
+        from .user_files import created_folder_path
+        created_folder_path(create=True)
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        path, problem = jail_path(path, "created")
+        if problem:
+            return {"error": problem}
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
         return {"ok": True, "path": path, "bytes": len(text.encode("utf-8"))}
@@ -341,7 +375,9 @@ def write_file(path: str, text: str):
 
 def _capture_write(args):
     # Snapshot whatever write_file is about to destroy.
-    path = args["path"]
+    path, problem = jail_path(args["path"], "created")
+    if problem:
+        raise ValueError(problem)
     if not os.path.exists(path):
         return {"path": path, "existed": False}
     try:
@@ -352,8 +388,31 @@ def _capture_write(args):
         return {"path": path, "existed": True, "unreadable": str(e)}
 
 
+def create_empty_file(name: str, directory: str = "project"):
+    from .user_files import create_empty_file as create
+    return create(name, directory)
+
+
+def _validate_empty_file(args):
+    from .user_files import resolve_file_target
+    try:
+        resolve_file_target(args["name"], args.get("directory", "project"))
+    except (ValueError, OSError) as error:
+        return str(error)
+    return None
+
+
+def _undo_empty_file(payload):
+    from .user_files import undo_created_file
+    return undo_created_file(payload)
+
+
 def _undo_write(payload):
-    path = payload["path"]
+    # A saved absolute path must still belong to the output scope. Refuse an
+    # undo if a folder has since been redirected outside CreatedFolder.
+    path, problem = jail_path(payload["path"], "created")
+    if problem:
+        raise ValueError(f"Cannot undo file write: {problem}")
     if not payload.get("existed"):
         if os.path.exists(path):
             os.remove(path)
@@ -687,11 +746,32 @@ _cap(
     "reversible",
     15,
     False,
-    "Overwrite a file with new text. Undoable from the journal.",
-    path_scope="project",
+    "Write UTF-8 text or code only inside CreatedFolder. Relative paths use that folder; "
+    "an explicit CreatedFolder/ prefix is also accepted. Creates parent folders. "
+    "Overwrites existing output files and is undoable from the journal.",
+    path_scope="created",
     path_args=("path",),
     capture_undo=_capture_write,
     undo=_undo_write,
+)
+
+_cap(
+    "create_empty_file",
+    create_empty_file,
+    _schema({
+        "name": {"type": "string", "minLength": 1},
+        "directory": {"type": "string", "enum": ["project", "desktop", "documents", "downloads"]},
+    }, ["name"]),
+    "reversible",
+    15,
+    False,
+    "Create a new empty file in CreatedFolder by default (directory=project), or in "
+    "an explicitly requested Desktop, Documents, or Downloads folder. "
+    "Use a filename, not a path. Never overwrites an existing file. "
+    "Undo is available only while the created file remains unchanged.",
+    extra_validate=_validate_empty_file,
+    capture_undo_result=lambda args, result: result.get("undo", {}),
+    undo=_undo_empty_file,
 )
 
 _cap(
@@ -1019,6 +1099,28 @@ def register_os_capabilities():
         False,
         "Launch an application by name.",
         schema=_schema({"name": {"type": "string", "minLength": 1}}, ["name"]),
+    )
+
+    def _validate_browser_url(args):
+        try:
+            _os.normalize_url(args["url"])
+        except ValueError as error:
+            return str(error)
+        return None
+
+    _os_cap(
+        "os_open_url",
+        "open_url",
+        "reversible",
+        800,
+        False,
+        "Open an HTTP(S) website in Chrome, Edge, Firefox, or the default browser. "
+        "Reports the open request, not whether the page finished loading.",
+        schema=_schema({
+            "url": {"type": "string", "minLength": 1},
+            "browser": {"type": "string", "enum": ["default", "chrome", "edge", "firefox"]},
+        }, ["url"]),
+        extra_validate=_validate_browser_url,
     )
     # Likewise: the user unlocks or wakes the machine themselves.
     _os_cap(

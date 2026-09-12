@@ -1,6 +1,6 @@
 # Global config with safe defaults
 backend: ollama                  # can be: ollama or fallback
-model: gpt-oss:20b              # default local model name
+model: qwen3.8:27b             # smallest currently installed local model
 temperature: 0.2
 max_tokens: 600
 timezone: America/New_York

@@ -52,7 +52,7 @@ Actor = Literal["user", "anticipator", "model", "scheduler"]
 
 Verdict = Literal["allow", "confirm", "deny"]
 
-PathScope = Literal["project", "home", "system"]
+PathScope = Literal["project", "created", "home", "system"]
 
 
 @dataclass(frozen=True)
@@ -100,6 +100,7 @@ class GateDecision:
     verdict: Verdict
     reason: str
     args: dict = field(default_factory=dict)  # normalized (paths resolved)
+    requires_safe_mode_off: bool = False
 
     @property
     def allowed(self) -> bool:
@@ -136,6 +137,9 @@ def scope_root(scope: Optional[PathScope]) -> Optional[Path]:
     """The directory a scope confines paths to, or None for an unconfined scope."""
     if scope == "project":
         return Path(os.getcwd()).resolve()
+    if scope == "created":
+        from .user_files import created_folder_path
+        return created_folder_path()
     if scope == "home":
         return Path.home().resolve()
     return None  # "system" and None are not confined by path
@@ -153,10 +157,29 @@ def jail_path(value: str, scope: Optional[PathScope]) -> tuple[Optional[str], Op
     compares path components instead of characters, so a sibling can no longer
     masquerade as a child.
     """
-    root = scope_root(scope)
     try:
-        resolved = Path(value).resolve()
-    except (OSError, ValueError) as e:
+        root = scope_root(scope)
+        candidate = Path(value)
+        if scope == "created":
+            # Relative generated paths are based in CreatedFolder. Accept the
+            # explicit folder prefix too, without nesting it a second time.
+            if ".." in candidate.parts:
+                return None, "generated file paths cannot contain parent-directory traversal"
+            if not candidate.is_absolute():
+                if candidate.drive or candidate.root:
+                    return None, "use a relative generated filename or an absolute path inside CreatedFolder"
+                parts = candidate.parts
+                if parts and parts[0].casefold() == "createdfolder":
+                    candidate = Path(*parts[1:])
+                candidate = root / candidate
+        resolved = candidate.resolve()
+        if scope == "created" and resolved == root:
+            return None, "give a filename inside CreatedFolder, not the directory itself"
+        if root is not None and resolved.is_relative_to(root) and scope == "created":
+            from .user_files import _validate_filename
+            for part in candidate.relative_to(root).parts:
+                _validate_filename(part)
+    except (OSError, ValueError, RuntimeError) as e:
         return None, f"unresolvable path {value!r}: {e}"
     if root is None:
         return str(resolved), None
@@ -222,6 +245,7 @@ def gate(
     confidence: float,
     actor: Actor,
     thresholds: Optional[dict] = None,
+    offer_safe_mode_confirmation: bool = False,
 ) -> GateDecision:
     """Judge one proposed action. Pure: decides, never executes, never logs.
 
@@ -270,12 +294,18 @@ def gate(
             "deny", f"scheduled payloads may not invoke irreversible capability {cap.name}"
         )
 
-    # Rule 4 — Safe Mode is a prerequisite for anything irreversible, and it is
-    # checked before the confirmation rule rather than after. The order is the
-    # point: asking "are you sure?" about an action that Safe Mode is going to
-    # refuse anyway teaches the user that confirmation prompts are noise. Off is
-    # necessary; confirmation is what makes it sufficient.
+    # Rule 4 — irreversible actions need Safe Mode off. An interactive HUD may
+    # offer one explicit approval to change the mode and run these exact args.
+    # This option never changes the mode here, and all other restrictions above
+    # must pass before that offer is possible. Unattended actors cannot use it.
     if cap.reversibility == "irreversible" and is_safe_mode():
+        if offer_safe_mode_confirmation and actor in ("user", "model"):
+            return GateDecision(
+                "confirm",
+                f"{cap.name} requires turning off Safe Mode and confirmation",
+                args,
+                requires_safe_mode_off=True,
+            )
         return GateDecision(
             "deny", f"{cap.name} is irreversible and Safe Mode is ON — use /safe off first"
         )
@@ -317,6 +347,7 @@ class Pending:
     confidence: float
     reason: str
     created: float
+    requires_safe_mode_off: bool = False
 
 
 class ConfirmationStore:
@@ -333,9 +364,11 @@ class ConfirmationStore:
         self._items: dict[str, Pending] = {}
         self._lock = threading.Lock()
 
-    def put(self, capability: str, args: dict, actor: Actor, confidence: float, reason: str) -> Pending:
+    def put(self, capability: str, args: dict, actor: Actor, confidence: float, reason: str,
+            *, requires_safe_mode_off: bool = False) -> Pending:
         token = secrets.token_urlsafe(8)
-        p = Pending(token, capability, dict(args), actor, confidence, reason, time.time())
+        p = Pending(token, capability, dict(args), actor, confidence, reason, time.time(),
+                    requires_safe_mode_off=requires_safe_mode_off)
         with self._lock:
             self._evict()
             self._items[token] = p

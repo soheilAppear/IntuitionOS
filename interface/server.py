@@ -38,7 +38,7 @@ from core.actions import (
 from core.anticipator import Anticipator
 from core.brain import Brain
 from core.calibration import CalibrationStore, load_thresholds, reliability
-from core.capabilities import capabilities, is_safe_mode
+from core.capabilities import capabilities, is_safe_mode, set_safe_mode
 from core.consolidation import RuleStore, consolidate, render_rules
 from core.context import ContextSensor
 from core.os_intents import _try_os_intent
@@ -98,6 +98,22 @@ async def _broadcast(msg: dict):
         except Exception:
             dead.add(ws)
     _clients.difference_update(dead)
+
+
+async def _broadcast_status():
+    """Safe Mode is shared by every HUD connected to this process."""
+    await _broadcast({
+        "type": "status",
+        "safe_mode": is_safe_mode(),
+        "tasks_count": len(_state["mem"].list_open()),
+    })
+
+
+def _safe_mode_sink(loop):
+    """A worker acknowledges a granted mode change before the action runs."""
+    def changed():
+        asyncio.run_coroutine_threadsafe(_broadcast_status(), loop).result()
+    return changed
 
 
 def _voice_info():
@@ -164,6 +180,7 @@ async def lifespan(app: FastAPI):
         retriever=retriever,
         retrieve_k=int(rcfg.get("k", 4)),
         prompt_budget_tokens=int(bcfg.get("prompt_budget_tokens", 2400)),
+        offer_safe_mode_confirmation=True,
     )
 
     def notify(task_id: int, title: str):
@@ -417,6 +434,15 @@ def _format_os_result(action: str, result: dict, kwargs: dict) -> str:
     """Render an OS action result using user-facing names and useful fields."""
     if result.get("error"):
         return f"⚠  {result['error']}"
+    if action == "create_empty_file":
+        return f"Created empty file: {result['path']}"
+    if action == "os_open_url":
+        browser = result.get("browser", kwargs.get("browser", "default"))
+        browser_name = {
+            "default": "your default browser", "chrome": "Chrome",
+            "edge": "Edge", "firefox": "Firefox",
+        }.get(browser, browser)
+        return f"Opening {result.get('url', kwargs.get('url', '?'))} in {browser_name}."
     if action == "os_open_app":
         # Show the friendly name the user requested, not the full exe path
         return f"Opened {kwargs.get('name', result.get('launched', '?')).title()}"
@@ -613,7 +639,10 @@ async def _dispatch(
     loop = asyncio.get_running_loop()
     res = await loop.run_in_executor(
         _executor,
-        lambda: actions.dispatch(name, kwargs, actor=actor, confidence=confidence),
+        lambda: actions.dispatch(
+            name, kwargs, actor=actor, confidence=confidence,
+            offer_safe_mode_confirmation=True,
+        ),
     )
     note = _active_notes.get(ws)
     if note is not None:
@@ -633,6 +662,7 @@ async def _dispatch(
                 "reason": res.get("reason", ""),
                 "reversibility": res.get("reversibility", ""),
                 "summary": res.get("summary", ""),
+                "requires_safe_mode_off": res.get("requires_safe_mode_off", False),
                 "client_revision": binding["client_revision"],
             }
         )
@@ -640,8 +670,22 @@ async def _dispatch(
     return res
 
 
-async def _resolve_confirmation(ws: WebSocket, token: str, granted: bool):
+async def _resolve_confirmation(
+    ws: WebSocket, token: str, granted: bool, allow_safe_mode_change: bool = True,
+):
     """Resolve an owned, current gate token and finish its action or model turn."""
+    if not isinstance(token, str) or type(granted) is not bool:
+        await ws.send_json({
+            "type": "error",
+            "text": "Confirmation requires a token and a boolean decision.",
+        })
+        return
+    if type(allow_safe_mode_change) is not bool:
+        await ws.send_json({
+            "type": "error",
+            "text": "allow_safe_mode_change requires a boolean.",
+        })
+        return
     loop = asyncio.get_running_loop()
     meta = _confirmations.get(token)
     session = _resolutions.get(ws)
@@ -667,7 +711,11 @@ async def _resolve_confirmation(ws: WebSocket, token: str, granted: bool):
         brain: Brain = _state["brain"]
         out = await loop.run_in_executor(
             _executor,
-            lambda: brain.resume(resume_token, granted, on_token=_token_sink(ws, loop)),
+            lambda: brain.resume(
+                resume_token, granted, on_token=_token_sink(ws, loop),
+                on_safe_mode_change=_safe_mode_sink(loop),
+                allow_safe_mode_change=allow_safe_mode_change,
+            ),
         )
         _finish_feedback(
             meta, "ok" if granted and not out.get("error") else "cancelled"
@@ -676,10 +724,12 @@ async def _resolve_confirmation(ws: WebSocket, token: str, granted: bool):
         return
 
     res = await loop.run_in_executor(
-        _executor, lambda: actions.confirm(token, granted=granted)
+        _executor, lambda: actions.confirm(
+            token, granted=granted, on_safe_mode_change=_safe_mode_sink(loop),
+            allow_safe_mode_change=allow_safe_mode_change,
+        )
     )
     _finish_feedback(meta, _outcome(res))
-    mem: Memory = _state["mem"]
     if res.get("error"):
         await ws.send_json({"type": "error", "text": res["error"]})
         return
@@ -693,13 +743,7 @@ async def _resolve_confirmation(ws: WebSocket, token: str, granted: bool):
         else _summarise(res)
     )
     await ws.send_json({"type": "reply", "text": text})
-    await ws.send_json(
-        {
-            "type": "status",
-            "safe_mode": is_safe_mode(),
-            "tasks_count": len(mem.list_open()),
-        }
-    )
+    await _broadcast_status()
 
 
 def _token_sink(ws: WebSocket, loop):
@@ -732,6 +776,7 @@ async def _send_brain_result(ws: WebSocket, out: dict):
                 "reason": out.get("reason", ""),
                 "reversibility": out.get("reversibility", ""),
                 "summary": "",
+                "requires_safe_mode_off": out.get("requires_safe_mode_off", False),
                 "client_revision": binding["client_revision"],
             }
         )
@@ -1003,17 +1048,12 @@ async def _handle_command(ws: WebSocket, text: str):
 
     if text.startswith("/safe"):
         parts = text.split()
-        if len(parts) >= 2:
+        if len(parts) == 2:
             res = set_safe_mode_action(state=parts[1])
-            safe_on = is_safe_mode()
-            await ws.send_json(
-                {
-                    "type": "status",
-                    "safe_mode": safe_on,
-                    "tasks_count": len(mem.list_open()),
-                    "text": res.get("result", ""),
-                }
-            )
+            if res.get("error"):
+                await ws.send_json({"type": "error", "text": res["error"]})
+            else:
+                await _broadcast_status()
         else:
             await ws.send_json({"type": "error", "text": "usage: /safe on|off"})
         return
@@ -1313,6 +1353,7 @@ async def _handle_input(ws: WebSocket, text: str):
     if session:
         session.outcome(note.get("outcome", "ok"))
     if note.get("capability") in (
+        "create_empty_file",
         "write_file",
         "/write",
         "/exec",
@@ -1430,7 +1471,13 @@ async def _handle_input_inner(ws: WebSocket, text: str, note: dict):
     if os_intent:
         action_name, kwargs = os_intent
         note["capability"] = action_name
-        await ws.send_json({"type": "thinking"})
+        await ws.send_json({
+            "type": "thinking",
+            "text": {
+                "os_open_url": "Opening browser…",
+                "create_empty_file": "Creating file…",
+            }.get(action_name, "Working…"),
+        })
         # A regex match on speech is a guess, not an instruction. Anything the
         # manifest calls irreversible now comes back parked for confirmation
         # instead of firing, which is what stops "close this" from killing a
@@ -1609,8 +1656,22 @@ async def ws_endpoint(ws: WebSocket):
 
             elif t == "confirm":
                 await _resolve_confirmation(
-                    ws, data.get("token", ""), bool(data.get("granted"))
+                    ws, data.get("token", ""), data.get("granted"),
+                    data.get("allow_safe_mode_change", True),
                 )
+
+            elif t == "set_safe_mode":
+                enabled = data.get("enabled")
+                if type(enabled) is not bool:
+                    await ws.send_json({
+                        "type": "error", "source": "safe_mode",
+                        "text": "Safe Mode requires enabled to be a boolean.",
+                    })
+                    continue
+                # This changes only the mode. It neither consumes an action's
+                # pending approval nor edits the socket's current draft.
+                set_safe_mode(enabled)
+                await _broadcast_status()
 
             elif t == "get_status":
                 await ws.send_json(

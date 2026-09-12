@@ -204,6 +204,44 @@ tree
 /read requirements.txt
 ```
 
+### Create an empty file (no Ollama needed)
+
+```text
+make a new file 1.py in desktop directory
+create a file "Meeting Notes.txt" in Documents
+create an empty file scratch.py in the current directory
+```
+
+The HUD and terminal recognize these requests as file creation, so `make` is
+not corrected to the Windows `makecab` command. Choose Desktop, Documents,
+Downloads, or `CreatedFolder` inside the current project (the default). Windows uses the actual configured folder,
+including a Desktop redirected to OneDrive. Existing files are never overwritten;
+the reply shows the full path of the new empty file. `/undo` can remove it only
+while it remains unchanged.
+
+Generated text and Python code also go in `CreatedFolder`: ask for a file with
+contents, or use `/write hello.py "print('Hello')"`. Read it with
+`/read CreatedFolder/hello.py`. File writes are confined to this directory;
+`CreatedFolder/` is ignored by Git, so generated output is excluded from pushes.
+
+The model uses general computer tools to interpret other requests. It receives
+the computer's current local clock and can open browser searches for live
+information. Browser launching does not yet let it read page contents, so a
+weather search can be opened but its conditions cannot be verified by that tool.
+
+### Websites in the HUD (no Ollama needed)
+
+```text
+open chrome and go to google.com
+go to google.com
+open https://example.com in edge
+```
+
+The HUD opens the website directly in Chrome, Edge, Firefox, or your default
+browser. These requests work with Safe Mode on. If the selected browser cannot
+be found or launched, the HUD reports the problem. The reply confirms an open
+request; it does not inspect the page or confirm that it finished loading.
+
 ### Memory
 
 ```
@@ -287,7 +325,18 @@ The HUD border flashes and a toast appears when a reminder fires.
 ```
 
 Safe Mode is **on by default**. The green dot in the HUD header turns red when it
-is off.
+is off. Click the dot or **SAFE ON / SAFE OFF** label to switch it directly;
+the button updates when the backend acknowledges the change. Your draft stays
+in place, and switching the mode does not approve any waiting action.
+If a permission prompt is already open, turning Safe Mode off updates it to
+ask only for approval to run the action.
+
+If a HUD action needs Safe Mode off, it shows **Turn off Safe Mode and run?**
+with the action details. **Yes, turn off & run** changes the mode and executes
+that exact action; **No, cancel** leaves the mode unchanged and cancels the
+action. Safe Mode stays off after approval until you turn it back on. Editing
+the input or disconnecting cancels a waiting approval. The terminal continues
+to use `/safe off` followed by its normal action confirmation.
 
 **This is not a sandbox, and calling it one would be a lie.** `run_local` executes
 with your full privileges. What it has instead is a gate and a record:
@@ -297,7 +346,8 @@ with your full privileges. What it has instead is a gate and a record:
   whether a human must approve it, and where in the filesystem it may look.
 - Paths are **resolved and jailed** by path component, not by string prefix.
 - Anything `irreversible` is **never** run without a human saying yes, at any
-  confidence, and is refused outright while Safe Mode is on.
+  confidence, and cannot execute while Safe Mode is on. The HUD can ask for
+  explicit permission to turn it off and run the displayed action.
 - Every action that changes something is written to an **audit journal**
   (`/journal`), and reversible ones can be taken back with `/undo`.
 
@@ -473,7 +523,7 @@ never submit, so it is not allowed to change anything at all.
 | `ls` | List directory |
 | `tree` | Recursive directory view |
 | `/read <path>` | Read a file |
-| `/write <path> "text"` | Write a file |
+| `/write <path> "text"` | Write a file inside CreatedFolder |
 | `/save "text"` | Save a memory note |
 | `/recall "term"` | Search memory |
 | `/memory` | Show recent memory |

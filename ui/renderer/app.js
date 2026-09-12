@@ -44,6 +44,7 @@ const outputArea = document.getElementById('output-area');
 const outputText = document.getElementById('output-text');
 const thinkingEl = document.getElementById('thinking-indicator');
 const ghostHint = document.getElementById('ghost-hint');
+const safeToggle = document.getElementById('safe-toggle');
 const safeDot = document.getElementById('safe-dot');
 const safeLabel = document.getElementById('safe-label');
 const tasksBadge = document.getElementById('tasks-badge');
@@ -73,6 +74,7 @@ let reconnectTimer = null;
 let hasConnected = false;
 let connectionErrorVisible = false;
 let safeMode = null;
+let requestedSafeMode = null;
 let voiceAvailable = null;
 let voiceStatusText = '';
 let bufferTimer = null;
@@ -81,7 +83,7 @@ let tasksOpen = false;
 let expanded = false;
 let lastCommand = '';
 let isRecording = false;
-/** @type {{token: string, capability: string}|null} */
+/** The complete parked action, retained so mode changes can refresh its prompt. */
 let pendingConfirm = null;
 // Increment on edits; accepting a reply never advances this renderer-owned ID.
 let inputRevision = 0;
@@ -165,9 +167,17 @@ function isConnected() {
 /** Connection state remains visible even when the draft hides the placeholder. */
 function updateConnectionUI() {
   const connected = isConnected();
+  const modeKnown = typeof safeMode === 'boolean';
   safeLabel.textContent = connected
-    ? (safeMode === null ? 'CONNECTED' : safeMode ? 'SAFE' : 'UNSAFE')
+    ? (requestedSafeMode !== null ? 'CHANGING…' : !modeKnown ? 'CONNECTED' : safeMode ? 'SAFE ON' : 'SAFE OFF')
     : 'OFFLINE';
+  safeToggle.disabled = !connected || !modeKnown || requestedSafeMode !== null;
+  safeToggle.setAttribute('aria-checked', String(safeMode === true));
+  safeToggle.setAttribute('aria-busy', String(requestedSafeMode !== null));
+  safeToggle.title = !connected ? 'Safe Mode unavailable: backend disconnected'
+    : !modeKnown ? 'Waiting for Safe Mode status'
+    : requestedSafeMode !== null ? 'Updating Safe Mode…'
+    : safeMode ? 'Turn Safe Mode off. Commands still require approval.' : 'Turn Safe Mode on';
   safeDot.classList.toggle('unsafe', connected && safeMode === false);
   safeDot.style.opacity = connected ? '' : '0.35';
   safeDot.title = connected ? 'Backend connected' : 'Backend disconnected';
@@ -179,9 +189,21 @@ function updateConnectionUI() {
     : voiceStatusText || 'Voice input (Alt+V)';
 }
 
+/** Change only the mode; a pending action still needs its own explicit answer. */
+safeToggle.addEventListener('click', () => {
+  if (safeToggle.disabled || !isConnected() || typeof safeMode !== 'boolean') return;
+  requestedSafeMode = !safeMode;
+  updateConnectionUI();
+  if (!send({ type: 'set_safe_mode', enabled: requestedSafeMode })) {
+    requestedSafeMode = null;
+    showDisconnected();
+  }
+});
+
 function disconnected(socket) {
   if (socket !== ws) return;
   safeMode = null;
+  requestedSafeMode = null;
   clearGhost();
   hud.classList.remove('anticipating');
   cmdInput.placeholder = 'Backend disconnected — reconnecting…';
@@ -224,7 +246,7 @@ function handleMessage(msg) {
       onStatus(msg);
       break;
     case 'thinking':
-      onThinking();
+      onThinking(msg);
       break;
     case 'reply':
       onReply(msg);
@@ -242,6 +264,10 @@ function handleMessage(msg) {
       onReminder(msg);
       break;
     case 'error':
+      if (msg.source === 'safe_mode') {
+        requestedSafeMode = null;
+        updateConnectionUI();
+      }
       onError(msg.text, msg.source);
       break;
     case 'voice_status':
@@ -279,9 +305,11 @@ function handleMessage(msg) {
 
 function onStatus(msg) {
   if (msg.voice) onVoiceStatus(msg.voice);
-  if (msg.safe_mode !== undefined) {
+  if (typeof msg.safe_mode === 'boolean') {
     safeMode = msg.safe_mode;
+    if (safeMode === requestedSafeMode) requestedSafeMode = null;
     updateConnectionUI();
+    renderConfirm();
   }
   if (msg.tasks_count !== undefined) {
     tasksBadge.textContent = msg.tasks_count;
@@ -289,7 +317,7 @@ function onStatus(msg) {
   }
 }
 
-function onThinking() {
+function onThinking(msg = {}) {
   clearStream();
   thinkingEl.classList.add('active');
   hud.classList.remove('anticipating');
@@ -299,7 +327,8 @@ function onThinking() {
   planStrip.innerHTML = '';
   planStrip.classList.remove('visible');
   const commandEcho = lastCommand ? `<div class="cmd-echo">› ${esc(lastCommand)}</div>` : '';
-  outputText.innerHTML = `${commandEcho}<div role="status" aria-live="polite">Thinking…</div>`;
+  const statusText = typeof msg.text === 'string' && msg.text ? msg.text : 'Thinking…';
+  outputText.innerHTML = `${commandEcho}<div role="status" aria-live="polite">${esc(statusText)}</div>`;
   outputArea.classList.add('visible');
   setTimeout(syncHeight, 16);
 }
@@ -460,28 +489,50 @@ function onConfirmRequest(msg) {
     return;
   }
   thinkingEl.classList.remove('active');
-  pendingConfirm = { token: msg.token, capability: msg.capability };
-
-  const irreversible = msg.reversibility === 'irreversible';
-  confirmBar.classList.toggle('irreversible', irreversible);
-  confirmTitle.textContent = (irreversible ? 'Cannot be undone: ' : 'Confirm: ') + msg.capability;
-
-  const args = msg.args || {};
-  const argText = Object.keys(args).length
-    ? Object.entries(args).map(([k, v]) => `${k}=${String(v)}`).join('  ')
-    : (msg.summary || msg.reason || '');
-  confirmDetail.textContent = argText;
-
+  pendingConfirm = { ...msg };
+  renderConfirm();
   confirmBar.classList.add('active');
   openPanel();
   cmdInput.focus();
   setTimeout(syncHeight, 16);
 }
 
+/** A parked request's original mode must not override newer backend status. */
+function renderConfirm() {
+  if (!pendingConfirm) return;
+  const msg = pendingConfirm;
+  const irreversible = msg.reversibility === 'irreversible';
+  const requiresSafeModeOff = msg.requires_safe_mode_off === true && safeMode !== false;
+  pendingConfirm.allow_safe_mode_change = requiresSafeModeOff;
+  confirmBar.classList.toggle('irreversible', irreversible);
+  confirmTitle.textContent = requiresSafeModeOff ? 'Turn off Safe Mode and run?'
+    : (irreversible ? 'Cannot be undone: ' : 'Confirm: ') + msg.capability;
+  confirmAllow.textContent = requiresSafeModeOff ? 'Yes, turn off & run' : 'Yes, run';
+  confirmDeny.textContent = 'No, cancel';
+
+  const args = msg.args || {};
+  const argText = Object.keys(args).length
+    ? Object.entries(args).map(([k, v]) => `${k}=${String(v)}`).join('  ')
+    : (msg.summary || (msg.requires_safe_mode_off ? '' : msg.reason) || '');
+  const permissionDetail = requiresSafeModeOff
+    ? 'Safe Mode will stay off until you turn it on. '
+      + (irreversible ? 'This action cannot be undone. ' : '')
+    : '';
+  confirmDetail.textContent = permissionDetail ? `${permissionDetail.trim()}\n${argText}` : argText;
+
+  setTimeout(syncHeight, 16);
+}
+
 /** Answer the gate token; selecting a correction never calls this implicitly. */
 function answerConfirm(granted) {
   if (!pendingConfirm) return;
-  if (!send({ type: 'confirm', token: pendingConfirm.token, granted })) {
+  const answer = { type: 'confirm', token: pendingConfirm.token, granted };
+  if (granted && pendingConfirm.requires_safe_mode_off === true) {
+    // Bind consent to the wording actually shown, even if another client
+    // changes the mode before the backend receives this answer.
+    answer.allow_safe_mode_change = pendingConfirm.allow_safe_mode_change;
+  }
+  if (!send(answer)) {
     showDisconnected();
     return;
   }

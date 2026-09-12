@@ -19,6 +19,9 @@ when a human has answered.
 from __future__ import annotations
 
 import json
+from datetime import datetime
+import os
+import platform
 import re
 import secrets
 import time
@@ -206,13 +209,15 @@ class _Suspended:
     trace: list
     confirm_token: str
     capability: str
+    has_action_evidence: bool = False
+    retried_completion: bool = False
 
 
 class Brain:
     def __init__(self, llm, memory, system_prompt, planner_schema, logger=None,
                  dispatcher=None, registry=None, max_iters: int = 5, budget_ms: int = 8000,
                  history_turns: int = 6, retriever=None, retrieve_k: int = 4,
-                 prompt_budget_tokens: int = 2400):
+                 prompt_budget_tokens: int = 2400, offer_safe_mode_confirmation: bool = False):
         # Save collaborators
         self.llm = llm
         self.mem = memory
@@ -235,12 +240,23 @@ class Brain:
         # protocol out of the front of the context window, which fails in the
         # most confusing way available: the model simply stops using tools.
         self.prompt_budget_tokens = prompt_budget_tokens
+        # Only an interface that displays the explicit permission-change copy
+        # opts in. Model output cannot choose this setting or approve a token.
+        self.offer_safe_mode_confirmation = offer_safe_mode_confirmation
         self._suspended: dict[str, _Suspended] = {}
 
     # ── Prompt ───────────────────────────────────────────────────────────
 
     def build_system_prompt(self, context=None, notes=None) -> str:
         parts = [self.system_prompt, "", "AVAILABLE TOOLS", render_capabilities(self.registry.manifest())]
+        # Give the model the computer's actual clock, not only an epoch or a
+        # numeric weekday it must guess how to interpret. Refresh each turn.
+        now = datetime.now().astimezone()
+        parts += ["", "CURRENT COMPUTER (fresh system readings)",
+                  f"Local date and time: {now.isoformat(timespec='seconds')} ({now.strftime('%A, %Z')})",
+                  f"Operating system: {platform.system()}",
+                  f"Project directory: {os.getcwd()}",
+                  f"Generated files directory: {os.path.join(os.getcwd(), 'CreatedFolder')}"]
         if context is not None:
             parts += ["", "CURRENT SITUATION", _render_context(context)]
         if notes:
@@ -316,24 +332,37 @@ class Brain:
         deadline = time.monotonic() + budget_ms / 1000.0
         return self._run(messages, max_iters, deadline, trace=[], on_token=on_token)
 
-    def resume(self, resume_token: str, granted: bool, on_token=None) -> dict:
+    def resume(self, resume_token: str, granted: bool, on_token=None,
+               on_safe_mode_change=None, allow_safe_mode_change=True) -> dict:
         """Continue a loop that was suspended awaiting confirmation."""
         state = self._suspended.pop(resume_token, None)
         if state is None:
             return {"plan": [], "reply": "That confirmation is no longer pending.", "error": "expired"}
 
-        result = self.dispatcher.confirm(state.confirm_token, granted=granted)
+        confirm_options = {}
+        if on_safe_mode_change is not None:
+            confirm_options["on_safe_mode_change"] = on_safe_mode_change
+        if allow_safe_mode_change is not True:
+            confirm_options["allow_safe_mode_change"] = allow_safe_mode_change
+        result = self.dispatcher.confirm(state.confirm_token, granted=granted, **confirm_options)
         observation = (
             f"The user declined to run {state.capability}."
             if not granted else _observation(state.capability, result)
         )
         state.trace.append(f"{state.capability}: {'declined' if not granted else 'confirmed'}")
         state.messages.append({"role": "user", "content": f"OBSERVATION: {observation}"})
-        return self._run(state.messages, state.iters_left, state.deadline, state.trace, on_token=on_token)
+        if granted and _successful_action(self.registry.get(state.capability), result):
+            state.has_action_evidence = True
+        return self._run(
+            state.messages, state.iters_left, state.deadline, state.trace, on_token=on_token,
+            has_action_evidence=state.has_action_evidence,
+            retried_completion=state.retried_completion,
+        )
 
     # ── The loop proper ──────────────────────────────────────────────────
 
-    def _run(self, messages, iters_left, deadline, trace, on_token=None) -> dict:
+    def _run(self, messages, iters_left, deadline, trace, on_token=None, *,
+             has_action_evidence=False, retried_completion=False) -> dict:
         retried_parse = False
 
         while True:
@@ -347,13 +376,44 @@ class Brain:
             iters_left -= 1
 
             try:
-                raw = self.llm.chat(messages, on_token=on_token)
+                chat = getattr(self.llm, "chat_json", self.llm.chat)
+                raw = chat(messages, on_token=on_token)
             except LLMError as e:
                 self.log(f"brain: {e}")
                 return {"plan": trace, "reply": str(e), "error": "llm"}
 
             messages.append({"role": "assistant", "content": raw})
             call, complaint = parse_tool_call(raw)
+
+            # JSON can still fabricate completed work. Check explicit success
+            # claims before displaying or saving a final answer. Past history,
+            # reads and refusals do not prove this request performed a change.
+            # This bounded backstop does not semantically verify every clause.
+            candidate_reply = (
+                call.reply if call is not None and call.is_reply
+                else _plain_text(raw) if call is None and retried_parse else None
+            )
+            if (candidate_reply is not None and not has_action_evidence
+                    and _claims_action_completed(candidate_reply)):
+                if retried_completion:
+                    reply = "I couldn't verify that the requested action was completed. No successful action was recorded for this request."
+                    self.log("brain: refused unsupported action-completion claim")
+                    self.mem.add("assistant", reply)
+                    return {"plan": trace, "reply": reply, "error": "unverified_action"}
+                retried_completion = True
+                messages.append({"role": "user", "content":
+                    "ACTION EVIDENCE ERROR: Your reply claimed a completed action, but no "
+                    "successful action was observed in this request. Previous conversation "
+                    "is not proof of a new action. Only if the user asked for an action, "
+                    "perform that requested action with an available tool, then check its "
+                    "result before reporting success. Do not perform new actions if the "
+                    "user only asked a question about prior work or existing information; "
+                    "answer as historical or read-only and describe the observed evidence. "
+                    "Quoted text or descriptions of what code would do are not actions "
+                    "you performed. Respect any refusal "
+                    "or declined permission; if you cannot complete the action, say so "
+                    "honestly instead of claiming it happened."})
+                continue
 
             if call is None:
                 # One structured correction, then take the prose at face value
@@ -381,7 +441,12 @@ class Brain:
                 continue
 
             trace.append(f"{call.tool}({_brief_args(call.args)})")
-            result = self.dispatcher.dispatch(call.tool, call.args, actor="model", confidence=1.0)
+            dispatch_options = {}
+            if self.offer_safe_mode_confirmation:
+                dispatch_options["offer_safe_mode_confirmation"] = True
+            result = self.dispatcher.dispatch(
+                call.tool, call.args, actor="model", confidence=1.0, **dispatch_options
+            )
 
             if isinstance(result, dict) and result.get("needs_confirmation"):
                 # Suspend. The model does not get to answer its own question.
@@ -389,6 +454,8 @@ class Brain:
                 self._suspended[token] = _Suspended(
                     messages=messages, iters_left=iters_left, deadline=deadline,
                     trace=trace, confirm_token=result["token"], capability=call.tool,
+                    has_action_evidence=has_action_evidence,
+                    retried_completion=retried_completion,
                 )
                 return {
                     "plan": trace,
@@ -400,8 +467,11 @@ class Brain:
                     "args": result.get("args", {}),
                     "reason": result.get("reason", ""),
                     "reversibility": result.get("reversibility", ""),
+                    "requires_safe_mode_off": result.get("requires_safe_mode_off", False),
                 }
 
+            if _successful_action(cap, result):
+                has_action_evidence = True
             messages.append({"role": "user", "content":
                              f"OBSERVATION: {_observation(call.tool, result)}"})
 
@@ -416,6 +486,46 @@ class Brain:
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+_COMPLETED_VERBS = (
+    r"saved|created|written|wrote|opened|launched|deleted|removed|updated|changed|"
+    r"copied|moved|installed|sent|scheduled|completed|executed|ran|closed"
+)
+_ACTION_CLAIM = re.compile(
+    rf"^(?:(?:done|successfully)\b(?:\s*[,.:!—–-]\s*|\s+|$)|"
+    rf"(?:{_COMPLETED_VERBS})\b|"
+    rf"I\s*(?:have\s+|'ve\s+|’ve\s+)?(?:successfully\s+|just\s+)?(?:{_COMPLETED_VERBS})\b)|"
+    rf"\b(?:has\s+been|have\s+been|is|are|was|were)\s+(?:now\s+|successfully\s+)?(?:{_COMPLETED_VERBS})\b",
+    re.I,
+)
+
+
+def _claims_action_completed(text: str) -> bool:
+    # Past-tense completion, not offers, instructions, hypotheticals or limits.
+    # Code and literal quoted strings are data rather than execution claims.
+    text = re.sub(r"```[\s\S]*?```|`[^`\n]*`|\"[^\"\n]*\"", "", text)
+    for sentence in re.split(r"(?:[.!?]\s+|[;\n]|\bbut\b)", text, flags=re.I):
+        sentence = sentence.strip()
+        if re.match(r"^(?:no\b|none\b|nothing\b)", sentence, re.I):
+            continue
+        if re.match(r"^(?:according to|the (?:script|code|example)\b|previously\b|yesterday\b)", sentence, re.I):
+            continue
+        if _ACTION_CLAIM.search(sentence):
+            return True
+    return False
+
+
+def _successful_action(cap, result) -> bool:
+    if cap is None or cap.reversibility == "free" or result is None:
+        return False
+    if not isinstance(result, dict):
+        return True
+    return not (
+        result.get("error") or result.get("denied") or result.get("cancelled")
+        or result.get("needs_confirmation") or result.get("ok") is False
+        or result.get("returncode", 0) != 0
+    )
 
 
 def _observation(tool: str, result) -> str:

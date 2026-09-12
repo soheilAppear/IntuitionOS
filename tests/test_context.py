@@ -118,7 +118,7 @@ def test_recent_files_come_from_the_journal(project, wired):
     acts.call("write_file", path="notes.txt", text="x")
 
     ctx = ContextSensor(journal=journal).snapshot()
-    assert str(project / "notes.txt") in ctx.recent_files
+    assert str(project / "CreatedFolder" / "notes.txt") in ctx.recent_files
 
 
 def test_recent_files_respects_the_time_window(project, wired):

@@ -244,7 +244,7 @@ def test_a_scheduled_payload_may_invoke_a_reversible_capability(sched, memory, w
     memory.execute("UPDATE tasks SET due_ts=? WHERE id=?", (time.time() - 1, res["id"]))
     sched._tick()
 
-    assert (project / "scheduled.txt").read_text(encoding="utf-8") == "hello"
+    assert (project / "CreatedFolder" / "scheduled.txt").read_text(encoding="utf-8") == "hello"
     assert ran and ran[0]["action"] == "write_file"
     assert journal.recent()[0]["actor"] == "scheduler"
 

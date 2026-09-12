@@ -74,6 +74,31 @@ html, body {
   -webkit-app-region: no-drag;
 }
 
+.safe-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 24px;
+  padding: 3px 7px;
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 5px;
+  background: rgba(255,255,255,0.025);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+.safe-toggle:hover:not(:disabled) {
+  background: rgba(255,255,255,0.07);
+  border-color: rgba(255,255,255,0.12);
+}
+.safe-toggle:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: -2px;
+}
+.safe-toggle:disabled { cursor: default; opacity: 0.55; }
+.safe-toggle .status-label { color: #9ca3af; }
+
 .safe-dot {
   width: 6px;
   height: 6px;
@@ -477,10 +502,12 @@ html, body {
 .confirm-bar.irreversible .confirm-title { color: #ff9c9c; }
 .confirm-detail {
   font-size: 10.5px;
-  color: rgba(255, 255, 255, 0.5);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  color: rgba(255, 255, 255, 0.72);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 160px;
+  overflow-y: auto;
+  line-height: 1.5;
   margin-top: 1px;
 }
 
@@ -497,6 +524,7 @@ html, body {
   transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
 }
 .confirm-btn:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+.confirm-btn:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
 .confirm-btn.allow { border-color: rgba(255, 176, 32, 0.45); color: #ffd07a; }
 .confirm-btn.allow:hover { background: rgba(255, 176, 32, 0.18); }
 .confirm-bar.irreversible .confirm-btn.allow {

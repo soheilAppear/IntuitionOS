@@ -24,6 +24,37 @@
       "est_cost_ms": 10
     },
     {
+      "name": "create_empty_file",
+      "summary": "Create a new empty file in CreatedFolder by default (directory=project), or in an explicitly requested Desktop, Documents, or Downloads folder. Use a filename, not a path. Never overwrites an existing file. Undo is available only while the created file remains unchanged.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "directory": {
+            "type": "string",
+            "enum": [
+              "project",
+              "desktop",
+              "documents",
+              "downloads"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": true,
+      "est_cost_ms": 15
+    },
+    {
       "name": "create_task",
       "summary": "Schedule a reminder for a time given in plain language.",
       "args": {
@@ -461,6 +492,37 @@
       "est_cost_ms": 800
     },
     {
+      "name": "os_open_url",
+      "summary": "Open an HTTP(S) website in Chrome, Edge, Firefox, or the default browser. Reports the open request, not whether the page finished loading.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "minLength": 1
+          },
+          "browser": {
+            "type": "string",
+            "enum": [
+              "default",
+              "chrome",
+              "edge",
+              "firefox"
+            ]
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 800
+    },
+    {
       "name": "os_restart_computer",
       "summary": "Restart the computer.",
       "args": {
@@ -763,7 +825,7 @@
     },
     {
       "name": "write_file",
-      "summary": "Overwrite a file with new text. Undoable from the journal.",
+      "summary": "Write UTF-8 text or code only inside CreatedFolder. Relative paths use that folder; an explicit CreatedFolder/ prefix is also accepted. Creates parent folders. Overwrites existing output files and is undoable from the journal.",
       "args": {
         "type": "object",
         "properties": {
@@ -784,7 +846,7 @@
       },
       "reversibility": "reversible",
       "requires_confirmation": false,
-      "path_scope": "project",
+      "path_scope": "created",
       "undoable": true,
       "est_cost_ms": 15
     }

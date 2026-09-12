@@ -91,6 +91,116 @@ function renderer({ connected = true } = {}) {
 
 function textOf(element) { return element.textContent + element.children.map(textOf).join(''); }
 
+test('Safe Mode toggle waits for backend acknowledgement and preserves the draft and approval', () => {
+  const r = renderer();
+  const toggle = r.elements.get('safe-toggle');
+  assert.equal(toggle.disabled, true, 'unknown mode must not be guessed');
+  toggle.dispatch('click');
+  assert.equal(r.sent.length, 0);
+  r.message({ type: 'status', safe_mode: true });
+  assert.equal(toggle.disabled, false);
+  assert.equal(toggle.attributes['aria-checked'], 'true');
+  r.change('git status');
+  r.show('git status', []);
+  r.message({ type: 'confirm_request', token: 'waiting', capability: 'run_command', client_revision: 1 });
+  const count = r.sent.length;
+  toggle.dispatch('click');
+  toggle.dispatch('click');
+  assert.deepEqual(r.sent.slice(count), [{ type: 'set_safe_mode', enabled: false }]);
+  assert.equal(toggle.disabled, true);
+  assert.equal(toggle.attributes['aria-checked'], 'true', 'show acknowledged state while waiting');
+  assert.equal(r.input.value, 'git status');
+  assert.ok(vm.runInContext('resolution !== null && pendingConfirm.token === "waiting"', r.context));
+  r.message({ type: 'status', safe_mode: false });
+  assert.equal(toggle.disabled, false);
+  assert.equal(toggle.attributes['aria-checked'], 'false');
+  assert.ok(r.elements.get('safe-dot').classList.contains('unsafe'));
+  assert.equal(r.elements.get('safe-label').textContent, 'SAFE OFF');
+  assert.ok(!r.sent.some(message => message.type === 'confirm'));
+  toggle.dispatch('click');
+  assert.deepEqual(r.sent.at(-1), { type: 'set_safe_mode', enabled: true });
+  r.message({ type: 'status', safe_mode: true });
+  assert.equal(r.elements.get('safe-label').textContent, 'SAFE ON');
+  assert.ok(!r.elements.get('safe-dot').classList.contains('unsafe'));
+});
+
+test('a disconnected mode change is never replayed and must wait for fresh status', () => {
+  const r = renderer();
+  const toggle = r.elements.get('safe-toggle');
+  r.message({ type: 'status', safe_mode: true });
+  r.socket.failSend = true;
+  toggle.dispatch('click');
+  assert.equal(toggle.disabled, true);
+  assert.equal(vm.runInContext('requestedSafeMode', r.context), null);
+  r.reconnect();
+  assert.equal(toggle.disabled, true);
+  assert.ok(!r.sent.some(message => message.type === 'set_safe_mode'));
+  r.message({ type: 'status', safe_mode: false });
+  assert.equal(toggle.disabled, false);
+  assert.equal(toggle.attributes['aria-checked'], 'false');
+});
+
+test('Safe Mode permission explains the mode change and grants only the displayed token', () => {
+  const r = renderer();
+  r.message({ type: 'status', safe_mode: true });
+  r.message({ type: 'confirm_request', token: 'permission', capability: 'run_command',
+    reversibility: 'irreversible', requires_safe_mode_off: true, args: { command: 'echo <hello>' } });
+  assert.equal(r.elements.get('confirm-title').textContent, 'Turn off Safe Mode and run?');
+  assert.match(r.elements.get('confirm-detail').textContent, /Safe Mode will stay off until you turn it on/);
+  assert.match(r.elements.get('confirm-detail').textContent, /command=echo <hello>/);
+  assert.equal(r.elements.get('confirm-allow').textContent, 'Yes, turn off & run');
+  assert.equal(r.sent.length, 0, 'showing the question must do nothing');
+  r.elements.get('confirm-allow').dispatch('click');
+  r.elements.get('confirm-allow').dispatch('click');
+  assert.deepEqual(r.sent, [{ type: 'confirm', token: 'permission', granted: true, allow_safe_mode_change: true }]);
+  assert.equal(r.elements.get('safe-toggle').attributes['aria-checked'], 'true');
+});
+
+test('declining Safe Mode permission leaves mode unchanged and cancels the action', () => {
+  const r = renderer();
+  r.message({ type: 'status', safe_mode: true });
+  r.message({ type: 'confirm_request', token: 'permission', capability: 'run_command',
+    reversibility: 'irreversible', requires_safe_mode_off: true });
+  r.elements.get('confirm-deny').dispatch('click');
+  assert.deepEqual(r.sent, [{ type: 'confirm', token: 'permission', granted: false }]);
+  assert.equal(r.elements.get('safe-toggle').attributes['aria-checked'], 'true');
+  assert.ok(!r.elements.get('thinking-indicator').classList.contains('active'));
+  r.message({ type: 'confirm_request', token: 'normal', capability: 'write_file' });
+  assert.equal(r.elements.get('confirm-allow').textContent, 'Yes, run');
+  assert.ok(!r.elements.get('confirm-detail').textContent.includes('Safe Mode will stay off'));
+});
+
+test('turning Safe Mode off refreshes a waiting permission prompt without approving it', () => {
+  const r = renderer();
+  r.message({ type: 'status', safe_mode: true });
+  r.message({ type: 'confirm_request', token: 'waiting', capability: 'run_command',
+    reversibility: 'irreversible', requires_safe_mode_off: true, args: { cmd: 'echo hello' } });
+  r.elements.get('safe-toggle').dispatch('click');
+  r.message({ type: 'status', safe_mode: false });
+  assert.equal(r.elements.get('confirm-title').textContent, 'Cannot be undone: run_command');
+  assert.equal(r.elements.get('confirm-allow').textContent, 'Yes, run');
+  assert.equal(r.elements.get('confirm-detail').textContent, 'cmd=echo hello');
+  assert.ok(r.elements.get('confirm-bar').classList.contains('active'));
+  assert.ok(!r.sent.some(message => message.type === 'confirm'));
+  r.elements.get('confirm-allow').dispatch('click');
+  assert.deepEqual(r.sent.at(-1), { type: 'confirm', token: 'waiting', granted: true, allow_safe_mode_change: false });
+});
+
+test('an older mode-change prompt arriving after SAFE OFF cannot ask to disable it again', () => {
+  const r = renderer();
+  r.message({ type: 'status', safe_mode: false });
+  r.message({ type: 'confirm_request', token: 'delayed', capability: 'os_shutdown_computer',
+    reversibility: 'irreversible', requires_safe_mode_off: true,
+    reason: 'os_shutdown_computer requires turning off Safe Mode and confirmation' });
+  assert.equal(r.elements.get('confirm-allow').textContent, 'Yes, run');
+  assert.ok(!r.elements.get('confirm-title').textContent.includes('Safe Mode'));
+  assert.ok(!r.elements.get('confirm-detail').textContent.includes('Safe Mode'));
+  r.message({ type: 'status', safe_mode: true });
+  assert.equal(r.elements.get('confirm-title').textContent, 'Turn off Safe Mode and run?');
+  assert.equal(r.elements.get('confirm-allow').textContent, 'Yes, turn off & run');
+  assert.ok(!r.sent.some(message => message.type === 'confirm'));
+});
+
 test('renderer highlights only the changed token and submits exact visible arguments', () => {
   const r = renderer();
   const raw = '  pyhton\ttrain.py --key "<secret>"  ';
@@ -333,4 +443,17 @@ test('streaming and final replies replace the visible pending state', () => {
   assert.match(output, /The final response/);
   assert.ok(!output.includes('partial response'));
   assert.ok(!r.elements.get('thinking-indicator').classList.contains('active'));
+});
+
+test('browser progress displays the action and a launch failure clears the busy state', () => {
+  const r = renderer();
+  r.change('open chrome and go to google.com');
+  r.show(r.input.value, []);
+  r.key('Enter');
+  r.message({ type: 'thinking', text: 'Opening browser…' });
+  assert.match(r.elements.get('output-text').innerHTML, /Opening browser…/);
+  assert.ok(r.elements.get('thinking-indicator').classList.contains('active'));
+  r.message({ type: 'reply', text: 'Chrome was not found. Install Chrome or use your default browser.' });
+  assert.ok(!r.elements.get('thinking-indicator').classList.contains('active'));
+  assert.match(r.elements.get('output-text').innerHTML, /Chrome was not found/);
 });

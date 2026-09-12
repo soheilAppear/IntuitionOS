@@ -7,6 +7,8 @@ ui/node_modules/
 # Runtime data — the directory is tracked, its contents are not
 data/*
 !data/.gitkeep
+# User-generated files stay local and are never included in normal Git staging.
+/CreatedFolder/
 *.db
 *.log
 

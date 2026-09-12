@@ -1,4 +1,4 @@
-# LLM client with Ollama backend and a safe fallback
+# LLM client with Ollama backend and an explicit fallback backend.
 
 import json
 import os
@@ -43,25 +43,41 @@ class LLMClient:
         # Fallback returns a trivial echo
         return "Ok. How can I help?"
 
-    def _payload(self, messages, stream):
-        return {
+    def chat_json(self, messages, on_token=None):
+        """Generate a JSON tool-loop turn without changing other chat callers.
+
+        The tool protocol already asks for JSON in the system prompt. Ollama's
+        JSON constraint keeps tool arguments parseable, and disabling optional
+        thinking leaves the output-token budget available for those arguments.
+        Ordinary chat (for example consolidation) keeps its existing format.
+        """
+        if self.backend == "ollama":
+            return self._chat_ollama(messages, on_token=on_token, json_mode=True)
+        return self.chat(messages, on_token=on_token)
+
+    def _payload(self, messages, stream, *, json_mode=False):
+        payload = {
             "model": self.model,
             "messages": messages,
             "options": {"temperature": self.temperature, "num_predict": self.max_tokens},
             "stream": stream,
         }
+        if json_mode:
+            payload.update(format="json", think=False)
+        return payload
 
-    def _chat_ollama(self, messages, on_token=None):
+    def _chat_ollama(self, messages, on_token=None, *, json_mode=False):
         base = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
         url = f"{base}/api/chat"
         timeout = (self.connect_timeout, self.read_timeout)
         try:
             if on_token is None:
-                resp = requests.post(url, json=self._payload(messages, False), timeout=timeout)
+                resp = requests.post(url, json=self._payload(messages, False, json_mode=json_mode), timeout=timeout)
                 resp.raise_for_status()
-                content = resp.json().get("message", {}).get("content", "").strip()
-                return content or "Ok."
-            return self._stream_ollama(url, messages, timeout, on_token)
+                result = resp.json()
+                content = (result.get("message") or {}).get("content", "")
+                return self._completed_content(content, result)
+            return self._stream_ollama(url, messages, timeout, on_token, json_mode=json_mode)
         except requests.exceptions.ConnectionError:
             raise LLMError(f"Cannot reach Ollama at {base} — run: ollama serve")
         except requests.exceptions.ReadTimeout:
@@ -77,9 +93,24 @@ class LLMClient:
         except Exception as e:
             raise LLMError(f"LLM error: {e}")
 
-    def _stream_ollama(self, url, messages, timeout, on_token):
+    def _completed_content(self, content, final):
+        if final.get("error"):
+            raise LLMError(str(final["error"]))
+        if final.get("done_reason") == "length":
+            raise LLMError(
+                f"Ollama reached the {self.max_tokens}-token output limit before finishing. "
+                "Try a smaller request or increase max_tokens in config/config.yaml."
+            )
+        if final.get("done") is not True:
+            raise LLMError("Ollama stopped before completing its reply. Please try again.")
+        if not isinstance(content, str) or not content.strip():
+            raise LLMError("Ollama completed without a visible reply. Please try again.")
+        return content.strip()
+
+    def _stream_ollama(self, url, messages, timeout, on_token, *, json_mode=False):
         parts = []
-        with requests.post(url, json=self._payload(messages, True), timeout=timeout, stream=True) as resp:
+        final = {}
+        with requests.post(url, json=self._payload(messages, True, json_mode=json_mode), timeout=timeout, stream=True) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():
                 if not line:
@@ -87,13 +118,15 @@ class LLMClient:
                 try:
                     chunk = json.loads(line)
                 except ValueError:
-                    # A malformed frame mid-stream is not a reason to lose the
-                    # tokens that already arrived.
-                    continue
+                    raise LLMError("Ollama returned an invalid streaming frame. Please try again.")
+                if not isinstance(chunk, dict):
+                    raise LLMError("Ollama returned an invalid streaming frame. Please try again.")
                 if chunk.get("error"):
                     raise LLMError(str(chunk["error"]))
                 piece = (chunk.get("message") or {}).get("content", "")
                 if piece:
+                    if not isinstance(piece, str):
+                        raise LLMError("Ollama returned invalid reply content. Please try again.")
                     parts.append(piece)
                     try:
                         on_token(piece)
@@ -101,5 +134,6 @@ class LLMClient:
                         # A UI that has gone away must not kill the generation.
                         pass
                 if chunk.get("done"):
+                    final = chunk
                     break
-        return "".join(parts).strip() or "Ok."
+        return self._completed_content("".join(parts), final)
