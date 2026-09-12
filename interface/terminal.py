@@ -675,6 +675,10 @@ def _run_terminal(cleanup):
                 continue
             if user == "/dream":
                 ccfg = cfg.get("consolidation", {}) or {}
+                # Consolidation asks the model to judge each pattern, so this is
+                # seconds of work. Saying so beats a prompt that simply stops
+                # responding — especially when Ollama is down.
+                rprint("[dim]Consolidating the episode log…[/dim]")
                 report = consolidate(
                     episodes.recent(limit=int(ccfg.get("window", 2000))),
                     rules,
@@ -683,6 +687,7 @@ def _run_terminal(cleanup):
                     min_confidence=float(ccfg.get("min_confidence", 0.5)),
                     calibrator=predictor.calibrator,
                     calibration_store=calib_store,
+                    logger=make_logger(cfg.get("log_path", "data/log.txt")),
                 )
                 rprint(Panel.fit(report.summary(), title="Consolidation"))
                 continue

@@ -260,15 +260,22 @@ class PredictionWindow:
         self.last_keystroke_ts: Optional[float] = None
         self.shown: Optional[str] = None  # the buffer a hint was shown for
         self.shown_conf: Optional[float] = None
+        self.shown_rule_id: Optional[int] = None
 
     def note_keystroke(self, text: str) -> None:
         self.buffer = text
         self.last_keystroke_ts = time.time()
 
-    def note_shown(self, predicted: str, confidence: Optional[float] = None) -> None:
-        """A hint reached the user's eyes. Only these carry a calibration signal."""
+    def note_shown(self, predicted: str, confidence: Optional[float] = None,
+                   rule_id: Optional[int] = None) -> None:
+        """A hint reached the user's eyes. Only these carry a calibration signal.
+
+        `rule_id` is set when the hint came from a rule consolidation promoted,
+        and is what lets that rule's hit rate ever be measured.
+        """
         self.shown = predicted
         self.shown_conf = confidence
+        self.shown_rule_id = rule_id
 
     def take(self, submitted: str) -> dict:
         """Resolve the window against what was actually submitted, and reset.
@@ -293,11 +300,30 @@ class PredictionWindow:
             "accepted_prediction": accepted,
             "hesitation_ms": hesitation,
         }
+        # Kept off `out`, which is splatted straight into EpisodeLog.record().
+        # Read it with take_rule_outcome() right after take().
+        self._rule_outcome = (
+            (self.shown_rule_id, bool(accepted))
+            if self.shown_rule_id is not None and accepted is not None
+            else None
+        )
         self.reset()
         return out
+
+    def take_rule_outcome(self):
+        """The (rule_id, hit) pair for the hint just resolved by take(), once.
+
+        This is what finally measures a consolidated rule. Until it was wired up,
+        `hit_rate` was written by nothing, so every rule claimed a flat 0.5
+        forever and pruning could never fire.
+        """
+        outcome = getattr(self, "_rule_outcome", None)
+        self._rule_outcome = None
+        return outcome
 
     def reset(self) -> None:
         self.buffer = ""
         self.last_keystroke_ts = None
         self.shown = None
         self.shown_conf = None
+        self.shown_rule_id = None

@@ -238,3 +238,47 @@ def test_window_is_consumed_by_take_so_one_submission_counts_once():
     w.note_shown("ls", 0.9)
     assert w.take("ls")["accepted_prediction"] == 1
     assert w.take("ls")["accepted_prediction"] is None
+
+
+# ── Feeding a shown rule's outcome back to the rule store ───────────────────
+
+
+def test_window_reports_the_outcome_of_a_rule_sourced_hint():
+    """Nothing used to carry the rule's identity from the hint to the
+    submission, so a rule's hit rate could never be measured at all."""
+    from core.episodes import PredictionWindow
+
+    w = PredictionWindow()
+    w.note_keystroke("pyt")
+    w.note_shown("pytest -q", 0.9, rule_id=7)
+    assert w.take("pytest -q")["accepted_prediction"] == 1
+    assert w.take_rule_outcome() == (7, True)
+
+
+def test_window_reports_a_contradicted_rule_as_a_miss():
+    from core.episodes import PredictionWindow
+
+    w = PredictionWindow()
+    w.note_keystroke("pyt")
+    w.note_shown("pytest -q", 0.9, rule_id=7)
+    w.take("python train.py")
+    assert w.take_rule_outcome() == (7, False)
+
+
+def test_a_rule_outcome_is_consumed_once():
+    from core.episodes import PredictionWindow
+
+    w = PredictionWindow()
+    w.note_shown("pytest -q", 0.9, rule_id=7)
+    w.take("pytest -q")
+    assert w.take_rule_outcome() == (7, True)
+    assert w.take_rule_outcome() is None
+
+
+def test_a_hint_with_no_rule_behind_it_reports_nothing():
+    from core.episodes import PredictionWindow
+
+    w = PredictionWindow()
+    w.note_shown("pytest -q", 0.9)
+    w.take("pytest -q")
+    assert w.take_rule_outcome() is None

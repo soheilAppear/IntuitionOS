@@ -461,3 +461,68 @@ def test_shutdown_cannot_restore_forgotten_predictor(tmp_path, monkeypatch):
     # Startup used to capture the old predictor in lifespan's local variable,
     # and save that forgotten model right here, when the server shut down.
     assert Predictor(store=PredictorStore(mem)).seen == 0
+
+
+# ── A shown rule is actually measured ───────────────────────────────────────
+
+
+def test_a_rule_shown_in_the_hud_is_measured_against_what_was_submitted(hud):
+    """`RuleStore.record_outcome` had no caller anywhere in the product, so a
+    rule's hit rate stayed at whatever it was promoted with forever and pruning
+    a decayed belief could never happen.
+    """
+    import asyncio
+
+    client, _cfg = hud
+    rules = server._state["rules"]
+    rule_id = rules.add({"kind": "sequential", "previous": "git commit"},
+                        "pytest -q", 12, "You test after committing.",
+                        confidence=0.9)
+
+    class FakeWS:
+        async def send_json(self, _msg):
+            pass
+
+    ws = FakeWS()
+    window = server.PredictionWindow()
+    server._windows[ws] = window
+
+    try:
+        # The HUD showed this rule's suggestion, and the user took it.
+        window.note_shown("pytest -q", 0.9, rule_id=rule_id)
+        asyncio.run(server._handle_input(ws, "pytest -q"))
+        assert rules.get(rule_id)["fired"] == 1
+        assert rules.get(rule_id)["hit_rate"] > 0.9
+
+        # Then it was shown again and contradicted.
+        window.note_shown("pytest -q", 0.9, rule_id=rule_id)
+        asyncio.run(server._handle_input(ws, "git push"))
+        measured = rules.get(rule_id)
+        assert measured["fired"] == 2
+        assert measured["hit_rate"] < 0.9, "a contradicted rule must lose ground"
+    finally:
+        server._windows.pop(ws, None)
+        server._active_notes.pop(ws, None)
+
+
+def test_a_hint_that_was_never_shown_does_not_touch_any_rule(hud):
+    import asyncio
+
+    client, _cfg = hud
+    rules = server._state["rules"]
+    rule_id = rules.add({"kind": "sequential", "previous": "git commit"},
+                        "pytest -q", 12, "desc", confidence=0.9)
+
+    class FakeWS:
+        async def send_json(self, _msg):
+            pass
+
+    ws = FakeWS()
+    server._windows[ws] = server.PredictionWindow()
+    try:
+        asyncio.run(server._handle_input(ws, "pytest -q"))
+        assert rules.get(rule_id)["fired"] == 0
+        assert rules.get(rule_id)["hit_rate"] is None
+    finally:
+        server._windows.pop(ws, None)
+        server._active_notes.pop(ws, None)

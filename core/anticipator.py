@@ -53,6 +53,21 @@ class TTLCache:
             self._items.move_to_end(key)
             return value
 
+    def find_prefix(self, prefix: str):
+        """The freshest live entry whose key starts with `prefix`.
+
+        Exact-key lookup answers "did we precompute this command"; a hint has to
+        be found from an incomplete command, which is a different question.
+        """
+        with self._lock:
+            now = time.monotonic()
+            for key, (stamped, value) in reversed(self._items.items()):
+                if now - stamped > self.ttl_s:
+                    continue
+                if isinstance(key, str) and key.startswith(prefix):
+                    return value
+            return None
+
     def clear(self):
         with self._lock:
             self._items.clear()
@@ -127,7 +142,22 @@ class Anticipator:
         self._cache.clear()
 
     def try_serve(self, text: str):
+        """A prewarmed result for exactly this command, for the submit path."""
         return self._cache.get(text)
+
+    def try_hint(self, text: str):
+        """What the user looks like they are about to type, mid-keystroke.
+
+        The hint path used to call try_serve, which is keyed on the full command,
+        so a prediction was only ever revealed once the user had already typed
+        the whole thing — by which point it could not tell them anything. The
+        prewarm is cached under the predicted command, so finding it from a
+        partial buffer is a prefix lookup.
+        """
+        text = (text or "").strip()
+        if not text:
+            return None
+        return self._cache.find_prefix(text)
 
     def last_predictions(self) -> list:
         return list(self._last_prediction or [])

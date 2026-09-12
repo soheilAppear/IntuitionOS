@@ -110,7 +110,15 @@ def test_predictions_come_back_ranked_and_bounded():
             p.update(ep(name, ctx()))
     out = p.predict("a", ctx(), k=2)
     assert len(out) <= 2
-    assert out == sorted(out, key=lambda x: -x.confidence)
+
+    # Completing something the user is visibly not typing is never the better
+    # guess, so what they typed outranks raw confidence: `a` puts `alpha` first
+    # even when the whole-bucket cue scores `beta` higher.
+    assert out[0].action == "alpha"
+
+    # Within a prefix-agreement tier, confidence still decides.
+    rest = p.predict("", ctx(), k=4)
+    assert rest == sorted(rest, key=lambda x: -x.confidence)
 
 
 def test_every_prediction_carries_a_reason():

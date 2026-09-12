@@ -48,12 +48,53 @@ class Prediction:
     why: str = ""             # human-readable, shown by /why and the HUD
     intent: Optional[str] = None
     capability: Optional[str] = None
+    rule_id: Optional[int] = None   # set when a consolidated rule produced this
 
     def to_dict(self) -> dict:
         return {
             "action": self.action, "confidence": self.confidence, "source": self.source,
             "why": self.why, "intent": self.intent, "capability": self.capability,
+            "rule_id": self.rule_id,
         }
+
+
+def _ranking_key(prefix: str):
+    """Rank prefix-consistent candidates above the rest, then by confidence.
+
+    The frequency model backs off to a whole-bucket cue when it has nothing
+    keyed on what was typed, and that cue does not know about the prefix — so
+    typing `py` could rank a suggestion of `anything` above one of `pytest`.
+    Completing something the user is visibly not typing is never the better
+    guess, so prefix agreement is the first sort term rather than a filter.
+    """
+    needle = (prefix or "").strip().lower()
+
+    def key(prediction):
+        matches = bool(needle) and prediction.action.lower().startswith(needle)
+        return (0 if matches else 1, -prediction.confidence)
+
+    return key
+
+
+def rule_strength(rule: dict) -> float:
+    """How confident a consolidated rule is entitled to sound.
+
+    Measured accuracy wins once the rule has actually been put in front of the
+    user; until then the honest number is the confidence it was mined with, not a
+    placeholder. Reporting every untested rule as 0.5 pushed freshly promoted
+    habits below the reveal threshold, so running /dream removed the very hints
+    it had just certified.
+
+    Lives here rather than in consolidation because consolidation imports this
+    module, and the predictor is what has to act on the number.
+    """
+    hit_rate = rule.get("hit_rate")
+    if hit_rate is not None and (rule.get("fired") or 0) > 0:
+        return float(hit_rate)
+    confidence = rule.get("confidence")
+    if confidence is not None:
+        return float(confidence)
+    return float(hit_rate) if hit_rate is not None else 0.5
 
 
 # ── The heuristics that were the whole predictor ─────────────────────────────
@@ -405,13 +446,12 @@ class Predictor:
             # if-chain it replaced, so the if-chain is still here.
             return self._calibrate(heuristic_predictions(prefix))[:k]
 
-        ranked = self._rules_first(prefix, ctx)
-        if ranked:
-            return self._calibrate(ranked)[:k]
+        from_rules = self._rules_first(prefix, ctx)
 
         freq = self.frequency.score(prefix, ctx)
         if not freq:
-            return self._calibrate(heuristic_predictions(prefix))[:k]
+            fallback = from_rules or heuristic_predictions(prefix)
+            return self._calibrate(fallback)[:k]
 
         total = sum(w for _a, w, _why in freq) or 1.0
         probs = self.logistic.probabilities(features(prefix, ctx))
@@ -423,23 +463,56 @@ class Predictor:
             score = (1.0 - self.blend) * freq_p + self.blend * model_p
             merged.append(Prediction(action=action, confidence=score, source="learned", why=why))
 
-        merged.sort(key=lambda p: -p.confidence)
+        merged = self._merge_rules(merged, from_rules)
+        merged.sort(key=_ranking_key(prefix))
         return self._calibrate(merged)[:k]
 
+    def _merge_rules(self, learned: list, from_rules: list) -> list:
+        """Let rules and learned scores compete instead of one silencing the other.
+
+        A rule used to short-circuit scoring entirely. That made /dream actively
+        harmful twice over: a freshly promoted rule reported an unmeasured
+        confidence and so *lowered* a prediction the learned stack was already
+        making well, and a rule mined from an abandoned habit permanently masked
+        the recency-weighted answer. Taking the stronger of the two keeps the
+        rule's human-readable reason where the rule genuinely is the better
+        signal, and gets out of the way where it is not.
+        """
+        if not from_rules:
+            return learned
+        best: dict = {}
+        for prediction in list(learned) + list(from_rules):
+            existing = best.get(prediction.action)
+            if existing is None or prediction.confidence > existing.confidence:
+                best[prediction.action] = prediction
+        return list(best.values())
+
     def _rules_first(self, prefix: str, ctx) -> list:
-        """A rule promoted by consolidation short-circuits scoring: it was already
-        judged to be a genuine habit, and it carries a human-readable reason."""
+        """Predictions from rules consolidation has promoted.
+
+        A rule carries a human-readable reason the statistical stack cannot
+        produce, so it is worth surfacing — but it claims only the confidence its
+        evidence supports: its measured hit rate once it has actually been shown
+        to the user, and the confidence it was mined with until then.
+        """
         if not self.rules:
             return []
         try:
             matches = self.rules.match(prefix, ctx)
         except Exception:
             return []
-        return [
-            Prediction(action=r["action"], confidence=float(r.get("hit_rate") or 0.5),
-                       source="rule", why=r.get("description") or "a learned rule")
-            for r in matches
-        ]
+        out, seen = [], set()
+        for r in matches:
+            if r["action"] in seen:
+                # The sequential and situational cues routinely agree, and two
+                # identical candidates used to fill two of the three hint slots.
+                continue
+            seen.add(r["action"])
+            out.append(Prediction(
+                action=r["action"], confidence=rule_strength(r), source="rule",
+                why=r.get("description") or "a learned rule", rule_id=r.get("id"),
+            ))
+        return out
 
     def _calibrate(self, predictions: list) -> list:
         if not self.calibrator:

@@ -195,8 +195,20 @@ def test_rules_lists_descriptions_support_and_hit_rates(memory):
 
     assert "You run the test suite right after committing." in text
     assert "seen 10x" in text
-    assert "hit rate" in text
     assert "pytest" in text
+
+    # A rule nobody has been shown yet reports the confidence it was mined with
+    # and says plainly that it is untested. It used to claim "hit rate 50%",
+    # which was not a measurement of anything — no code ever wrote that column.
+    assert "recently held 100%" in text
+    assert "not yet tested on you" in text
+    assert "hit rate" not in text
+
+    # Once it has actually been put in front of the user, the measured number
+    # replaces it.
+    rule_id = rules.all()[0]["id"]
+    rules.record_outcome(rule_id, hit=True)
+    assert "hit rate" in render_rules(rules.all())
 
 
 def test_rules_is_helpful_when_empty():
@@ -342,3 +354,157 @@ def test_consolidation_refits_the_calibrator(memory):
 def test_consolidation_without_a_calibrator_is_fine(memory):
     report = consolidate(planted_log(), RuleStore(memory), llm=None)
     assert not report.calibration_refit
+
+
+# ── /dream must make the system better, not worse ───────────────────────────
+#
+# Every test below covers a way the consolidation feature was actively harmful:
+# running it removed hints, resurrected abandoned habits, asserted contradictory
+# beliefs, or froze the interface. They exist because the suite was fully green
+# while all of that was true.
+
+
+def _habit_log(action, prev, n, ts):
+    return [Episode(action=action, keystroke_prefix=action, ts=ts + i,
+                    context=ctx(prev=prev)) for i in range(n)]
+
+
+def test_dream_does_not_downgrade_a_prediction_it_just_certified(memory):
+    """The regression that made /dream counterproductive.
+
+    A promoted rule reported `hit_rate`, which nothing ever wrote, so it claimed
+    a flat 0.5 — below the default reveal threshold of 0.70. Running /dream on a
+    habit the predictor already knew therefore *removed* the ghost hint for it.
+    """
+    now = time.time()
+    log = _habit_log("pytest -q", "git commit", 60, now)
+    rules = RuleStore(memory)
+
+    before = Predictor(min_episodes=10)
+    for e in log:
+        before.update(e)
+    top_before = before.predict("pyt", ctx(prev="git commit"))[0]
+    assert top_before.confidence >= 0.7
+
+    consolidate(log, rules, llm=None)
+
+    after = Predictor(min_episodes=10, rules=rules)
+    for e in log:
+        after.update(e)
+    top_after = after.predict("pyt", ctx(prev="git commit"))[0]
+
+    assert top_after.action == "pytest -q"
+    assert top_after.confidence >= top_before.confidence, (
+        "consolidating a habit must not lower the confidence in it"
+    )
+
+
+def test_a_rule_never_claims_a_hit_rate_nobody_measured(memory):
+    rules = RuleStore(memory)
+    consolidate(planted_log(), rules, llm=None)
+    rule = rules.all()[0]
+
+    assert rule["hit_rate"] is None, "untested rules have no measured accuracy"
+    assert rule["confidence"] == pytest.approx(1.0)
+    assert rule["fired"] == 0
+
+
+def test_the_same_habit_does_not_fill_every_hint_slot(memory):
+    """Sequential and situational mining routinely agree, and both rules used to
+    be returned, so two of the three suggestions were the identical command."""
+    rules = RuleStore(memory)
+    log = _habit_log("pytest -q", "git commit", 60, time.time())
+    consolidate(log, rules, llm=None)
+
+    p = Predictor(min_episodes=10, rules=rules)
+    for e in log:
+        p.update(e)
+    actions = [pred.action for pred in p.predict("pyt", ctx(prev="git commit"))]
+    assert len(actions) == len(set(actions)), actions
+
+
+def test_an_abandoned_habit_does_not_outvote_the_current_one(memory):
+    """Mining counted the whole window flat while the predictor decays by
+    recency, so a workflow dropped months ago was promoted and then masked the
+    correct answer permanently."""
+    now = time.time()
+    log = _habit_log("npm run build", "git pull", 200, now - 120 * 86400)
+    log += _habit_log("npm run dev", "git pull", 20, now - 2 * 86400)
+
+    rules = RuleStore(memory)
+    consolidate(log, rules, llm=None)
+
+    promoted = {r["action"] for r in rules.all(active_only=True)}
+    assert promoted == {"npm run dev"}, promoted
+
+    p = Predictor(min_episodes=10, rules=rules)
+    for e in log:
+        p.update(e)
+    assert p.predict("npm", ctx(prev="git pull"))[0].action == "npm run dev"
+
+
+def test_a_belief_the_log_no_longer_supports_is_retired(memory):
+    now = time.time()
+    rules = RuleStore(memory)
+    consolidate(_habit_log("npm run build", "git pull", 60, now - 200 * 86400),
+                rules, llm=None)
+    assert {r["action"] for r in rules.all(active_only=True)} == {"npm run build"}
+
+    consolidate(_habit_log("npm run dev", "git pull", 60, now), rules, llm=None)
+
+    assert {r["action"] for r in rules.all(active_only=True)} == {"npm run dev"}
+    retired = [r for r in rules.all(active_only=False) if not r["active"]]
+    assert retired, "superseded beliefs are deactivated, not deleted"
+    assert "(retired)" in render_rules(rules.all(active_only=False))
+
+
+def test_an_even_split_does_not_promote_two_contradictory_rules(memory):
+    """`support / total >= 0.5` let a coin flip qualify, so /rules asserted both
+    halves of the same situation as things the system believed."""
+    now = time.time()
+    log = []
+    for i in range(12):
+        log.append(Episode(action="pytest -q", keystroke_prefix="pytest -q",
+                           ts=now + i * 2, context=ctx()))
+        log.append(Episode(action="git commit", keystroke_prefix="git commit",
+                           ts=now + i * 2 + 1, context=ctx()))
+
+    rules = RuleStore(memory)
+    consolidate(log, rules, llm=None)
+
+    situational = [r for r in rules.all() if r["pattern"].get("kind") == "situational"]
+    assert len(situational) <= 1, [r["description"] for r in situational]
+
+
+def test_an_unreachable_model_is_only_tried_once(memory):
+    """Every candidate got its own doomed request, so a dead Ollama cost one
+    connection timeout per pattern and froze the interface for the sum of them."""
+    llm = StubLLM(explode=True)
+    log = []
+    now = time.time()
+    for name in ("alpha", "beta", "gamma", "delta", "epsilon"):
+        log += _habit_log(f"run {name}", f"before {name}", 8, now)
+
+    report = consolidate(log, RuleStore(memory), llm=llm)
+
+    assert report.candidates > 1, "need several candidates for this to mean anything"
+    assert len(llm.calls) == 1, f"one failure should end model use, got {len(llm.calls)}"
+    assert not report.used_model
+    assert report.promoted, "the statistical fallback still produces rules"
+
+
+def test_a_rule_is_measured_once_it_has_been_shown(memory):
+    """`record_outcome` had no caller outside the tests, so `hit_rate` stayed at
+    its default forever and `prune` could never retire anything."""
+    rules = RuleStore(memory)
+    consolidate(planted_log(), rules, llm=None)
+    rule_id = rules.all()[0]["id"]
+
+    for _ in range(12):
+        rules.record_outcome(rule_id, hit=False)
+
+    rule = rules.get(rule_id)
+    assert rule["fired"] == 12
+    assert rule["hit_rate"] < 0.25
+    assert rule["last_fired_ts"] is not None
+    assert [r["id"] for r in prune(rules)] == [rule_id]

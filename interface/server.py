@@ -270,6 +270,7 @@ async def lifespan(app: FastAPI):
                     "confidence": conf,
                     "why": prediction.why,
                     "action": text,
+                    "rule_id": prediction.rule_id,
                 },
             )
         if t == "ls":
@@ -280,6 +281,7 @@ async def lifespan(app: FastAPI):
                     "confidence": conf,
                     "why": prediction.why,
                     "action": text,
+                    "rule_id": prediction.rule_id,
                 },
             )
         if t.startswith("read file "):
@@ -291,11 +293,13 @@ async def lifespan(app: FastAPI):
                     "confidence": conf,
                     "why": prediction.why,
                     "action": text,
+                    "rule_id": prediction.rule_id,
                 },
             )
         # Anything else is still worth predicting even though there is nothing
         # cheap to precompute: the hint alone has value.
-        return (text, {"confidence": conf, "why": prediction.why, "action": text})
+        return (text, {"confidence": conf, "why": prediction.why, "action": text,
+                       "rule_id": prediction.rule_id})
 
     a = cfg.get("anticipation", {}) or {}
     ant = Anticipator(
@@ -361,6 +365,7 @@ async def lifespan(app: FastAPI):
             "rules": rule_store,
             "retriever": retriever,
             "resolver": resolver,
+            "logger": logger,
         }
     )
 
@@ -853,6 +858,7 @@ async def _handle_command(ws: WebSocket, text: str):
                 min_confidence=float(ccfg.get("min_confidence", 0.5)),
                 calibrator=_state.get("calibrator"),
                 calibration_store=_state.get("calibration_store"),
+                logger=_state.get("logger"),
             ),
         )
         await ws.send_json({"type": "reply", "text": report.summary()})
@@ -1212,6 +1218,29 @@ async def _handle_command(ws: WebSocket, text: str):
     await ws.send_json({"type": "error", "text": f"Unknown command: {text}"})
 
 
+def _record_rule_outcome(window, text: str) -> None:
+    """Feed a shown rule's outcome back to the rule store.
+
+    Kept tolerant: learning is never worth failing a submission over, and the
+    episode log may be disabled entirely.
+    """
+    if not window:
+        return
+    outcome = window.take_rule_outcome()
+    if not outcome:
+        return
+    rules = _state.get("rules")
+    episodes = _state.get("episodes")
+    if not rules or (episodes is not None and not episodes.enabled):
+        return
+    if text.strip() == "/forget":
+        return
+    try:
+        rules.record_outcome(outcome[0], outcome[1])
+    except Exception:
+        pass
+
+
 async def _handle_input(ws: WebSocket, text: str):
     """Encode one episode, then handle the input.
 
@@ -1239,6 +1268,10 @@ async def _handle_input(ws: WebSocket, text: str):
         else None
     )
     note["episode_id"] = episode_id
+
+    # This submission is the verdict on any rule-sourced hint that was shown, and
+    # the only thing that ever moves a rule's hit rate off its mined confidence.
+    _record_rule_outcome(window, text)
     _active_notes[ws] = note
 
     try:
@@ -1447,7 +1480,7 @@ async def _maybe_send_anticipation(ws: WebSocket, text: str):
     ant = _state.get("ant")
     if not ant:
         return
-    pre = ant.try_serve(text)
+    pre = ant.try_hint(text)
     if pre and isinstance(pre, dict):
         # Prewarming happens above the "free" threshold; revealing needs the
         # higher "reveal" one, because a wrong hint costs the user attention
@@ -1469,7 +1502,7 @@ async def _maybe_send_anticipation(ws: WebSocket, text: str):
         # user must not be counted against them for ignoring it.
         window = _windows.get(ws)
         if window:
-            window.note_shown(text, pre.get("confidence"))
+            window.note_shown(text, pre.get("confidence"), rule_id=pre.get("rule_id"))
 
 
 async def _submit_input(ws, data):

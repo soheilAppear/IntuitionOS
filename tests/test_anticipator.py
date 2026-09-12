@@ -172,3 +172,39 @@ def test_it_prewarms_what_the_predictor_learned(project):
         assert warmed == ["pytest"]
     finally:
         ant.stop()
+
+
+# ── The hint has to arrive while it can still help ──────────────────────────
+
+
+def test_a_hint_is_found_from_a_partial_command():
+    """The ghost hint was looked up with try_serve, which is keyed on the whole
+    command — so it only ever appeared once the user had finished typing, when
+    it could no longer tell them anything."""
+    ant = Anticipator(prewarm_fn=lambda p: ("pytest -q", {"action": "pytest -q"}),
+                      predict_fn=lambda buf: None, enabled=False)
+    ant._cache.put("pytest -q", {"action": "pytest -q", "confidence": 0.9})
+
+    for typed in ("p", "py", "pyt", "pytest", "pytest -q"):
+        assert ant.try_hint(typed), f"no hint offered after typing {typed!r}"
+
+    # The submit path is a different question and stays an exact match.
+    assert ant.try_serve("pyt") is None
+    assert ant.try_serve("pytest -q")
+
+
+def test_a_hint_does_not_contradict_what_was_typed():
+    ant = Anticipator(prewarm_fn=lambda p: None, predict_fn=lambda buf: None, enabled=False)
+    ant._cache.put("pytest -q", {"action": "pytest -q"})
+
+    assert ant.try_hint("git") is None
+    assert ant.try_hint("") is None
+    assert ant.try_hint("   ") is None
+
+
+def test_an_expired_prewarm_is_not_offered_as_a_hint():
+    ant = Anticipator(prewarm_fn=lambda p: None, predict_fn=lambda buf: None,
+                      enabled=False, cache_ttl_s=0.01)
+    ant._cache.put("pytest -q", {"action": "pytest -q"})
+    time.sleep(0.05)
+    assert ant.try_hint("pyt") is None
