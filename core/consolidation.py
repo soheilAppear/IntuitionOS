@@ -170,16 +170,21 @@ def find_candidates(episodes, min_support: int = DEFAULT_MIN_SUPPORT,
         found = []
         weighted_total = sum(weights.values())
         raw_total = sum(raw.values())
+        # The action must be the *sole* strongest in its bucket. An even split
+        # used to clear `min_confidence: 0.5` on both sides, so /rules asserted
+        # two contradictory beliefs about the identical situation. Requiring a
+        # unique winner rejects the tie without making `min_confidence: 1.0`
+        # unsatisfiable, which a strictly-greater comparison would.
         best = max(weights.values()) if weights else 0.0
+        winners = [a for a, w in weights.items() if w >= best]
+        if len(winners) != 1:
+            return found
         for action, weight in weights.items():
+            if action != winners[0]:
+                continue
             support = raw[action]
             confidence = weight / weighted_total if weighted_total else 0.0
-            # Strictly greater, and the strongest action in its bucket: at
-            # `min_confidence: 0.5` an even split used to promote both halves,
-            # so /rules asserted two contradictory beliefs about one situation.
-            if support < min_support or confidence <= min_confidence:
-                continue
-            if weight < best:
+            if support < min_support or confidence < min_confidence:
                 continue
             found.append(Candidate(pattern=pattern_for(action), action=action,
                                    support=support, total=raw_total,

@@ -508,3 +508,10 @@ def test_a_rule_is_measured_once_it_has_been_shown(memory):
     assert rule["hit_rate"] < 0.25
     assert rule["last_fired_ts"] is not None
     assert [r["id"] for r in prune(rules)] == [rule_id]
+
+
+def test_min_confidence_of_one_still_promotes_a_perfect_pattern(memory):
+    """Rejecting ties must not make `min_confidence: 1.0` unsatisfiable."""
+    log = _habit_log("pytest -q", "git commit", 20, time.time())
+    found = find_candidates(log, min_support=4, min_confidence=1.0)
+    assert [c.action for c in found] == ["pytest -q", "pytest -q"]
