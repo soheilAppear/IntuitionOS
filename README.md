@@ -215,6 +215,56 @@ tree
 
 Click **◎** in the HUD header to browse the full memory panel.
 
+### Habits it works out for itself
+
+```
+/dream
+/rules
+/rules delete 3
+```
+
+`/dream` reads back the episode log and looks for things you do repeatedly in the
+same situation — what follows a particular command here, what you run in this
+directory at this hour. Each recurring pattern is put to the local model, which
+decides whether it is a genuine habit or an accident of a short log and names it
+in a sentence. Rules are then consulted with no model in the query path at all,
+because something that takes seconds to answer cannot sit inside a keystroke.
+
+`/rules` is the payoff, and it is deliberately in plain language:
+
+```
+What I think I have noticed about how you work:
+
+  #1  You run the test suite right after committing.
+        seen 62x · hit rate 64% of 14 shown · predicts 'pytest -q'
+  #2  You start the dev server after pulling.
+        seen 20x · recently held 100% · not yet tested on you · predicts 'npm run dev'
+
+Delete one you disagree with: /rules delete <id>
+```
+
+Those two lines report **two different numbers**, and the distinction is the
+honest part. *Recently held* is how often the pattern actually held in your log,
+weighted toward recent behaviour — it is what the rule was mined on. *Hit rate*
+is how often you took the suggestion once it was genuinely put in front of you,
+and it only exists after that has happened. A rule that has never been shown to
+you says so rather than inventing a number for a test that has not been run.
+
+Mining is recency-weighted on the same half-life as the predictor, so a workflow
+you abandoned months ago cannot outvote the one you use today, and a belief the
+current window no longer supports is retired on the next `/dream` — deactivated
+rather than deleted, so `/rules --all` can still show what it used to think and
+that it stopped. A rule whose measured hit rate decays is retired the same way.
+
+A rule never silences the rest of the system. It competes with the learned
+predictor and the stronger signal wins, which is what stops a freshly promoted
+rule from lowering confidence in something already predicted well. Running
+`/dream` should never make the system worse at a habit it had already learned.
+
+Ollama being unavailable does not break any of this: patterns are still found and
+promoted, with statistical descriptions instead of written ones, and the report
+says so plainly.
+
 ### Natural language scheduling
 
 ```
@@ -346,10 +396,10 @@ episode *before* being updated with it.
 
 | Metric | Baseline (if-chain) | Learned | Calibrated |
 |---|---|---|---|
-| Top-1 accuracy | 12.5% | **54.6%** | 54.6% |
-| Top-3 accuracy | 12.5% | **61.3%** | 61.3% |
-| Prewarm hit rate | 12.5% | **64.9%** | 61.4% |
-| Wasted prewarm rate | 87.5% | **35.1%** | 38.6% |
+| Top-1 accuracy | 12.5% | **55.0%** | 55.0% |
+| Top-3 accuracy | 12.5% | **61.7%** | 61.7% |
+| Prewarm hit rate | 12.5% | **64.9%** | 61.7% |
+| Wasted prewarm rate | 87.5% | **35.1%** | 38.3% |
 | False reveal rate (hints shown and ignored) | 0.0% | 9.5% | 9.9% |
 | Expected calibration error | 0.050 | 0.057 | **0.037** |
 | Hints shown (of 240) | 16 | 95 | 111 |
@@ -388,6 +438,13 @@ being handled.
 Type `tree`, `ls`, or `read file <path>` **slowly**. Watch the `›` glow cyan — the
 anticipator has already computed the result in the background. Press Enter and see
 `⚡ cached` in the response. No waiting.
+
+The ghost hint and the cached result are two different things and they are looked
+up differently. The cached result is matched against the command you actually
+submitted — exactly this command, already computed. The hint is matched against
+what you have typed *so far*, so once the predictor has learned a habit, typing
+`p` is enough to be offered `pytest -q`. A suggestion that only arrived after you
+had finished typing the command would not be a suggestion.
 
 What gets prewarmed is whatever the predictor has learned you tend to do, not a
 fixed list. Two separate thresholds govern it, and the gap between them is the

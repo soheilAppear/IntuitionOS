@@ -159,6 +159,29 @@ separate reveal threshold controls visible prediction hints. This is independent
 of the correction list: predicting a next action and correcting a misspelled
 command are different observations.
 
+The cache answers two different questions and they use different lookups.
+`try_serve(text)` is an exact-key match on the submitted command: "was the result
+of precisely this already computed", which is what produces `⚡ cached`.
+`try_hint(text)` is a prefix match over the same cache: "given what has been typed
+so far, what does it look like the user is about to run". The hint path used the
+exact lookup once, which meant a suggestion only ever surfaced after the whole
+command had been typed — too late to be a suggestion at all.
+
+**Consolidation and rule confidence.** A rule carries two distinct numbers, and
+conflating them is a mistake with visible consequences. `confidence` is how often
+the pattern held in the log it was mined from, recency-weighted on the predictor's
+half-life so an abandoned workflow cannot outvote a current one. `hit_rate` is the
+rolling accuracy measured after the rule was actually shown to the user, written
+by `RuleStore.record_outcome` and counted by `fired`. A rule reports its mined
+confidence until it has been tested and its measured hit rate afterwards; it never
+invents a number for a test that has not happened.
+
+Rules do not short-circuit scoring. They are merged with the learned candidates and
+the stronger signal wins, so a rule contributes its human-readable reason where it
+is the better answer and gets out of the way where it is not. Beliefs the current
+window no longer supports are deactivated by the next `/dream` rather than staying
+active indefinitely, and `prune` retires those whose measured hit rate has decayed.
+
 **Reminders.** Both bootstraps install a scheduler and the same `Memory` instance
 used by actions. The binding helpers support either initialization order.
 Natural-language time is interpreted in the configured timezone and stored as
