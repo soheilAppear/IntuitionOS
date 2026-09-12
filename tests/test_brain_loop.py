@@ -10,7 +10,6 @@ import json
 
 import pytest
 
-from core import actions as actions_mod
 from core.brain import Brain, extract_json_object, parse_tool_call, render_capabilities
 from core.capabilities import capabilities, set_safe_mode
 from core.llm import LLMError
@@ -35,7 +34,7 @@ class StubLLM:
         return turn
 
 
-def tool(name, **args):
+def tool(name, /, **args):
     return json.dumps({"thought": f"calling {name}", "tool": name, "args": args})
 
 
@@ -285,6 +284,38 @@ def test_completion_feedback_does_not_authorize_unrequested_mutations(brain_fact
 def test_unstructured_fallback_cannot_bypass_completion_guard(brain_factory):
     brain, _ = brain_factory("Saved file.txt.", "Saved file.txt.", "Saved file.txt.")
     assert brain.step("write file.txt")["error"] == "unverified_action"
+
+
+@pytest.mark.parametrize("text", [
+    "keep.txt already exists in the project, so nothing was created or changed. Pick a different filename.",
+    "I could not create keep.txt because it already exists in the project. The tool refused to overwrite it, so no file was created or changed.",
+])
+def test_existing_file_refusal_with_negated_result_needs_no_repair(project, brain_factory, text):
+    folder = project / "CreatedFolder"
+    folder.mkdir()
+    (folder / "keep.txt").write_text("KEEP ORIGINAL", encoding="utf-8")
+    brain, llm = brain_factory(tool("create_empty_file", name="keep.txt"), reply(text))
+    out = brain.step("Create a new empty file named keep.txt. Do not overwrite an existing file.")
+    assert out["reply"] == text and "error" not in out
+    assert len(llm.calls) == 2
+    assert (folder / "keep.txt").read_text(encoding="utf-8") == "KEEP ORIGINAL"
+    assert not any(m["content"].startswith("ACTION EVIDENCE ERROR:") for m in llm.calls[-1])
+
+
+@pytest.mark.parametrize("text", [
+    "Nothing was created, but Chrome was opened.",
+    "No file was created, and Chrome was opened.",
+    "keep.txt already exists, so nothing was created; Chrome was opened.",
+])
+def test_negated_file_result_does_not_hide_mixed_positive_claim(project, brain_factory, text):
+    folder = project / "CreatedFolder"
+    folder.mkdir()
+    (folder / "keep.txt").write_text("KEEP ORIGINAL", encoding="utf-8")
+    brain, llm = brain_factory(tool("create_empty_file", name="keep.txt"), reply(text), reply(text))
+    out = brain.step("Create a new empty file named keep.txt. Do not overwrite an existing file.")
+    assert out["error"] == "unverified_action"
+    assert len(llm.calls) == 3
+    assert (folder / "keep.txt").read_text(encoding="utf-8") == "KEEP ORIGINAL"
 
 
 def test_completion_evidence_survives_successful_confirmation(brain_factory, monkeypatch):

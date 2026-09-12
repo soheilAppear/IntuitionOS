@@ -507,12 +507,17 @@ def _claims_action_completed(text: str) -> bool:
     text = re.sub(r"```[\s\S]*?```|`[^`\n]*`|\"[^\"\n]*\"", "", text)
     for sentence in re.split(r"(?:[.!?]\s+|[;\n]|\bbut\b)", text, flags=re.I):
         sentence = sentence.strip()
-        if re.match(r"^(?:no\b|none\b|nothing\b)", sentence, re.I):
-            continue
         if re.match(r"^(?:according to|the (?:script|code|example)\b|previously\b|yesterday\b)", sentence, re.I):
             continue
-        if _ACTION_CLAIM.search(sentence):
-            return True
+        # Negation applies to its clause, not every claim in the sentence.
+        # "It already exists, so nothing was created" is a refusal; "Nothing
+        # was created, but Chrome was opened" still asserts an action.
+        for clause in re.split(r",|\b(?:and|so|yet|however)\b", sentence, flags=re.I):
+            clause = clause.strip()
+            if re.match(r"^(?:no\b|none\b|nothing\b)", clause, re.I):
+                continue
+            if _ACTION_CLAIM.search(clause):
+                return True
     return False
 
 

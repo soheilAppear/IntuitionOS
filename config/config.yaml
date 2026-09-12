@@ -1,6 +1,6 @@
 # Global config with safe defaults
 backend: ollama                  # can be: ollama or fallback
-model: qwen3.8:27b             # smallest currently installed local model
+model: nemotron-3.5-lightning:latest
 temperature: 0.2
 max_tokens: 600
 timezone: America/New_York
@@ -14,11 +14,11 @@ voice:
   model: base        # tiny (fastest) | base | small | medium (most accurate)
   language: en
 
-# Bounds on one tool-loop turn. A local 20B model on consumer hardware will
-# otherwise iterate for minutes; both limits are enforced, whichever hits first.
+# Bounds on one tool-loop turn. Leave room to locate, edit, verify, and reply.
+# The time budget is checked between model calls; an in-flight call can exceed it.
 brain:
-  max_iters: 5          # tool calls per turn
-  budget_ms: 20000      # wall clock per turn
+  max_iters: 8          # model iterations, including the final reply
+  budget_ms: 20000      # time budget checked between model calls
   history_turns: 6      # conversational turns carried into the prompt
 
 # The episode log records every input you submit, locally, so the predictor has
