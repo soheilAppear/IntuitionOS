@@ -413,6 +413,50 @@ That check happens at resolution time and redirects are still followed, so it
 raises the cost of reaching your private network rather than making it
 impossible. Every fetch is journalled like any other non-free action.
 
+### Hand gestures
+
+```
+/gestures on
+/gestures status
+/gestures off
+```
+
+A webcam watches for hand poses and movements and binds them to actions. Off
+until you ask for it: opening a camera is not something to do because a config
+file said so.
+
+| Gesture | Does |
+|---|---|
+| swipe left / right | snap the active window to that half of the screen |
+| swipe up / down | maximise / minimise it |
+| two fingers | switch to the next window |
+| fist | play / pause |
+| thumbs up | next track |
+
+**A gesture is the least deliberate input this system takes.** There is no
+keystroke behind it, you may have been waving at someone else in the room, and a
+frame or two of noise can look like a swipe. Three things follow, and they are
+the whole design:
+
+- **It is its own actor.** Gestures dispatch as `gesture`, which the capability
+  gate confines to reversible actions — the same mechanism that stops the
+  anticipator from doing anything but prewarm. A gesture can move a window; it
+  can *never* reach `os_shutdown_computer` or `os_kill_process`, at any
+  confidence, and no confirmation is even offered for those. A badly wrong
+  classifier cannot close or delete anything.
+- **A pose must persist.** One frame is noise, so a pose has to hold for several
+  consecutive frames before it becomes an event (`hold_frames`).
+- **And it must then stop.** A fired gesture cannot fire again until `cooldown_s`
+  has passed. Without that a hand resting in frame dispatches the same action
+  thirty times a second.
+
+Everything it does is undoable. `/undo` after a snap puts the window back to the
+exact position it had, because the journal captured the geometry first.
+
+Requires a webcam plus `mediapipe` and `opencv-python`, both in
+`requirements.txt`. If either is missing, or no camera is connected, `/gestures
+status` says which — the backend still starts normally.
+
 ### Hardware
 
 ```
@@ -587,6 +631,7 @@ never submit, so it is not allowed to change anything at all.
 | `/snooze <id> 15m\|2h\|1d` | Snooze a task |
 | `/safe on\|off` | Toggle Safe Mode |
 | `/exec "python script.py"` | Run a command, scoped to the project and journalled |
+| `/gestures on\|off\|status` | Hand gestures through the webcam |
 | `/hw` | List hardware devices |
 | `/hw schema <name>` | Show device schema |
 | `/actions` | List all registered actions |

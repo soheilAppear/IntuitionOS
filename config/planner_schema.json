@@ -299,6 +299,29 @@
       "est_cost_ms": 100
     },
     {
+      "name": "os_cycle_window",
+      "summary": "Focus the next or previous visible window.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "direction": {
+            "type": "string",
+            "enum": [
+              "next",
+              "previous"
+            ]
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 70
+    },
+    {
       "name": "os_fetch_url",
       "summary": "Fetch a public HTTP(S) page and return its readable text. Use this to answer questions about a website's contents. Addresses on this machine or a private network are refused.",
       "args": {
@@ -324,6 +347,25 @@
       "path_scope": null,
       "undoable": false,
       "est_cost_ms": 1500
+    },
+    {
+      "name": "os_focus_window",
+      "summary": "Bring a window to the front.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 70
     },
     {
       "name": "os_get_battery",
@@ -443,7 +485,7 @@
     },
     {
       "name": "os_list_windows",
-      "summary": "List visible window titles.",
+      "summary": "List the visible application windows by title.",
       "args": {
         "type": "object",
         "properties": {},
@@ -454,7 +496,7 @@
       "requires_confirmation": false,
       "path_scope": null,
       "undoable": false,
-      "est_cost_ms": 600
+      "est_cost_ms": 300
     },
     {
       "name": "os_lock_screen",
@@ -470,6 +512,36 @@
       "path_scope": null,
       "undoable": false,
       "est_cost_ms": 100
+    },
+    {
+      "name": "os_media_key",
+      "summary": "Send a media key: play_pause, next_track, previous_track, stop, mute, volume_up, volume_down.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "enum": [
+              "play_pause",
+              "next_track",
+              "previous_track",
+              "stop",
+              "mute",
+              "volume_up",
+              "volume_down"
+            ]
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 60
     },
     {
       "name": "os_move_mouse",
@@ -495,6 +567,39 @@
       "path_scope": null,
       "undoable": false,
       "est_cost_ms": 100
+    },
+    {
+      "name": "os_move_window",
+      "summary": "Move or resize a window. Omit the title for the active window; zero width or height keeps the current size.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "x": {
+            "type": "integer"
+          },
+          "y": {
+            "type": "integer"
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "height": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": true,
+      "est_cost_ms": 90
     },
     {
       "name": "os_open_app",
@@ -675,6 +780,41 @@
       "est_cost_ms": 100
     },
     {
+      "name": "os_snap_window",
+      "summary": "Snap a window to a half, a quarter, or the full screen. Positions: left, right, top, bottom, top-left, top-right, bottom-left, bottom-right, full.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "position": {
+            "type": "string",
+            "enum": [
+              "left",
+              "right",
+              "top",
+              "bottom",
+              "top-left",
+              "top-right",
+              "bottom-left",
+              "bottom-right",
+              "full"
+            ]
+          }
+        },
+        "required": [
+          "position"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": true,
+      "est_cost_ms": 90
+    },
+    {
       "name": "os_system_info",
       "summary": "Report OS, RAM, disk and uptime.",
       "args": {
@@ -749,6 +889,54 @@
       "path_scope": null,
       "undoable": false,
       "est_cost_ms": 500
+    },
+    {
+      "name": "os_window_geometry",
+      "summary": "Report where a window is. Omit the title for the active window.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "free",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 60
+    },
+    {
+      "name": "os_window_state",
+      "summary": "Minimise, maximise or restore a window.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "minimize",
+              "maximize",
+              "restore"
+            ]
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 70
     },
     {
       "name": "read_file",

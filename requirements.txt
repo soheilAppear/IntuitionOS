@@ -25,3 +25,9 @@ numpy==2.2.6
 
 # OS sandbox — optional, guarded at import
 PyAutoGUI==0.9.54
+
+# Hand gestures through a webcam — optional, guarded at probe() rather than at
+# import, so a machine with neither camera nor these packages still starts and
+# explains why gestures are unavailable.
+mediapipe==1.0.1
+opencv-python==5.0.0.93

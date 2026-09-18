@@ -1108,6 +1108,82 @@ def register_os_capabilities():
             return str(error)
         return None
 
+    # ── Windows on the screen ────────────────────────────────────────────
+    # Moving a window is visibly reversible: the user watches it happen and the
+    # journal keeps where it was, so /undo puts it back.
+
+    def _capture_geometry(args):
+        before = _os.window_geometry(args.get("title", ""))
+        if before.get("error"):
+            raise ValueError(before["error"])
+        return {"title": before["title"], "x": before["x"], "y": before["y"],
+                "width": before["width"], "height": before["height"]}
+
+    def _restore_geometry(payload):
+        return _os.move_window(payload["title"], payload["x"], payload["y"],
+                               payload["width"], payload["height"])
+
+    _os_cap(
+        "os_list_windows", "list_windows", "free", 300, False,
+        "List the visible application windows by title.",
+    )
+    _os_cap(
+        "os_window_geometry", "window_geometry", "free", 60, False,
+        "Report where a window is. Omit the title for the active window.",
+        schema=_schema({"title": {"type": "string"}}),
+    )
+    _os_cap(
+        "os_move_window", "move_window", "reversible", 90, False,
+        "Move or resize a window. Omit the title for the active window; zero "
+        "width or height keeps the current size.",
+        schema=_schema({
+            "title": {"type": "string"},
+            "x": {"type": "integer"}, "y": {"type": "integer"},
+            "width": {"type": "integer", "minimum": 0},
+            "height": {"type": "integer", "minimum": 0},
+        }),
+        undo=_restore_geometry, capture_undo=_capture_geometry,
+    )
+    _os_cap(
+        "os_snap_window", "snap_window", "reversible", 90, False,
+        "Snap a window to a half, a quarter, or the full screen. Positions: "
+        "left, right, top, bottom, top-left, top-right, bottom-left, "
+        "bottom-right, full.",
+        schema=_schema({
+            "title": {"type": "string"},
+            "position": {"type": "string", "enum": [
+                "left", "right", "top", "bottom", "top-left", "top-right",
+                "bottom-left", "bottom-right", "full"]},
+        }, ["position"]),
+        undo=_restore_geometry, capture_undo=_capture_geometry,
+    )
+    _os_cap(
+        "os_window_state", "set_window_state", "reversible", 70, False,
+        "Minimise, maximise or restore a window.",
+        schema=_schema({
+            "title": {"type": "string"},
+            "state": {"type": "string", "enum": ["minimize", "maximize", "restore"]},
+        }, ["state"]),
+    )
+    _os_cap(
+        "os_focus_window", "focus_window", "reversible", 70, False,
+        "Bring a window to the front.",
+        schema=_schema({"title": {"type": "string"}}),
+    )
+    _os_cap(
+        "os_cycle_window", "cycle_window", "reversible", 70, False,
+        "Focus the next or previous visible window.",
+        schema=_schema({"direction": {"type": "string", "enum": ["next", "previous"]}}),
+    )
+    _os_cap(
+        "os_media_key", "media_key", "reversible", 60, False,
+        "Send a media key: play_pause, next_track, previous_track, stop, "
+        "mute, volume_up, volume_down.",
+        schema=_schema({"key": {"type": "string", "enum": [
+            "play_pause", "next_track", "previous_track", "stop",
+            "mute", "volume_up", "volume_down"]}}, ["key"]),
+    )
+
     # Reading a page is how a question about the web gets answered. Deliberately
     # not `free`: `free` is what the anticipator may run speculatively, and it
     # must never make a network request to a URL it merely guessed at.

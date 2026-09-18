@@ -56,6 +56,7 @@ from core.llm import LLMClient
 from core.memory import Memory
 from core.retrieval import Retriever
 from core.scheduler import Scheduler
+from core.gestures import GestureRecognizer
 from core.voice import VoiceRecognizer
 
 # Shared services are created during lifespan, rather than per HUD connection.
@@ -144,6 +145,60 @@ def _queue_voice_callback(loop, callback):
     future.add_done_callback(
         lambda done: done.exception() if not done.cancelled() else None
     )
+
+
+def _queue_gesture(loop, event) -> None:
+    """Hand a gesture from the camera thread to the event loop."""
+    if loop.is_closed():
+        return
+    future = asyncio.run_coroutine_threadsafe(_run_gesture(event), loop)
+    future.add_done_callback(
+        lambda done: done.exception() if not done.cancelled() else None
+    )
+
+
+def _queue_gesture_status(loop, status) -> None:
+    if loop.is_closed():
+        return
+    future = asyncio.run_coroutine_threadsafe(
+        _broadcast({"type": "gesture_status", **status}), loop
+    )
+    future.add_done_callback(
+        lambda done: done.exception() if not done.cancelled() else None
+    )
+
+
+async def _run_gesture(event) -> None:
+    """Dispatch what a gesture is bound to, as the gesture actor.
+
+    The actor is the whole safety story: the gate confines it to reversible
+    capabilities, so a misread hand can move a window but cannot close, delete
+    or shut down anything. Nothing here needs to re-check that.
+    """
+    gestures = _state.get("gestures")
+    if not gestures:
+        return
+    binding = gestures.action_for(event.name)
+    if not binding:
+        return
+    capability, args = binding
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            _executor,
+            lambda: actions.dispatch(capability, dict(args), actor="gesture",
+                                     confidence=1.0),
+        )
+    except Exception as error:
+        result = {"error": str(error)}
+
+    await _broadcast({
+        "type": "gesture",
+        "gesture": event.name,
+        "capability": capability,
+        "text": _format_os_result(capability, result, args)
+        if isinstance(result, dict) else str(result),
+        "ok": bool(isinstance(result, dict) and not result.get("error")),
+    })
 
 
 @asynccontextmanager
@@ -363,6 +418,18 @@ async def lifespan(app: FastAPI):
                 "text": f"Voice setup failed: {error}",
             }
 
+    # ── Gestures ─────────────────────────────────────────────────────────
+    # The camera is opened only once gestures are switched on, so a machine with
+    # no webcam — or a user who does not want one watching — costs nothing.
+    gesture_cfg = cfg.get("gestures", {}) or {}
+    gestures = GestureRecognizer(
+        camera_index=int(gesture_cfg.get("camera_index", 0)),
+        hold_frames=int(gesture_cfg.get("hold_frames", 4)),
+        cooldown_s=float(gesture_cfg.get("cooldown_s", 0.8)),
+        on_gesture=lambda event: _queue_gesture(loop, event),
+        on_status=lambda status: _queue_gesture_status(loop, status),
+    )
+
     _state.update(
         {
             "cfg": cfg,
@@ -370,6 +437,7 @@ async def lifespan(app: FastAPI):
             "mem": mem,
             "sched": sched,
             "ant": ant,
+            "gestures": gestures,
             "voice": voice,
             "voice_status": voice_status,
             "voice_owner": None,
@@ -413,6 +481,10 @@ async def lifespan(app: FastAPI):
     _state["ant"].stop()
     if _state.get("voice"):
         _state["voice"].stop_now()
+    if _state.get("gestures"):
+        # Release the camera. A held device stays unavailable to every other
+        # application until the process actually exits.
+        _state["gestures"].stop()
     try:
         if _state["episodes"].enabled:
             _state["predictor"].save()
@@ -1242,6 +1314,40 @@ async def _handle_command(ws: WebSocket, text: str):
                 f"{r['decision']}{'/' + r['outcome'] if r['outcome'] else ''}{mark}"
             )
         await ws.send_json({"type": "reply", "text": "\n".join(lines)})
+        return
+
+    if text.startswith("/gestures"):
+        gestures = _state.get("gestures")
+        if not gestures:
+            await ws.send_json({"type": "error", "text": "gestures unavailable"})
+            return
+        parts = text.split()
+        argument = parts[1].lower() if len(parts) > 1 else "status"
+
+        if argument == "on":
+            outcome = gestures.start()
+            if outcome.get("error"):
+                await ws.send_json({"type": "error", "text": outcome["error"]})
+                return
+            await ws.send_json({"type": "reply", "text": "Gestures on — watching the camera."})
+        elif argument == "off":
+            gestures.stop()
+            await ws.send_json({"type": "reply", "text": "Gestures off. The camera is released."})
+        elif argument == "status":
+            status = gestures.status()
+            lines = [
+                f"available: {status['available']}",
+                f"running:   {status['running']}",
+                status["text"],
+                "",
+                "Bindings:",
+            ]
+            lines += [f"  {name:<14} {capability}"
+                      for name, capability in sorted(status["bindings"].items())]
+            await ws.send_json({"type": "reply", "text": "\n".join(lines)})
+        else:
+            await ws.send_json({"type": "error", "text": "usage: /gestures on|off|status"})
+        await _broadcast({"type": "gesture_status", **gestures.status()})
         return
 
     if text == "/capabilities":

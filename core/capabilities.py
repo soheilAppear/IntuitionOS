@@ -48,7 +48,7 @@ Reversibility = Literal["free", "reversible", "irreversible"]
 #                shell command, a shutdown). Never auto-executed, at any
 #                confidence.
 
-Actor = Literal["user", "anticipator", "model", "scheduler"]
+Actor = Literal["user", "anticipator", "model", "scheduler", "gesture"]
 
 Verdict = Literal["allow", "confirm", "deny"]
 
@@ -294,6 +294,19 @@ def gate(
         return GateDecision(
             "deny",
             f"anticipator may only run free capabilities; {cap.name} is {cap.reversibility}",
+        )
+
+    # Rule 3a — a gesture is a camera's opinion about a hand. It is the least
+    # deliberate input the system takes: there is no keystroke behind it, the
+    # user may simply have been gesturing at someone else in the room, and a
+    # frame or two of noise can look like a swipe. So it may move a window, the
+    # cursor or the volume — things the user can see happen and undo — and it may
+    # never reach anything irreversible, at any confidence, with no confirmation
+    # offered. A misread hand must not be able to close or delete anything.
+    if actor == "gesture" and cap.reversibility == "irreversible":
+        return GateDecision(
+            "deny",
+            f"a gesture may not run {cap.name}: irreversible actions need a deliberate request",
         )
 
     # Rule 3b — the scheduler fires unattended, with nobody present to answer a

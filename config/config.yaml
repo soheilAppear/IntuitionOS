@@ -14,6 +14,15 @@ voice:
   model: base        # tiny (fastest) | base | small | medium (most accurate)
   language: en
 
+# Hand gestures through the webcam. Off until you ask for them with /gestures on,
+# because opening a camera is not something to do because a config file said so.
+# A gesture dispatches as the `gesture` actor, which the capability gate confines
+# to reversible actions: it can move a window, never close one.
+gestures:
+  camera_index: 0    # first webcam; raise this if you have several
+  hold_frames: 4     # frames a pose must persist before it counts as deliberate
+  cooldown_s: 0.8    # minimum gap between two firings of the same gesture
+
 # Bounds on one tool-loop turn. Leave room to locate, edit, verify, and reply.
 # The time budget is checked between model calls; an in-flight call can exceed it.
 brain:

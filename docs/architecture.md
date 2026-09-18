@@ -195,6 +195,26 @@ one-off remains in the open task list. Stored payloads dispatch as `actor="sched
 irreversible payloads are denied and actions requiring confirmation are not run
 unattended. The app must be running to deliver reminders.
 
+**Gestures.** The backend owns one `GestureRecognizer`, started only by
+`/gestures on` so a camera is never opened because a config file said so. A worker
+thread reads frames, MediaPipe produces 21 hand landmarks, and `core/gestures.py`
+turns those into a pose. Classification is a pure function of the landmarks, which
+is what lets the whole vocabulary be tested against fixed coordinates with no
+hardware; only the capture loop needs a camera.
+
+Two filters sit between a pose and an action, and both are necessary. A pose must
+hold for `hold_frames` consecutive frames before it becomes an event, because one
+frame is noise. A fired gesture then cannot fire again until `cooldown_s` has
+passed, because a hand resting in frame would otherwise dispatch the same action
+at the frame rate — the same shape of bug as a tool loop repeating a call.
+
+Events dispatch as `actor="gesture"`, and that is the entire safety argument. Gate
+rule 3a refuses any irreversible capability to that actor outright, with no
+confirmation offered, so a misread hand can snap a window but cannot close or
+delete one. The binding table is checked by a test that asserts every bound
+capability is non-irreversible, so it cannot quietly become a way around the gate.
+Window moves capture their geometry first, so `/undo` restores the exact position.
+
 **Voice.** The backend owns one `VoiceRecognizer`; recording uses the Windows
 default input device through `sounddevice`. A worker captures audio, detects
 silence, and transcribes it locally with Whisper. Initial model preparation may

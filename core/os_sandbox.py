@@ -683,6 +683,263 @@ def toggle_wifi(state: str) -> dict:
 
 # ── Window management ─────────────────────────────────────────────────────────
 
+_MEDIA_KEYS = {
+    "play_pause": 0xB3, "next_track": 0xB0, "previous_track": 0xB1,
+    "stop": 0xB2, "mute": 0xAD, "volume_down": 0xAE, "volume_up": 0xAF,
+}
+
+
+def media_key(key: str) -> dict:
+    """Send one media key, the same event a keyboard's media button sends.
+
+    Goes to the shell rather than a particular window, so whichever player is
+    running responds — which is what makes a gesture for "next track" useful
+    without having to find and focus the player first.
+    """
+    name = (key or "").strip().lower()
+    code = _MEDIA_KEYS.get(name)
+    if code is None:
+        return {"error": f"Choose one of: {', '.join(sorted(_MEDIA_KEYS))}."}
+    user32 = _user32()
+    if user32 is None:
+        return {"error": "Media keys are only implemented on Windows."}
+    _KEYEVENTF_KEYUP = 0x0002
+    user32.keybd_event(code, 0, 0, 0)
+    user32.keybd_event(code, 0, _KEYEVENTF_KEYUP, 0)
+    return {"ok": True, "key": name}
+
+
+# ── Window control ────────────────────────────────────────────────────────────
+#
+# Done with ctypes against user32 rather than pywin32, which would be a new
+# binary dependency for a handful of calls this module can make directly.
+# Everything here is reversible: a window that was moved can be moved back, and
+# the gate is what says so.
+
+
+_SW_MINIMIZE, _SW_MAXIMIZE, _SW_RESTORE = 6, 3, 9
+_SWP_NOZORDER, _SWP_NOACTIVATE = 0x0004, 0x0010
+
+
+def _user32():
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    return ctypes.WinDLL("user32", use_last_error=True)
+
+
+def _window_title(user32, handle) -> str:
+    import ctypes
+    length = user32.GetWindowTextLengthW(handle)
+    if length <= 0:
+        return ""
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(handle, buffer, length + 1)
+    return buffer.value
+
+
+def _enumerate_windows(user32) -> list:
+    """Every visible, titled, non-minimised-to-tray top-level window."""
+    import ctypes
+    from ctypes import wintypes
+
+    found = []
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def collect(handle, _param):
+        if not user32.IsWindowVisible(handle):
+            return True
+        title = _window_title(user32, handle)
+        if title:
+            found.append((handle, title))
+        return True
+
+    user32.EnumWindows(callback_type(collect), 0)
+    return found
+
+
+def _resolve_window(user32, title: str):
+    """Find one window by a case-insensitive substring of its title.
+
+    Returns (handle, error). Ambiguity is an error rather than a guess: moving
+    the wrong window is confusing and the caller can always be more specific.
+    """
+    windows = _enumerate_windows(user32)
+    if not title or not title.strip():
+        handle = user32.GetForegroundWindow()
+        if not handle:
+            return None, "There is no active window."
+        return handle, None
+    needle = title.strip().lower()
+    matches = [(h, t) for h, t in windows if needle in t.lower()]
+    if not matches:
+        return None, f"No visible window matching {title!r}."
+    exact = [(h, t) for h, t in matches if t.lower() == needle]
+    if exact:
+        return exact[0][0], None
+    if len(matches) > 1:
+        names = ", ".join(repr(t) for _h, t in matches[:5])
+        return None, f"{len(matches)} windows match {title!r}: {names}. Be more specific."
+    return matches[0][0], None
+
+
+def _work_area(user32) -> tuple:
+    """The desktop minus the taskbar, so a snapped window is not covered."""
+    import ctypes
+    from ctypes import wintypes
+
+    class RECT(ctypes.Structure):
+        _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                    ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+    rect = RECT()
+    if user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+        return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+    return 0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+
+
+def window_geometry(title: str = "") -> dict:
+    """Where a window currently is, so a move can be undone."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = _user32()
+    if user32 is None:
+        return {"error": "Window control is only implemented on Windows."}
+    handle, error = _resolve_window(user32, title)
+    if error:
+        return {"error": error}
+
+    class RECT(ctypes.Structure):
+        _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                    ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+    rect = RECT()
+    if not user32.GetWindowRect(handle, ctypes.byref(rect)):
+        return {"error": "Could not read the window's position."}
+    return {
+        "ok": True, "title": _window_title(user32, handle),
+        "x": rect.left, "y": rect.top,
+        "width": rect.right - rect.left, "height": rect.bottom - rect.top,
+    }
+
+
+def move_window(title: str = "", x: int = 0, y: int = 0,
+                width: int = 0, height: int = 0) -> dict:
+    """Move and optionally resize a window. Zero width/height keeps the current size."""
+    user32 = _user32()
+    if user32 is None:
+        return {"error": "Window control is only implemented on Windows."}
+    handle, error = _resolve_window(user32, title)
+    if error:
+        return {"error": error}
+
+    current = window_geometry(_window_title(user32, handle))
+    if current.get("error"):
+        return current
+    width = int(width) or current["width"]
+    height = int(height) or current["height"]
+    if width < 100 or height < 100:
+        return {"error": "A window smaller than 100x100 would be unusable."}
+
+    user32.ShowWindow(handle, _SW_RESTORE)
+    if not user32.SetWindowPos(handle, None, int(x), int(y), width, height,
+                               _SWP_NOZORDER | _SWP_NOACTIVATE):
+        return {"error": "The window refused to move."}
+    return {"ok": True, "title": current["title"], "x": int(x), "y": int(y),
+            "width": width, "height": height}
+
+
+def snap_window(title: str = "", position: str = "left") -> dict:
+    """Snap a window to a half, quarter, or the full work area."""
+    user32 = _user32()
+    if user32 is None:
+        return {"error": "Window control is only implemented on Windows."}
+    handle, error = _resolve_window(user32, title)
+    if error:
+        return {"error": error}
+
+    origin_x, origin_y, full_w, full_h = _work_area(user32)
+    half_w, half_h = full_w // 2, full_h // 2
+    layouts = {
+        "left":         (origin_x,          origin_y,          half_w, full_h),
+        "right":        (origin_x + half_w, origin_y,          half_w, full_h),
+        "top":          (origin_x,          origin_y,          full_w, half_h),
+        "bottom":       (origin_x,          origin_y + half_h, full_w, half_h),
+        "top-left":     (origin_x,          origin_y,          half_w, half_h),
+        "top-right":    (origin_x + half_w, origin_y,          half_w, half_h),
+        "bottom-left":  (origin_x,          origin_y + half_h, half_w, half_h),
+        "bottom-right": (origin_x + half_w, origin_y + half_h, half_w, half_h),
+        "full":         (origin_x,          origin_y,          full_w, full_h),
+    }
+    key = (position or "").strip().lower().replace("_", "-").replace(" ", "-")
+    if key not in layouts:
+        return {"error": f"Choose one of: {', '.join(sorted(layouts))}."}
+
+    x, y, width, height = layouts[key]
+    user32.ShowWindow(handle, _SW_RESTORE)
+    if not user32.SetWindowPos(handle, None, x, y, width, height,
+                               _SWP_NOZORDER | _SWP_NOACTIVATE):
+        return {"error": "The window refused to move."}
+    return {"ok": True, "title": _window_title(user32, handle), "position": key,
+            "x": x, "y": y, "width": width, "height": height}
+
+
+def set_window_state(title: str = "", state: str = "restore") -> dict:
+    """Minimise, maximise or restore a window."""
+    user32 = _user32()
+    if user32 is None:
+        return {"error": "Window control is only implemented on Windows."}
+    handle, error = _resolve_window(user32, title)
+    if error:
+        return {"error": error}
+    commands = {"minimize": _SW_MINIMIZE, "maximize": _SW_MAXIMIZE, "restore": _SW_RESTORE}
+    key = (state or "").strip().lower()
+    if key not in commands:
+        return {"error": "Choose minimize, maximize or restore."}
+    name = _window_title(user32, handle)
+    user32.ShowWindow(handle, commands[key])
+    return {"ok": True, "title": name, "state": key}
+
+
+def focus_window(title: str = "") -> dict:
+    """Bring a window to the front."""
+    user32 = _user32()
+    if user32 is None:
+        return {"error": "Window control is only implemented on Windows."}
+    handle, error = _resolve_window(user32, title)
+    if error:
+        return {"error": error}
+    name = _window_title(user32, handle)
+    user32.ShowWindow(handle, _SW_RESTORE)
+    # A process that does not own the foreground cannot simply take it, so the
+    # input queues are briefly attached. Failure here is not fatal: the window
+    # is still restored and flashing in the taskbar.
+    user32.SetForegroundWindow(handle)
+    return {"ok": True, "title": name, "focused": True}
+
+
+def cycle_window(direction: str = "next") -> dict:
+    """Focus the next or previous visible window, in a stable order."""
+    user32 = _user32()
+    if user32 is None:
+        return {"error": "Window control is only implemented on Windows."}
+    windows = [(h, t) for h, t in _enumerate_windows(user32)]
+    if len(windows) < 2:
+        return {"error": "There are not two visible windows to switch between."}
+    current = user32.GetForegroundWindow()
+    handles = [h for h, _t in windows]
+    step = -1 if (direction or "next").strip().lower() in ("previous", "prev", "back") else 1
+    try:
+        index = handles.index(current)
+    except ValueError:
+        index = -1 if step == 1 else 0
+    target, name = windows[(index + step) % len(windows)]
+    user32.ShowWindow(target, _SW_RESTORE)
+    user32.SetForegroundWindow(target)
+    return {"ok": True, "title": name, "direction": "previous" if step < 0 else "next"}
+
+
 def list_windows() -> dict:
     """List visible application windows by title."""
     ps = (
