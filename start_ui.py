@@ -23,6 +23,38 @@ BACKEND_PORT = 7432
 STARTUP_TIMEOUT = 60.0
 
 
+def _project_python():
+    """The interpreter the backend should run under.
+
+    Forgetting to activate the venv is the most common way to start this, and
+    `sys.executable` obeyed it silently: the backend was launched under whatever
+    Python was first on PATH, then died on a missing dependency thirty frames
+    into uvicorn's importer. The project's own interpreter is right there, so
+    use it and say so rather than failing with someone else's traceback.
+
+    `INTUITION_ALLOW_SYSTEM_PY=1` keeps the current interpreter, matching what
+    the same variable already means for `/exec`.
+    """
+    current = os.path.abspath(sys.executable or "")
+    if os.environ.get("INTUITION_ALLOW_SYSTEM_PY", "0") == "1":
+        return sys.executable, None
+    venv_python = os.path.join(
+        PROJECT_ROOT, ".venv",
+        "Scripts" if os.name == "nt" else "bin",
+        "python.exe" if os.name == "nt" else "python",
+    )
+    if not os.path.isfile(venv_python):
+        return sys.executable, None
+    if os.path.normcase(current) == os.path.normcase(os.path.abspath(venv_python)):
+        return sys.executable, None
+    return venv_python, (
+        f"Using the project venv interpreter ({venv_python}).\n"
+        f"  The active interpreter is {sys.executable or 'unknown'}, which is not it.\n"
+        "  Activate it with .\\.venv\\Scripts\\activate to silence this, or set "
+        "INTUITION_ALLOW_SYSTEM_PY=1 to use the active one anyway."
+    )
+
+
 def _find_electron():
     """Prefer the native binary so the launcher owns Electron, not a CMD shim."""
     system = platform.system()
@@ -202,10 +234,13 @@ def main():
     try:
         _check_port_available()
         electron_bin = _ensure_electron()
+        backend_python, note = _project_python()
+        if note:
+            print(note, flush=True)
         print("Starting IntuitionOS backend; waiting for /health…", flush=True)
         server = subprocess.Popen(
             [
-                sys.executable,
+                backend_python,
                 "-m",
                 "uvicorn",
                 "interface.server:app",

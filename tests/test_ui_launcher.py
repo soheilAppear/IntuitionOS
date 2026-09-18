@@ -1,5 +1,6 @@
 """Launcher lifecycle regressions; no tests start or stop real processes."""
 
+import os
 import subprocess
 from unittest.mock import Mock
 
@@ -276,3 +277,74 @@ def test_health_probe_requires_expected_response_and_closes_connection(
     assert launcher._backend_healthy() is expected
     connection.request.assert_called_once_with("GET", "/health")
     connection.close.assert_called_once()
+
+
+# ── Running the launcher outside the venv ───────────────────────────────────
+
+
+def test_the_backend_runs_under_the_project_venv_not_whatever_python_started_it(
+    monkeypatch, tmp_path
+):
+    """Forgetting to activate the venv used to produce thirty frames of uvicorn
+    importer traceback ending in a missing dependency, because the backend was
+    launched with sys.executable whatever that happened to be."""
+    import start_ui
+
+    scripts = tmp_path / ".venv" / ("Scripts" if os.name == "nt" else "bin")
+    scripts.mkdir(parents=True)
+    venv_python = scripts / ("python.exe" if os.name == "nt" else "python")
+    venv_python.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(start_ui, "PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(start_ui.sys, "executable", r"C:\Python314\python.exe")
+    monkeypatch.delenv("INTUITION_ALLOW_SYSTEM_PY", raising=False)
+
+    chosen, note = start_ui._project_python()
+
+    assert chosen == str(venv_python)
+    assert note and "not it" in note, "the user is told why the interpreter changed"
+
+
+def test_an_already_correct_interpreter_is_left_alone_and_says_nothing(
+    monkeypatch, tmp_path
+):
+    import start_ui
+
+    scripts = tmp_path / ".venv" / ("Scripts" if os.name == "nt" else "bin")
+    scripts.mkdir(parents=True)
+    venv_python = scripts / ("python.exe" if os.name == "nt" else "python")
+    venv_python.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(start_ui, "PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(start_ui.sys, "executable", str(venv_python))
+    monkeypatch.delenv("INTUITION_ALLOW_SYSTEM_PY", raising=False)
+
+    chosen, note = start_ui._project_python()
+    assert chosen == str(venv_python) and note is None
+
+
+def test_allow_system_py_keeps_the_active_interpreter(monkeypatch, tmp_path):
+    """The escape hatch the docs already promise for /exec means the same here."""
+    import start_ui
+
+    scripts = tmp_path / ".venv" / ("Scripts" if os.name == "nt" else "bin")
+    scripts.mkdir(parents=True)
+    (scripts / ("python.exe" if os.name == "nt" else "python")).write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(start_ui, "PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(start_ui.sys, "executable", r"C:\Python314\python.exe")
+    monkeypatch.setenv("INTUITION_ALLOW_SYSTEM_PY", "1")
+
+    chosen, note = start_ui._project_python()
+    assert chosen == r"C:\Python314\python.exe" and note is None
+
+
+def test_no_venv_present_falls_back_without_complaining(monkeypatch, tmp_path):
+    import start_ui
+
+    monkeypatch.setattr(start_ui, "PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(start_ui.sys, "executable", r"C:\Python314\python.exe")
+    monkeypatch.delenv("INTUITION_ALLOW_SYSTEM_PY", raising=False)
+
+    chosen, note = start_ui._project_python()
+    assert chosen == r"C:\Python314\python.exe" and note is None
