@@ -1108,19 +1108,44 @@ def register_os_capabilities():
             return str(error)
         return None
 
+    # Reading a page is how a question about the web gets answered. Deliberately
+    # not `free`: `free` is what the anticipator may run speculatively, and it
+    # must never make a network request to a URL it merely guessed at.
+    _os_cap(
+        "os_fetch_url",
+        "fetch_url",
+        "reversible",
+        1500,
+        False,
+        "Fetch a public HTTP(S) page and return its readable text. Use this to "
+        "answer questions about a website's contents. Addresses on this machine "
+        "or a private network are refused.",
+        schema=_schema({
+            "url": {"type": "string", "minLength": 1},
+            "max_chars": {"type": "integer", "minimum": 200, "maximum": 20000},
+        }, ["url"]),
+        extra_validate=_validate_browser_url,
+    )
+    # Opening a browser is a visible change to the user's screen that they did
+    # not necessarily ask for, so anything acting on their behalf asks first.
+    # A user typing "open github.com" is not asked to confirm what they just
+    # requested — `confirm_actors` is what draws that line.
     _os_cap(
         "os_open_url",
         "open_url",
         "reversible",
         800,
-        False,
+        True,
         "Open an HTTP(S) website in Chrome, Edge, Firefox, or the default browser. "
-        "Reports the open request, not whether the page finished loading.",
+        "Reports the open request, not whether the page finished loading. This "
+        "shows the page to the user and cannot return its contents — use "
+        "os_fetch_url to read a page.",
         schema=_schema({
             "url": {"type": "string", "minLength": 1},
             "browser": {"type": "string", "enum": ["default", "chrome", "edge", "firefox"]},
         }, ["url"]),
         extra_validate=_validate_browser_url,
+        confirm_actors=("model", "anticipator", "scheduler"),
     )
     # Likewise: the user unlocks or wakes the machine themselves.
     _os_cap(

@@ -80,6 +80,13 @@ class Capability:
     # "Confirmation depends on the driver": some capabilities are cheap for most
     # arguments and serious for a few, so the decision has to see the arguments.
     dynamic_confirm: Optional[Callable] = None  # args -> bool
+    # Which actors must be asked. None means every actor, which is the default
+    # and what `requires_confirmation` has always meant. Naming actors expresses
+    # "the user may do this directly, but something acting on their behalf has
+    # to ask" — opening a browser window is the case that needed it: doing it
+    # because the user said to is the request, while doing it because a model
+    # inferred it is a surprise appearing on their screen.
+    confirm_actors: Optional[tuple] = None
 
     def __post_init__(self):
         if self.path_args and not self.path_scope:
@@ -89,9 +96,11 @@ class Capability:
         if self.undo and self.reversibility != "reversible":
             raise ValueError(f"{self.name}: undo only makes sense for reversible actions")
 
-    def needs_confirmation(self, args: dict) -> bool:
+    def needs_confirmation(self, args: dict, actor: Optional[str] = None) -> bool:
         if self.requires_confirmation:
-            return True
+            # An unknown actor is treated as in scope: failing towards asking is
+            # the safe direction for a confirmation decision.
+            return self.confirm_actors is None or actor is None or actor in self.confirm_actors
         return bool(self.dynamic_confirm and self.dynamic_confirm(args))
 
 
@@ -311,7 +320,7 @@ def gate(
         )
 
     # Rule 5 — an explicit confirmation requirement outranks any confidence.
-    if cap.needs_confirmation(args):
+    if cap.needs_confirmation(args, actor):
         return GateDecision("confirm", f"{cap.name} requires confirmation", args)
 
     # Rule 6 — and irreversible always needs a human, whether or not the manifest

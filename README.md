@@ -371,6 +371,48 @@ Retrieval is FTS5 with BM25 ranking plus a recency weighting, bounded by a token
 budget so a large note database cannot crowd the model's instructions out of the
 prompt.
 
+### Reading a web page
+
+Asking about something on the web makes the model read the page rather than
+just putting it on your screen:
+
+```
+what does the top story on news.ycombinator.com say?
+how is the weather in Toronto?
+```
+
+Two separate capabilities, because they do different things and the difference
+used to be the source of a real bug:
+
+| | What it does | Who may run it |
+|---|---|---|
+| `os_fetch_url` | Fetches a page and returns its **text** to the model | model or you, no confirmation |
+| `os_open_url` | **Shows** the page in a browser, returns nothing readable | you directly; the model must ask first |
+
+Opening a page can never hand its contents back, so a model asked a question it
+could only answer by reading would open the page, still not know the answer, and
+try again — one browser tab per iteration until the loop's limit stopped it.
+Giving it a tool that actually reads is the fix; the tool descriptions say which
+is which, and the loop now refuses to repeat an identical call.
+
+`os_fetch_url` is the only part of IntuitionOS that makes an outbound request,
+so it is deliberately fenced:
+
+- **Never speculative.** It is not a `free` capability, and `free` is precisely
+  what the anticipator is allowed to run on a guess. IntuitionOS will not fetch
+  a URL because it thought you might ask.
+- **Public web only.** The host is resolved first and refused if it lands on
+  loopback, a private range, link-local, or anything else inside your network —
+  so the model cannot read Ollama's API on `11434`, this backend on `7432`, your
+  router, or a cloud metadata endpoint. A public-looking name that resolves home
+  is refused on the address, not the spelling.
+- **Bounded.** HTTP(S) only, a request timeout, a response size ceiling, and
+  scripts and stylesheets stripped before any text reaches the model.
+
+That check happens at resolution time and redirects are still followed, so it
+raises the cost of reaching your private network rather than making it
+impossible. Every fetch is journalled like any other non-free action.
+
 ### Hardware
 
 ```
@@ -398,7 +440,9 @@ ignored is the negative signal that keeps its confidence honest.
 Two things are worth being explicit about:
 
 - **Nothing leaves this machine.** There is no telemetry, no upload, and no
-  hosted API in the path. The log is a table in a local SQLite file.
+  hosted API in the path. The log is a table in a local SQLite file. The one
+  thing that does reach the network is a page you asked about — see
+  [Reading a web page](#reading-a-web-page) — and it sends the URL, not your log.
 - **It records without being asked.** Unlike `/save`, you do not opt in per entry.
 
 So it comes with an off switch and an eraser:

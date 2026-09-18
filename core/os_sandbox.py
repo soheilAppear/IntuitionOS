@@ -4,11 +4,16 @@ system info, and basic input control.
 All actions are explicit and named. Nothing runs automatically.
 """
 
+import ipaddress
 import os
+import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
+from html import unescape
+from typing import Optional
 from urllib.parse import urlsplit
 import webbrowser
 
@@ -187,6 +192,119 @@ def normalize_url(url: str) -> str:
         ):
             raise ValueError("Use a website URL with a valid hostname.")
     return value
+
+
+_FETCH_TIMEOUT_S = 12.0
+_FETCH_MAX_BYTES = 2_000_000
+_SCRIPT_STYLE = re.compile(r"<(script|style|noscript)\b.*?</\1>", re.I | re.S)
+_TAGS = re.compile(r"<[^>]+>")
+_BLANKS = re.compile(r"\n\s*\n\s*")
+
+
+def _refuse_internal_address(host: str) -> Optional[str]:
+    """Refuse a host that resolves anywhere inside this machine or network.
+
+    Without this the model can reach the loopback interface — Ollama's own API
+    on 11434, the IntuitionOS backend on 7432 — plus the router, anything else
+    on the LAN, and cloud metadata endpoints. A page fetch is supposed to read
+    the public web, so everything else is refused by address rather than by
+    hostname spelling.
+
+    This is a check at resolution time, not a guarantee: a name that resolves
+    again between this call and the connection can point somewhere else, and
+    a redirect is followed by the HTTP library. It raises the cost of reaching
+    the private network; it does not make it impossible.
+    """
+    try:
+        resolved = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return f"Could not resolve {host}."
+    for family, _type, _proto, _canon, sockaddr in resolved:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        try:
+            address = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            return f"Could not interpret the address for {host}."
+        if (address.is_private or address.is_loopback or address.is_link_local
+                or address.is_reserved or address.is_multicast
+                or address.is_unspecified):
+            return (
+                f"Refusing to fetch {host}: it resolves to {address}, which is on "
+                "this machine or a private network rather than the public web."
+            )
+    return None
+
+
+def html_to_text(html: str) -> str:
+    """Reduce a page to readable text without pulling in a parser dependency."""
+    text = _SCRIPT_STYLE.sub(" ", html)
+    text = _TAGS.sub(" ", text)
+    text = unescape(text)
+    text = "\n".join(line.strip() for line in text.splitlines())
+    text = _BLANKS.sub("\n\n", text)
+    return re.sub(r"[ \t]{2,}", " ", text).strip()
+
+
+def fetch_url(url: str, max_chars: int = 4000) -> dict:
+    """Fetch a public web page and return its readable text.
+
+    This is the read that `open_url` cannot do. Opening a page in a browser
+    hands it to the user; it can never hand the contents back to the model, so
+    a question like "how is the weather" had no tool that could answer it.
+    """
+    try:
+        destination = normalize_url(url)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    host = urlsplit(destination).hostname or ""
+    refusal = _refuse_internal_address(host)
+    if refusal:
+        return {"error": refusal}
+
+    try:
+        limit = max(200, min(int(max_chars), 20000))
+    except (TypeError, ValueError):
+        limit = 4000
+
+    try:
+        import requests
+    except ImportError:
+        return {"error": "requests is not installed — run: pip install requests"}
+
+    try:
+        response = requests.get(
+            destination,
+            timeout=_FETCH_TIMEOUT_S,
+            stream=True,
+            headers={"User-Agent": "IntuitionOS/1.0 (local assistant)"},
+        )
+    except Exception as exc:
+        return {"error": f"Could not fetch {destination}: {exc}"}
+
+    with response:
+        content_type = (response.headers.get("Content-Type") or "").lower()
+        if not any(t in content_type for t in ("text/", "json", "xml", "")):
+            return {"error": f"{destination} returned {content_type or 'unknown'} content, not a readable page."}
+        try:
+            raw = response.raw.read(_FETCH_MAX_BYTES, decode_content=True) or b""
+        except Exception as exc:
+            return {"error": f"Could not read {destination}: {exc}"}
+        if not response.ok:
+            return {"error": f"{destination} returned HTTP {response.status_code}.",
+                    "status_code": response.status_code}
+
+    body = raw.decode(response.encoding or "utf-8", errors="replace")
+    text = html_to_text(body) if "html" in content_type else body.strip()
+    truncated = len(text) > limit
+    return {
+        "ok": True,
+        "url": response.url,
+        "status_code": response.status_code,
+        "truncated": truncated,
+        "text": text[:limit] + ("… (truncated)" if truncated else ""),
+    }
 
 
 def open_url(url: str, browser: str = "default") -> dict:
