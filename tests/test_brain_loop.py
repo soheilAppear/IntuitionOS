@@ -177,13 +177,28 @@ def test_an_unknown_tool_name_is_reported_back_not_executed(project, brain_facto
 
 
 def test_max_iters_is_honoured(project, brain_factory):
-    """A stub that never stops must still terminate."""
-    brain, llm = brain_factory(*[tool("list_dir", path=".")] * 50)
+    """A stub that never stops must still terminate.
+
+    Each call names a different path, because an identical repeat is now served
+    from the first result without being dispatched again — that guard is tested
+    separately and would otherwise hide whether the iteration cap works.
+    """
+    brain, llm = brain_factory(*[tool("list_dir", path=f"sub{i}") for i in range(50)])
     out = brain.step("go", max_iters=3)
 
     assert out["exhausted"] == "reached the tool-call limit"
     assert len(out["plan"]) == 3
     assert len(llm.calls) == 3
+
+
+def test_a_model_repeating_one_call_forever_still_terminates(project, brain_factory):
+    """The same guarantee when the model never varies its call at all."""
+    brain, llm = brain_factory(*[tool("list_dir", path=".")] * 50)
+    out = brain.step("go", max_iters=3)
+
+    assert out["exhausted"] == "reached the tool-call limit"
+    assert out["plan"] == ["list_dir(path=.)"], "dispatched once, not once per iteration"
+    assert len(llm.calls) == 3, "the loop still stops at the iteration cap"
 
 
 def test_the_wall_clock_budget_is_honoured(project, brain_factory):
@@ -492,3 +507,70 @@ def test_parse_tool_call_treats_missing_args_as_empty():
     assert complaint is None
     assert call.tool == "hw_list"
     assert call.args == {}
+
+
+# ── A repeated identical call is not performed twice ────────────────────────
+
+
+def test_an_identical_repeated_call_runs_once(project, brain_factory):
+    """Asking "how is the weather" opened one browser tab per loop iteration.
+
+    Opening a page cannot return the page's contents, so the model never got
+    what it needed, kept issuing the same call, and the user got one tab per
+    iteration until max_iters stopped it. A repeat of an identical call is now
+    answered from the first result instead of performed again.
+    """
+    (project / "notes.txt").write_text("content", encoding="utf-8")
+
+    brain, llm = brain_factory(
+        tool("read_file", path="notes.txt"),
+        tool("read_file", path="notes.txt"),
+        tool("read_file", path="notes.txt"),
+        reply("Here is what I found."),
+        max_iters=6,
+    )
+    out = brain.step("read my notes")
+
+    assert out["reply"] == "Here is what I found."
+    assert out["plan"] == ["read_file(path=notes.txt)"], (
+        "the identical call must be dispatched exactly once"
+    )
+
+    # The model is told why, and is given the first result so it can still work.
+    observations = [
+        m["content"] for m in llm.calls[-1] if m["content"].startswith("OBSERVATION:")
+    ]
+    assert any("already called" in o for o in observations)
+    assert any("content" in o for o in observations), "the first result is still available"
+
+
+def test_different_arguments_are_still_dispatched(project, brain_factory):
+    """The guard must not block legitimate repeated use of the same tool."""
+    (project / "a.txt").write_text("alpha", encoding="utf-8")
+    (project / "b.txt").write_text("beta", encoding="utf-8")
+
+    brain, _llm = brain_factory(
+        tool("read_file", path="a.txt"),
+        tool("read_file", path="b.txt"),
+        reply("Read both."),
+    )
+    out = brain.step("read both files")
+
+    assert out["plan"] == ["read_file(path=a.txt)", "read_file(path=b.txt)"]
+
+
+def test_a_repeated_side_effect_is_performed_once(project, brain_factory, wired):
+    """The case that matters: the repeat must not re-run the side effect."""
+    _acts, journal, _mem = wired
+    brain, _llm = brain_factory(
+        tool("write_file", path="out.txt", text="hello"),
+        tool("write_file", path="out.txt", text="hello"),
+        tool("write_file", path="out.txt", text="hello"),
+        reply("Done."),
+        max_iters=6,
+    )
+    out = brain.step("write the file")
+
+    assert out["plan"] == ["write_file(path=out.txt, text=hello)"]
+    writes = [e for e in journal.recent(20) if e["capability"] == "write_file"]
+    assert len(writes) == 1, f"the write ran {len(writes)} times"

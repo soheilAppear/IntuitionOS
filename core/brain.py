@@ -211,6 +211,7 @@ class _Suspended:
     capability: str
     has_action_evidence: bool = False
     retried_completion: bool = False
+    seen: dict = field(default_factory=dict)
 
 
 class Brain:
@@ -356,14 +357,17 @@ class Brain:
         return self._run(
             state.messages, state.iters_left, state.deadline, state.trace, on_token=on_token,
             has_action_evidence=state.has_action_evidence,
-            retried_completion=state.retried_completion,
+            retried_completion=state.retried_completion, seen=state.seen,
         )
 
     # ── The loop proper ──────────────────────────────────────────────────
 
     def _run(self, messages, iters_left, deadline, trace, on_token=None, *,
-             has_action_evidence=False, retried_completion=False) -> dict:
+             has_action_evidence=False, retried_completion=False, seen=None) -> dict:
         retried_parse = False
+        # What has already been dispatched this turn, so an identical call is
+        # answered from the first result instead of performed again.
+        seen = {} if seen is None else seen
 
         while True:
             if iters_left <= 0:
@@ -440,6 +444,22 @@ class Brain:
                                  f"OBSERVATION: there is no tool named {call.tool!r}. Available: {known}"})
                 continue
 
+            # An identical call, already made this turn, is answered from the
+            # first result rather than performed again. A model that cannot get
+            # what it wants from a tool tends to try the same call repeatedly —
+            # harmless for a read, but "how is the weather" opened one browser
+            # tab per iteration until the loop hit its limit, because opening a
+            # page can never return the page's contents for it to read.
+            signature = (call.tool, json.dumps(call.args or {}, sort_keys=True, default=str))
+            if signature in seen:
+                messages.append({"role": "user", "content":
+                                 f"OBSERVATION: {call.tool} was already called with these "
+                                 f"exact arguments in this turn and was not run again. Its "
+                                 f"result was: {seen[signature]}. Repeating it will not "
+                                 f"produce a different result — use what you have to answer "
+                                 f"the user, or try a different tool or different arguments."})
+                continue
+
             trace.append(f"{call.tool}({_brief_args(call.args)})")
             dispatch_options = {}
             if self.offer_safe_mode_confirmation:
@@ -455,7 +475,7 @@ class Brain:
                     messages=messages, iters_left=iters_left, deadline=deadline,
                     trace=trace, confirm_token=result["token"], capability=call.tool,
                     has_action_evidence=has_action_evidence,
-                    retried_completion=retried_completion,
+                    retried_completion=retried_completion, seen=seen,
                 )
                 return {
                     "plan": trace,
@@ -472,8 +492,9 @@ class Brain:
 
             if _successful_action(cap, result):
                 has_action_evidence = True
-            messages.append({"role": "user", "content":
-                             f"OBSERVATION: {_observation(call.tool, result)}"})
+            observation = _observation(call.tool, result)
+            seen[signature] = observation
+            messages.append({"role": "user", "content": f"OBSERVATION: {observation}"})
 
     def _give_up(self, messages, trace, why: str) -> dict:
         """Out of iterations or out of time: say so instead of inventing a result."""
