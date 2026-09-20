@@ -296,6 +296,64 @@ def _is_natural_action_request(text: str) -> bool:
     ) is not None
 
 
+# ── Windows on the screen ────────────────────────────────────────────────────
+#
+# Said aloud, arranging windows is the most natural thing to ask for and the
+# least worth waking a model over: "put this on the left" is unambiguous, and
+# routing it here means it works with Ollama stopped and answers immediately.
+
+_THIS_WINDOW = r"(?:(?:this|the|current|active|it)\s+)?(?:window|one)?"
+_POSITIONS = {
+    "left": "left", "right": "right", "top": "top", "bottom": "bottom",
+    "up": "top", "down": "bottom",
+    "top left": "top-left", "top right": "top-right",
+    "bottom left": "bottom-left", "bottom right": "bottom-right",
+    "upper left": "top-left", "upper right": "top-right",
+    "lower left": "bottom-left", "lower right": "bottom-right",
+    "full": "full", "fullscreen": "full", "full screen": "full",
+}
+
+
+def _try_window_intent(t: str):
+    """Recognise window arrangement without interpreting it as a shell command."""
+    t = _browser_request_text(t).strip().rstrip(".!?")
+
+    # "snap/move/put this window to the left", "snap left"
+    match = re.fullmatch(
+        r"(?:snap|move|put|send|dock|place)\s+" + _THIS_WINDOW +
+        r"\s*(?:to|on|at|into)?\s*(?:the\s+)?(?P<where>[a-z ]+?)"
+        r"(?:\s+(?:half|side|corner|of\s+the\s+screen))?",
+        t,
+    )
+    if match:
+        where = " ".join(match.group("where").split())
+        position = _POSITIONS.get(where)
+        if position:
+            return ("os_snap_window", {"position": position})
+
+    match = re.fullmatch(
+        r"(?P<state>maximi[sz]e|minimi[sz]e|restore)\s*" + _THIS_WINDOW, t)
+    if match:
+        state = match.group("state")
+        canonical = ("maximize" if state.startswith("maxim")
+                     else "minimize" if state.startswith("minim") else "restore")
+        return ("os_window_state", {"state": canonical})
+
+    match = re.fullmatch(
+        r"(?:(?:switch|go|move|cycle)\s+to\s+(?:the\s+)?)?"
+        r"(?P<direction>next|previous|last|prior)\s+(?:window|app|application)", t)
+    if match:
+        direction = match.group("direction")
+        return ("os_cycle_window",
+                {"direction": "next" if direction == "next" else "previous"})
+
+    if re.fullmatch(r"(?:list|show|what)\s+(?:my\s+|the\s+|are\s+my\s+)?"
+                    r"(?:open\s+)?windows(?:\s+are\s+open)?", t):
+        return ("os_list_windows", {})
+
+    return None
+
+
 def _try_os_intent(text: str):
     """Return (capability_name, argument_dict) for the first matching OS phrase.
 
@@ -318,6 +376,10 @@ def _try_os_intent(text: str):
         return None
 
     t = text.lower().strip()
+
+    window_intent = _try_window_intent(t)
+    if window_intent is not None:
+        return window_intent
 
     # open / launch / start  (action-first: "open chrome") ────────────
     m = re.match(

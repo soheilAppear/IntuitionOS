@@ -111,3 +111,54 @@ def test_explicit_exec_still_allows_shell_name_correction(resolver):
 def test_supported_single_actions_still_use_existing_direct_tools(text, capability):
     assert is_app_command(text)
     assert _try_os_intent(text)[0] == capability
+
+
+# ── Arranging windows out loud ──────────────────────────────────────────────
+#
+# Said aloud this is the most natural thing to ask for and the least worth
+# waking a model over, so it is recognised directly and works with Ollama down.
+
+
+@pytest.mark.parametrize("said,expected", [
+    ("snap this window to the left",      ("os_snap_window", {"position": "left"})),
+    ("move this window to the right",     ("os_snap_window", {"position": "right"})),
+    ("put it on the left",                ("os_snap_window", {"position": "left"})),
+    ("snap left",                         ("os_snap_window", {"position": "left"})),
+    ("move this window to the top right", ("os_snap_window", {"position": "top-right"})),
+    ("dock this window bottom left",      ("os_snap_window", {"position": "bottom-left"})),
+    ("maximize this window",              ("os_window_state", {"state": "maximize"})),
+    ("minimise",                          ("os_window_state", {"state": "minimize"})),
+    ("restore this window",               ("os_window_state", {"state": "restore"})),
+    ("next window",                       ("os_cycle_window", {"direction": "next"})),
+    ("switch to the previous window",     ("os_cycle_window", {"direction": "previous"})),
+    ("list my open windows",              ("os_list_windows", {})),
+])
+def test_window_arrangement_is_recognised_without_the_model(said, expected):
+    assert _try_os_intent(said) == expected
+
+
+@pytest.mark.parametrize("said", [
+    "move file.txt to backup/",       # a real file operation, not a window
+    "minimize the risk of failure",   # prose that happens to start with a verb
+    "git push",
+    "python train.py --lr 0.001",
+    "left",                           # a bare word is not an instruction
+    "what is the weather",
+])
+def test_ordinary_input_is_not_mistaken_for_a_window_command(said):
+    """A false positive here would move a window instead of running a command."""
+    routed = _try_os_intent(said)
+    assert routed is None or not routed[0].startswith(
+        ("os_snap_window", "os_window_state", "os_cycle_window", "os_list_windows")
+    ), f"{said!r} was hijacked into {routed}"
+
+
+def test_a_spoken_window_command_is_reversible_and_passes_the_gate():
+    from core.actions import register_os_capabilities
+    from core.capabilities import capabilities, gate
+
+    register_os_capabilities()
+    name, args = _try_os_intent("snap this window to the left")
+    decision = gate(capabilities.get(name), dict(args), actor="user", confidence=1.0)
+    assert decision.verdict == "allow"
+    assert capabilities.get(name).reversibility == "reversible"

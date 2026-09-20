@@ -13,6 +13,18 @@ checked against reality, and lets a local model take real actions through a gate
 that knows what each one costs if it turns out to be wrong. All of it runs on
 your own hardware via Ollama, and none of it leaves the machine.
 
+You reach it by typing, by speaking, or with your hands in front of a webcam.
+What it can do for you spans reading and writing files, running commands,
+arranging windows, reading a web page, setting reminders, and answering
+questions — each one declared in a manifest with how bad it would be to get it
+wrong, and gated on that.
+
+**One idea runs through all of it:** how fast something must answer decides how
+much authority it gets. A suggestion while you type has microseconds and may
+change nothing. A model with tools has seconds and may only propose. In between
+sits a learned predictor that says how sure it is, in numbers that have been
+checked. Those tiers are separate on purpose, and the separation is the design.
+
 The claims in this README are measured. See [Does it work?](#does-it-work).
 
 For the code itself, start with the [architecture and component guide](docs/architecture.md),
@@ -69,18 +81,49 @@ cd ui
 npm install
 cd ..
 
-# 3. Start Ollama (optional — file and task features work without it)
+# 3. Start Ollama (optional — file, window and task features work without it)
+$env:OLLAMA_KEEP_ALIVE = "-1"    # see "Keeping the model warm" below
 ollama serve
-ollama pull gpt-oss:20b   # must match `model:` in config/config.yaml
-#
-# gpt-oss:20b is the default and it is large. On a modest machine set
-#   model: llama3
-# in config/config.yaml and pull that instead. The two must agree, or the
-# first message you send returns an HTTP error from Ollama.
 
-# 4. Launch
+# 4. Pull whatever `model:` in config/config.yaml names. Check it first:
+#      Select-String '^model:' config/config.yaml
+#    The two must agree, or your first message returns an HTTP error.
+ollama pull <the model named in config.yaml>
+
+# 5. Launch
 python start_ui.py
 ```
+
+You do **not** need to activate the venv first. The launcher runs the backend
+under `.venv` whichever interpreter started it, and says so when it switches.
+
+### Choosing a model
+
+Any Ollama model with tool support works. `config/config.yaml` decides which,
+and the only hard rule is that the name there and the name you pulled must
+match exactly, tag included.
+
+Two properties matter more than raw size. The tool loop parses a JSON object out
+of each reply, so a model that emits clean structured output beats a larger one
+that does not — `core/llm.py` asks for `format="json"` with thinking disabled to
+help. And a mixture-of-experts model generally answers faster than a dense model
+of the same parameter count, which matters because `brain.budget_ms` caps a turn
+at 20 seconds.
+
+### Keeping the model warm
+
+Ollama unloads an idle model from VRAM after `OLLAMA_KEEP_ALIVE` (5 minutes by
+default). The next message then pays a cold start — tens of seconds on a large
+model — which **exceeds the 20-second turn budget**, so the HUD looks broken
+when it is only waiting for a reload.
+
+| Setting | Effect |
+|---|---|
+| `OLLAMA_KEEP_ALIVE=-1` | Never unloads. Every turn is warm; VRAM stays occupied. |
+| `OLLAMA_KEEP_ALIVE=5m` | Default. Frees VRAM, but the first message after a pause is slow. |
+| `ollama stop <model>` | Manual release, for when you want the GPU back for something else. |
+
+`ollama ps` shows what is currently resident.
 
 Use `Alt+Space` to toggle the HUD. `Ctrl+Q` to quit.
 
@@ -352,6 +395,40 @@ with your full privileges. What it has instead is a gate and a record:
   (`/journal`), and reversible ones can be taken back with `/undo`.
 
 Run `/capabilities` to see the whole surface with each entry's declared cost.
+
+#### Who is asking matters as much as what is asked
+
+The gate's second axis is the **actor**. The same capability is judged differently
+depending on what drove it, because "you typed this" and "a camera thought it saw
+this" are not the same claim. Five actors exist, and each is restricted by how
+deliberate its input is:
+
+| Actor | What it is | May reach |
+|---|---|---|
+| `user` | You typed or said it | everything, subject to Safe Mode and confirmation |
+| `model` | The LLM proposed it in its tool loop | reversible freely; irreversible parks for your approval |
+| `scheduler` | A reminder fired unattended | nothing irreversible — nobody is present to answer |
+| `anticipator` | A guess about what you might do next | `free` only. It is speculating; it may not change anything |
+| `gesture` | A camera's reading of your hand | reversible only. Irreversible is refused outright, not offered |
+
+This is why prewarming is safe to do at all, and why a misread gesture can snap a
+window but can never close one. It also draws a line the plain
+`requires_confirmation` flag could not: opening a browser window is a *request*
+when you ask for it and a *surprise* when the model decides on its own, so
+`os_open_url` asks the model to confirm and lets you through directly.
+
+#### The loop will not repeat itself
+
+Within one turn, the model cannot dispatch the same capability with the same
+arguments twice. The repeat is answered with the first result and a note that
+retrying will not change anything.
+
+That bound exists because the failure it prevents is not hypothetical. Asked "how
+is the weather", the model called `os_open_url`, got back a confirmation that a
+page had been *opened* — which is not the weather, because opening a page cannot
+return its contents — and tried again, once per iteration, until `max_iters`
+stopped it. Five tabs, for one question. Tools whose result cannot satisfy the
+request are exactly the ones with side effects worth not repeating.
 
 ### AI (requires Ollama)
 
@@ -645,6 +722,40 @@ Visible correction covers `/` commands and available shell commands: `/hlp`
 offers `/help`, `/taks` offers `/tasks`, and `gti status` offers `git status`.
 The selected replacement is always shown before it can be submitted.
 
+### Said in plain language
+
+Some requests are recognised directly and routed to a capability without waking
+the model, which is why they work with Ollama stopped. They still pass the gate.
+
+```
+open github.com                      →  os_open_url
+make a file called notes.txt on my desktop
+                                     →  create_empty_file
+snap this window to the left         →  os_snap_window
+what does example.com say?           →  os_fetch_url   (needs the model to read it)
+```
+
+### Moving windows
+
+Available to you, to the model, and to gestures. All of it is reversible, and
+`/undo` after a move restores the exact previous geometry because the journal
+captured it first.
+
+| Capability | Does |
+|---|---|
+| `os_list_windows` | Every visible window by title |
+| `os_window_geometry` | Where a window is right now |
+| `os_move_window` | Move and optionally resize |
+| `os_snap_window` | Snap to a half, a quarter, or full screen |
+| `os_window_state` | Minimise, maximise, restore |
+| `os_focus_window` | Bring to the front |
+| `os_cycle_window` | Next or previous window |
+| `os_media_key` | Play/pause, track, mute, volume |
+
+Titles match on a case-insensitive substring. An ambiguous title is an error
+rather than a guess — moving the wrong window is worse than being asked again.
+Omit the title entirely to mean the active window.
+
 ---
 
 ## Configuration
@@ -703,12 +814,25 @@ there would mean some confidence buys an action that cannot be taken back, and
 the loader resets it. `reveal` is likewise clamped so it can never fall below
 `free`.
 
+Gestures are configured too, and are off until `/gestures on`:
+
+```yaml
+gestures:
+  camera_index: 0    # first webcam; raise this if you have several
+  hold_frames: 4     # frames a pose must persist before it counts as deliberate
+  cooldown_s: 0.8    # minimum gap between two firings of the same gesture
+```
+
 Environment variables (`.env` or shell):
 
-```
-OLLAMA_HOST=http://127.0.0.1:11434
-INTUITION_SAFE=1           # read once at startup, then held in process memory
-```
+| Variable | Effect |
+|---|---|
+| `OLLAMA_HOST` | Where the model lives. Default `http://127.0.0.1:11434` |
+| `OLLAMA_KEEP_ALIVE` | Ollama's own setting. `-1` keeps the model resident; see [Keeping the model warm](#keeping-the-model-warm) |
+| `INTUITION_SAFE` | `1` forces Safe Mode on at startup, then held in process memory |
+| `INTUITION_SHELL` | `pwsh` or `powershell` to execute in a clean PowerShell instead of CMD |
+| `INTUITION_ALLOW_SYSTEM_PY` | `1` uses the active interpreter instead of `.venv`, for both `/exec` and the launcher |
+| `OLLAMA_NO_CLOUD` | Ollama's own setting. `1` stops its background account checks |
 
 ---
 
@@ -722,7 +846,14 @@ start_ui.py
   │     core/capabilities.py   manifest + the one gate all dispatch passes
   │     core/journal.py        audit trail and undo
   │     core/actions.py        the actions themselves (file, exec, task, hw)
-  │     core/os_sandbox.py     OS surface (volume, apps, power, clipboard)
+  │     core/os_sandbox.py     OS surface (windows, volume, apps, web, power)
+  │     core/user_files.py     named user folders, via the Known Folder API
+  │
+  │   ── understanding what was asked ────────────────────────────
+  │     core/command_resolver.py  the shared correction core
+  │     core/shell_environment.py PATH/PATHEXT discovery, shell providers
+  │     core/os_intents.py        plain speech → an OS capability
+  │     core/file_intents.py      plain speech → a file capability
   │
   │   ── learning from experience ────────────────────────────────
   │     core/context.py        cheap portable snapshot of the situation
@@ -731,6 +862,10 @@ start_ui.py
   │     core/calibration.py    reliability curve, isotonic recalibration
   │     core/consolidation.py  offline: patterns become inspectable rules
   │     core/anticipator.py    speculative prewarming, bounded and TTL'd
+  │
+  │   ── senses ─────────────────────────────────────────────────
+  │     core/voice.py          local Whisper, VAD, never auto-submits
+  │     core/gestures.py       webcam → landmarks → pose, pure classifier
   │
   │   ── the slow path ───────────────────────────────────────────
   │     core/brain.py          propose → gate → execute → observe loop
@@ -745,7 +880,14 @@ start_ui.py
 
 intuitionos.py → interface/terminal.py   (classic REPL, same core)
 eval/                                    (replayable metrics, CI gate)
+plugins/                                 (hardware drivers, simulated by default)
 ```
+
+**Workers that run on their own clock.** Five subsystems own a thread and keep
+their own rhythm rather than being stepped by a central loop: `anticipator`,
+`scheduler`, `gestures`, `voice`, and the Whisper preload. Each is expected to
+fail alone — a camera unplugged, Ollama down, a model that will not load — and
+report why without taking the backend with it.
 
 **Three tiers, deliberately separated by how fast they must answer:**
 
@@ -813,13 +955,36 @@ The WebSocket might not be connected. Check that `python start_ui.py` is running
 **LLM errors**
 Make sure Ollama is running (`ollama serve`) and the model is pulled (`ollama pull <model>`). File and task commands work without Ollama.
 
-**venv Python not found**
+**`ModuleNotFoundError` on startup**
+The backend is running under the wrong interpreter. The launcher normally
+prevents this by selecting `.venv` itself and printing a line saying so, but if
+the dependencies were installed somewhere else, reinstall them where it looks:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
 ```
-Or allow system Python: `$env:INTUITION_ALLOW_SYSTEM_PY = "1"`
+Or keep the active interpreter deliberately: `$env:INTUITION_ALLOW_SYSTEM_PY = "1"`
+
+**The first message after a pause takes forever, then works**
+Ollama unloaded the model from VRAM and is reloading it. That reload can exceed
+`brain.budget_ms`, so the turn gives up before the model answers. See
+[Keeping the model warm](#keeping-the-model-warm); `ollama ps` shows whether the
+model is currently resident.
+
+**`&&` is not a valid statement separator**
+Windows PowerShell 5.1 does not support `&&`. Either use PowerShell 7 (`pwsh`),
+or run the commands on separate lines.
+
+**`bind: Only one usage of each socket address`**
+Ollama is already running. Do not start a second one — check with
+`curl http://127.0.0.1:11434/api/version`.
+
+**Gestures do nothing**
+Run `/gestures status`. It reports which part is missing: `mediapipe` or
+`opencv-python` absent, no camera at `camera_index`, or the camera held by
+another application. A camera that Windows lists but reports as not present is
+unplugged or powered off.
 
 **Safe Mode blocking exec**
 ```
@@ -833,7 +998,8 @@ Or allow system Python: `$env:INTUITION_ALLOW_SYSTEM_PY = "1"`
 
 Shipped since the last revision of this file: token streaming in the HUD, a real
 tool loop, the episode log, the learned predictor, calibration, consolidation,
-cue-driven retrieval, and the evaluation harness.
+cue-driven retrieval, the evaluation harness, plain-language file and OS intents,
+window control, page reading, and hand gestures.
 
 Still ahead:
 
@@ -844,6 +1010,13 @@ Still ahead:
 - A genuine sandbox for `run_local`, so the word can be used honestly
 - Local embeddings for retrieval — but only if they measurably beat FTS5 plus
   recency on a held-out set, which has not been tested yet
+- A learned gesture classifier. The current one is hand-tuned geometry, and its
+  thresholds were chosen by reasoning about hand shape rather than measured
+  against labelled data. A small local model would be better, and unlike a
+  hosted one it would not put a camera feed on the network
+- Failure-isolation tests: kill one subsystem, prove the others keep working.
+  Each worker already owns its thread and is *expected* to fail alone, but that
+  is currently a design intention rather than something CI enforces
 
 ---
 
