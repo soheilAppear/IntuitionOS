@@ -194,7 +194,9 @@ def _type_name(spec: dict) -> str:
     t = spec.get("type", "any")
     if isinstance(t, list):
         return "|".join(x for x in t if x != "null")
-    return t
+    bounds = [f"{key} {spec[key]}" for key in ("minimum", "maximum", "minLength", "maxLength")
+              if key in spec]
+    return t + (f" ({', '.join(bounds)})" if bounds else "")
 
 
 # ── The loop ─────────────────────────────────────────────────────────────────
@@ -209,6 +211,8 @@ class _Suspended:
     trace: list
     confirm_token: str
     capability: str
+    signature: tuple
+    suspended_at: float
     has_action_evidence: bool = False
     retried_completion: bool = False
     seen: dict = field(default_factory=dict)
@@ -345,17 +349,24 @@ class Brain:
             confirm_options["on_safe_mode_change"] = on_safe_mode_change
         if allow_safe_mode_change is not True:
             confirm_options["allow_safe_mode_change"] = allow_safe_mode_change
+        resumed_at = time.monotonic()
         result = self.dispatcher.confirm(state.confirm_token, granted=granted, **confirm_options)
         observation = (
             f"The user declined to run {state.capability}."
             if not granted else _observation(state.capability, result)
         )
+        # Human deliberation has its own confirmation-token expiry. It must
+        # not consume the model's remaining work budget.
+        deadline = state.deadline + max(0.0, resumed_at - state.suspended_at)
+        state.seen[state.signature] = result if granted else {
+            "cancelled": True, "reason": f"The user declined to run {state.capability}."
+        }
         state.trace.append(f"{state.capability}: {'declined' if not granted else 'confirmed'}")
         state.messages.append({"role": "user", "content": f"OBSERVATION: {observation}"})
         if granted and _successful_action(self.registry.get(state.capability), result):
             state.has_action_evidence = True
         return self._run(
-            state.messages, state.iters_left, state.deadline, state.trace, on_token=on_token,
+            state.messages, state.iters_left, deadline, state.trace, on_token=on_token,
             has_action_evidence=state.has_action_evidence,
             retried_completion=state.retried_completion, seen=state.seen,
         )
@@ -368,15 +379,18 @@ class Brain:
         # What has already been dispatched this turn, so an identical call is
         # answered from the first result instead of performed again.
         seen = {} if seen is None else seen
+        repeats = 0
 
         while True:
-            if iters_left <= 0:
-                return self._give_up(messages, trace, "reached the tool-call limit")
             # >= not >, so a zero budget spends nothing. time.monotonic() is
             # coarse on Windows (~15 ms), and a strict > let two LLM calls through
             # before the clock had visibly moved.
             if time.monotonic() >= deadline:
-                return self._give_up(messages, trace, "ran out of time")
+                return self._give_up(trace, seen, "ran out of time")
+            if iters_left <= 0:
+                return self._finish(messages, trace, seen, deadline,
+                                    "reached the model-step limit", on_token,
+                                    has_action_evidence=has_action_evidence)
             iters_left -= 1
 
             try:
@@ -384,7 +398,7 @@ class Brain:
                 raw = chat(messages, on_token=on_token)
             except LLMError as e:
                 self.log(f"brain: {e}")
-                return {"plan": trace, "reply": str(e), "error": "llm"}
+                return self._give_up(trace, seen, str(e), error="llm")
 
             messages.append({"role": "assistant", "content": raw})
             call, complaint = parse_tool_call(raw)
@@ -437,6 +451,11 @@ class Brain:
                 self.mem.add("assistant", call.reply)
                 return {"plan": trace, "reply": call.reply, "thought": call.thought}
 
+            # A slow model can finish a proposal after the deadline. Receiving
+            # that proposal is not permission to start another action late.
+            if time.monotonic() >= deadline:
+                return self._give_up(trace, seen, "ran out of time")
+
             cap = self.registry.get(call.tool)
             if cap is None:
                 known = ", ".join(self.registry.names())
@@ -452,14 +471,20 @@ class Brain:
             # page can never return the page's contents for it to read.
             signature = (call.tool, json.dumps(call.args or {}, sort_keys=True, default=str))
             if signature in seen:
+                repeats += 1
+                if repeats >= 2:
+                    return self._finish(messages, trace, seen, deadline,
+                                        "repeated the same tool without progress", on_token,
+                                        has_action_evidence=has_action_evidence)
                 messages.append({"role": "user", "content":
                                  f"OBSERVATION: {call.tool} was already called with these "
                                  f"exact arguments in this turn and was not run again. Its "
-                                 f"result was: {seen[signature]}. Repeating it will not "
+                                 f"result was: {_observation(call.tool, seen[signature])}. Repeating it will not "
                                  f"produce a different result — use what you have to answer "
                                  f"the user, or try a different tool or different arguments."})
                 continue
 
+            repeats = 0
             trace.append(f"{call.tool}({_brief_args(call.args)})")
             dispatch_options = {}
             if self.offer_safe_mode_confirmation:
@@ -474,6 +499,7 @@ class Brain:
                 self._suspended[token] = _Suspended(
                     messages=messages, iters_left=iters_left, deadline=deadline,
                     trace=trace, confirm_token=result["token"], capability=call.tool,
+                    signature=signature, suspended_at=time.monotonic(),
                     has_action_evidence=has_action_evidence,
                     retried_completion=retried_completion, seen=seen,
                 )
@@ -493,20 +519,74 @@ class Brain:
             if _successful_action(cap, result):
                 has_action_evidence = True
             observation = _observation(call.tool, result)
-            seen[signature] = observation
+            seen[signature] = result
             messages.append({"role": "user", "content": f"OBSERVATION: {observation}"})
 
-    def _give_up(self, messages, trace, why: str) -> dict:
-        """Out of iterations or out of time: say so instead of inventing a result."""
-        reply = f"I stopped after {len(trace)} tool call(s) because I {why}."
-        if trace:
-            reply += " So far: " + "; ".join(trace) + "."
-        self.log(f"brain: {why} after {len(trace)} calls")
+    def _finish(self, messages, trace, seen, deadline, why, on_token=None, *,
+                has_action_evidence=False):
+        """Reserve one answer-only turn; it has no path to tool dispatch."""
+        if seen and time.monotonic() < deadline:
+            final_messages = [*messages, {"role": "system", "content":
+                "FINAL ANSWER REQUIRED. Tool use has ended for this request. "
+                "Return one JSON object with a reply field and no tool field. "
+                "Answer the user's original request using the OBSERVATION results already "
+                "received. If a lookup failed, explain the actual failure; do not invent "
+                "missing facts. Report any incomplete work honestly. Do not repeat a "
+                "tool request or claim an action that was not observed."}]
+            try:
+                chat = getattr(self.llm, "chat_json", self.llm.chat)
+                raw = chat(final_messages, on_token=on_token)
+                call, _ = parse_tool_call(raw)
+                if call is not None and call.is_reply and call.reply.strip():
+                    if not has_action_evidence and _claims_action_completed(call.reply):
+                        return self._give_up(trace, seen,
+                            "could not verify the model's action-completion claim",
+                            error="unverified_action")
+                    self.mem.add("assistant", call.reply)
+                    return {"plan": trace, "reply": call.reply, "thought": call.thought}
+            except LLMError as exc:
+                return self._give_up(trace, seen, str(exc), error="llm")
+        return self._give_up(trace, seen, why)
+
+    def _give_up(self, trace, seen, why: str, *, error=None) -> dict:
+        """Preserve observed data even if the model cannot finish its answer."""
+        reply = (why if error == "llm" else f"I couldn't finish the answer because I {why}.")
+        if seen:
+            summaries = [_result_summary(tool, result) for (tool, _), result in seen.items()]
+            reply += "\n\nResults received:\n" + "\n\n".join(summaries[-3:])
+        self.log(f"brain: {why}; {len(seen)} tool results retained")
         self.mem.add("assistant", reply)
-        return {"plan": trace, "reply": reply, "exhausted": why}
+        return {"plan": trace, "reply": reply, "error" if error else "exhausted": error or why}
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _result_summary(tool, result):
+    """A bounded literal result, not an inferred claim that the task succeeded."""
+    source = ""
+    if isinstance(result, dict):
+        source = str(result.get("url") or result.get("path") or "")
+        if result.get("cancelled"):
+            text = result.get("reason") or "The action was cancelled."
+        elif result.get("error") or result.get("denied") or result.get("ok") is False:
+            text = "Error: " + str(result.get("error") or result.get("reason") or result)
+        elif isinstance(result.get("text"), str):
+            text = result["text"] or "The tool returned no readable text."
+            if result.get("truncated"):
+                text += "\n[Partial result: source was truncated.]"
+        elif "stdout" in result:
+            text = f"Exit code: {result.get('returncode', 'unknown')}\n{result['stdout']}"
+            if result.get("stderr"):
+                text += "\n" + str(result["stderr"])
+        else:
+            text = json.dumps(result, ensure_ascii=False, default=str)
+    else:
+        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+    text = str(text)
+    if len(text) > 2000:
+        text = text[:2000] + "\n[Result excerpt truncated.]"
+    return f"{tool}{' — ' + source if source else ''}:\n{text}"
 
 
 _COMPLETED_VERBS = (
@@ -544,6 +624,10 @@ def _claims_action_completed(text: str) -> bool:
 
 def _successful_action(cap, result) -> bool:
     if cap is None or cap.reversibility == "free" or result is None:
+        return False
+    # Fetching is non-free to prohibit speculative network requests, not
+    # because reading a page proves a requested file/desktop change happened.
+    if cap.name == "os_fetch_url":
         return False
     if not isinstance(result, dict):
         return True

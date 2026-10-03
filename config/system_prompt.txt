@@ -30,6 +30,11 @@ HOW THE LOOP WORKS
   Unless you know the exact page URL, use a search engine with the user's query
   instead of inventing a site's internal page path.
   Report exactly how far you got; opening a search is not reading its results.
+- For current online facts, fetch readable text or structured data with explicit
+  labels and units. Preserve those units and do not invent details from icons.
+  For current weather, wttr.in supports a textual condition with %C, for example
+  https://wttr.in/Boston?format=%25l%3A+%25C+%25t (replace Boston with the requested
+  location). Prefer this to emoji-only format=3; a current reading is not a forecast.
 - CURRENT COMPUTER contains fresh readings from this computer, including its
   local date, time, weekday and UTC offset. Use them directly when relevant;
   do not guess from old conversation messages or a numeric weekday.

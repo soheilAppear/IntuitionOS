@@ -186,9 +186,9 @@ def test_max_iters_is_honoured(project, brain_factory):
     brain, llm = brain_factory(*[tool("list_dir", path=f"sub{i}") for i in range(50)])
     out = brain.step("go", max_iters=3)
 
-    assert out["exhausted"] == "reached the tool-call limit"
+    assert out["exhausted"] == "reached the model-step limit"
     assert len(out["plan"]) == 3
-    assert len(llm.calls) == 3
+    assert len(llm.calls) == 4, "one reserved answer-only turn cannot dispatch another tool"
 
 
 def test_a_model_repeating_one_call_forever_still_terminates(project, brain_factory):
@@ -196,9 +196,9 @@ def test_a_model_repeating_one_call_forever_still_terminates(project, brain_fact
     brain, llm = brain_factory(*[tool("list_dir", path=".")] * 50)
     out = brain.step("go", max_iters=3)
 
-    assert out["exhausted"] == "reached the tool-call limit"
+    assert out["exhausted"] == "repeated the same tool without progress"
     assert out["plan"] == ["list_dir(path=.)"], "dispatched once, not once per iteration"
-    assert len(llm.calls) == 3, "the loop still stops at the iteration cap"
+    assert len(llm.calls) == 4, "the final answer-only turn is bounded too"
 
 
 def test_the_wall_clock_budget_is_honoured(project, brain_factory):
@@ -469,8 +469,18 @@ def test_context_is_rendered_into_the_prompt(project, brain_factory):
 
 def test_render_capabilities_marks_optional_arguments():
     text = render_capabilities(capabilities.manifest())
-    assert "read_file(path: string)" in text
-    assert "list_dir(path?: string)" in text
+    assert "read_file(path: string (minLength 1))" in text
+    assert "list_dir(path?: string (minLength 1))" in text
+
+
+def test_render_capabilities_exposes_argument_bounds_to_the_model():
+    text = render_capabilities([{
+        "name": "fetch", "args": {"properties": {
+            "max_chars": {"type": "integer", "minimum": 200, "maximum": 20000}
+        }}, "reversibility": "reversible", "requires_confirmation": False,
+        "summary": "Read a page.",
+    }])
+    assert "max_chars?: integer (minimum 200, maximum 20000)" in text
 
 
 # ── Parser units ────────────────────────────────────────────────────────────

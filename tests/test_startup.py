@@ -8,6 +8,7 @@ down again.
 """
 
 import asyncio
+import json
 import shutil
 
 import pytest
@@ -276,6 +277,50 @@ def test_terminal_startup_wires_reminders_to_the_shared_memory(app_dir):
         assert mem.get_task(result["id"])["title"] == "verify terminal wiring"
     finally:
         sched.stop()
+
+
+def test_fresh_terminal_registers_and_runs_web_lookup(app_dir, monkeypatch):
+    """No prior HUD session may be needed to make web tools available."""
+    from core import actions as actions_mod, os_sandbox
+    from core.capabilities import capabilities
+    from interface import terminal
+
+    # Earlier HUD tests can hide missing startup registration. Use fresh
+    # registry dictionaries and restore the original ones when this test ends.
+    monkeypatch.setattr(capabilities, "_caps", {
+        name: cap for name, cap in capabilities._caps.items()
+        if not name.startswith("os_")
+    })
+    monkeypatch.setattr(actions_mod.actions, "_actions", {
+        name: fn for name, fn in actions_mod.actions._actions.items()
+        if not name.startswith("os_")
+    })
+    monkeypatch.setattr(actions_mod.actions, "names", {
+        name for name in actions_mod.actions.names if not name.startswith("os_")
+    })
+    fetched = []
+
+    def fetch(url, max_chars=4000):
+        fetched.append(url)
+        return {"ok": True, "url": url, "text": "Boston: Cloudy +18 C"}
+
+    monkeypatch.setattr(os_sandbox, "fetch_url", fetch)
+    _, brain, mem, sched, *_ = terminal.bootstrap()
+    try:
+        assert "os_fetch_url(" in brain.build_system_prompt()
+        assert capabilities.get("os_shutdown_computer").requires_confirmation
+        outputs = iter([
+            json.dumps({"tool": "os_fetch_url", "args": {"url": "https://example.com/weather"}}),
+            json.dumps({"reply": "Boston is cloudy, 18 C."}),
+        ])
+        monkeypatch.setattr(brain.llm, "chat_json", lambda messages, on_token=None: next(outputs))
+        result = brain.step("Tell me the weather in Boston")
+        assert fetched == ["https://example.com/weather"]
+        assert result["reply"] == "Boston is cloudy, 18 C."
+        assert "error" not in result
+    finally:
+        sched.stop()
+        mem.close()
 
 
 def test_hud_startup_can_create_a_reminder_without_a_prior_session(app_dir):

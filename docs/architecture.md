@@ -147,10 +147,19 @@ terminal does not implement that direct phrase-to-OS dispatch path. Use
 the system prompt, recent conversation, bounded retrieved notes, and context.
 The local model proposes a tool or returns a reply. Tool arguments pass the same
 gate as typed actions. A confirmation suspends the loop; `Brain.resume` consumes
-the reply and continues with the observation. Iteration and time limits are
-checked between iterations; a blocking model or tool call can exceed the loop's
-time budget. Malformed tool output receives at most a structured retry before
-the system falls back to a readable reply.
+the reply and continues with the observation. Human confirmation wait pauses
+the work budget; the confirmation token retains its own expiry. Both accepted
+and declined results enter the duplicate-call cache.
+
+`max_iters` counts model/planning steps. Repeated proposals without progress or
+the step limit trigger at most one answer-only model call if time remains;
+this path never dispatches tools. Exhaustion or model failure retains bounded
+literal tool results in the reply. Time is checked between calls and before
+dispatching a model proposal, so a slow model cannot start a new action after
+the deadline. An in-flight model or tool call can still exceed the budget.
+Malformed tool output receives at most a structured retry before the system
+falls back to a readable reply. Capability argument bounds are included in the
+prompt so the model can obey the same schema that the gate validates.
 
 **Anticipation.** Buffer changes wake a debounced worker. It asks the predictor
 for likely next actions and can prewarm a small set of cheap reads. It dispatches

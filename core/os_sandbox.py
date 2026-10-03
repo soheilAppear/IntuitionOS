@@ -14,7 +14,7 @@ import sys
 import time
 from html import unescape
 from typing import Optional
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 import webbrowser
 
 import psutil
@@ -196,6 +196,7 @@ def normalize_url(url: str) -> str:
 
 _FETCH_TIMEOUT_S = 12.0
 _FETCH_MAX_BYTES = 2_000_000
+_FETCH_MAX_REDIRECTS = 5
 _SCRIPT_STYLE = re.compile(r"<(script|style|noscript)\b.*?</\1>", re.I | re.S)
 _TAGS = re.compile(r"<[^>]+>")
 _BLANKS = re.compile(r"\n\s*\n\s*")
@@ -211,9 +212,9 @@ def _refuse_internal_address(host: str) -> Optional[str]:
     hostname spelling.
 
     This is a check at resolution time, not a guarantee: a name that resolves
-    again between this call and the connection can point somewhere else, and
-    a redirect is followed by the HTTP library. It raises the cost of reaching
-    the private network; it does not make it impossible.
+    again between this call and the connection can point somewhere else.
+    fetch_url validates redirects separately. This raises the cost of reaching
+    the private network; it does not eliminate DNS-rebinding races.
     """
     try:
         resolved = socket.getaddrinfo(host, None)
@@ -258,14 +259,9 @@ def fetch_url(url: str, max_chars: int = 4000) -> dict:
     except ValueError as exc:
         return {"error": str(exc)}
 
-    host = urlsplit(destination).hostname or ""
-    refusal = _refuse_internal_address(host)
-    if refusal:
-        return {"error": refusal}
-
     try:
         limit = max(200, min(int(max_chars), 20000))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         limit = 4000
 
     try:
@@ -273,31 +269,60 @@ def fetch_url(url: str, max_chars: int = 4000) -> dict:
     except ImportError:
         return {"error": "requests is not installed — run: pip install requests"}
 
-    try:
-        response = requests.get(
-            destination,
-            timeout=_FETCH_TIMEOUT_S,
-            stream=True,
-            headers={"User-Agent": "IntuitionOS/1.0 (local assistant)"},
-        )
-    except Exception as exc:
-        return {"error": f"Could not fetch {destination}: {exc}"}
-
-    with response:
-        content_type = (response.headers.get("Content-Type") or "").lower()
-        if not any(t in content_type for t in ("text/", "json", "xml", "")):
-            return {"error": f"{destination} returned {content_type or 'unknown'} content, not a readable page."}
+    for redirects in range(_FETCH_MAX_REDIRECTS + 1):
+        host = urlsplit(destination).hostname or ""
+        refusal = _refuse_internal_address(host)
+        if refusal:
+            return {"error": refusal}
         try:
-            raw = response.raw.read(_FETCH_MAX_BYTES, decode_content=True) or b""
+            response = requests.get(
+                destination,
+                timeout=_FETCH_TIMEOUT_S,
+                stream=True,
+                allow_redirects=False,
+                headers={"User-Agent": "IntuitionOS/1.0 (local assistant)"},
+            )
         except Exception as exc:
-            return {"error": f"Could not read {destination}: {exc}"}
-        if not response.ok:
-            return {"error": f"{destination} returned HTTP {response.status_code}.",
-                    "status_code": response.status_code}
+            return {"error": f"Could not fetch {destination}: {exc}"}
 
-    body = raw.decode(response.encoding or "utf-8", errors="replace")
+        with response:
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("Location")
+                if not location:
+                    return {"error": f"{destination} redirected without a destination."}
+                if redirects == _FETCH_MAX_REDIRECTS:
+                    return {"error": f"{destination} returned too many redirects."}
+                try:
+                    destination = normalize_url(urljoin(destination, location))
+                except ValueError as exc:
+                    return {"error": f"Invalid redirect: {exc}"}
+                continue
+            if not response.ok:
+                return {"error": f"{destination} returned HTTP {response.status_code}.",
+                        "status_code": response.status_code}
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            media_type = content_type.split(";", 1)[0].strip()
+            if media_type and not (
+                media_type.startswith("text/")
+                or media_type in {"application/json", "application/xml"}
+                or media_type.endswith(("+json", "+xml"))
+            ):
+                return {"error": f"{destination} returned {media_type} content, not a readable page."}
+            try:
+                raw = response.raw.read(_FETCH_MAX_BYTES + 1, decode_content=True) or b""
+            except Exception as exc:
+                return {"error": f"Could not read {destination}: {exc}"}
+        break
+
+    bytes_truncated = len(raw) > _FETCH_MAX_BYTES
+    raw = raw[:_FETCH_MAX_BYTES]
+    try:
+        body = raw.decode(response.encoding or "utf-8", errors="replace")
+    except (LookupError, TypeError):
+        # A server-supplied charset must not crash the assistant's tool loop.
+        body = raw.decode("utf-8", errors="replace")
     text = html_to_text(body) if "html" in content_type else body.strip()
-    truncated = len(text) > limit
+    truncated = bytes_truncated or len(text) > limit
     return {
         "ok": True,
         "url": response.url,

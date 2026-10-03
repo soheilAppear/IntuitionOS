@@ -107,8 +107,8 @@ Two properties matter more than raw size. The tool loop parses a JSON object out
 of each reply, so a model that emits clean structured output beats a larger one
 that does not — `core/llm.py` asks for `format="json"` with thinking disabled to
 help. And a mixture-of-experts model generally answers faster than a dense model
-of the same parameter count, which matters because `brain.budget_ms` caps a turn
-at 20 seconds.
+of the same parameter count. `brain.budget_ms` defaults to 20 seconds and is
+checked between calls; an in-flight model or tool call can take longer.
 
 ### Keeping the model warm
 
@@ -426,6 +426,16 @@ Within one turn, the model cannot dispatch the same capability with the same
 arguments twice. The repeat is answered with the first result and a note that
 retrying will not change anything.
 
+`brain.max_iters` counts model/planning steps, including invalid or repeated
+proposals, not just executed tools. Repeated requests without progress trigger
+an answer-only recovery; reaching the step limit also reserves one answer-only
+model call if time remains. That recovery cannot run more tools. If the model
+still cannot answer, or the time budget expires, the reply includes the actual
+tool results or errors instead of discarding them behind a limit message.
+Waiting for human confirmation pauses the work budget; confirmed and declined
+requests are remembered so the model cannot execute or ask for them again in
+that turn. Confirmation-token expiry still applies.
+
 That bound exists because the failure it prevents is not hypothetical. Asked "how
 is the weather", the model called `os_open_url`, got back a confirmation that a
 page had been *opened* — which is not the weather, because opening a page cannot
@@ -489,9 +499,16 @@ so it is deliberately fenced:
 - **Bounded.** HTTP(S) only, a request timeout, a response size ceiling, and
   scripts and stylesheets stripped before any text reaches the model.
 
-That check happens at resolution time and redirects are still followed, so it
-raises the cost of reaching your private network rather than making it
-impossible. Every fetch is journalled like any other non-free action.
+Redirects are limited and every destination is checked before fetching it.
+DNS resolution and connection remain separate, so this does not eliminate
+DNS-rebinding races. Binary responses are refused; invalid charset labels fall
+back to UTF-8, and incomplete excerpts are marked as truncated. Every fetch is
+journalled like any other non-free action.
+
+Weather lookups request conditions in words and preserve the returned units.
+For example, wttr.in's [`%C` format](https://github.com/chubin/wttr.in#one-line-output)
+returns a textual condition; an emoji-only response is not a reliable basis for
+the local model to describe sunshine, clouds, or rain.
 
 ### Hand controls
 
@@ -949,8 +966,8 @@ max_tokens: 600
 timezone: America/New_York # reminders are parsed in this zone, stored as UTC
 memory_db_path: data/intuition.db
 
-brain:                     # bounds on one tool-loop turn, whichever hits first
-  max_iters: 5
+brain:                     # planning limits; bounded answer-only recovery may follow
+  max_iters: 8
   budget_ms: 20000
   history_turns: 6
 

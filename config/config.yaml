@@ -35,7 +35,7 @@ gestures:
 # Bounds on one tool-loop turn. Leave room to locate, edit, verify, and reply.
 # The time budget is checked between model calls; an in-flight call can exceed it.
 brain:
-  max_iters: 8          # model iterations, including the final reply
+  max_iters: 8          # planning/model steps; one answer-only recovery may follow
   budget_ms: 20000      # time budget checked between model calls
   history_turns: 6      # conversational turns carried into the prompt
 

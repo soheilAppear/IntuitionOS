@@ -38,6 +38,7 @@ from core.actions import (
     undo_last,
     journal_recent,
     get_journal,
+    register_os_capabilities,
 )
 from core.calibration import CalibrationStore, load_thresholds, reliability
 from core.capabilities import capabilities
@@ -379,6 +380,10 @@ def bootstrap():
 
     thresholds = load_thresholds(cfg.get("thresholds"))
     set_thresholds(thresholds)
+
+    # A terminal session must expose the same gated model tools as the HUD,
+    # including read-only web lookups. Registration does not execute them.
+    register_os_capabilities()
 
     llm = LLMClient(
         cfg.get("backend", "ollama"),
