@@ -299,6 +299,33 @@
       "est_cost_ms": 100
     },
     {
+      "name": "os_close_window",
+      "summary": "Request graceful close of the confirmed active window, preserving application save prompts.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "hwnd": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "pid": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "hwnd",
+          "pid"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "irreversible",
+      "requires_confirmation": true,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 70
+    },
+    {
       "name": "os_cycle_window",
       "summary": "Focus the next or previous visible window.",
       "args": {
@@ -313,6 +340,31 @@
           }
         },
         "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 70
+    },
+    {
+      "name": "os_desktop_view",
+      "summary": "Toggle Windows Task View (overview of windows and virtual desktops), or show/hide the desktop. The keyboard fallback toggles the selected view.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "view": {
+            "type": "string",
+            "enum": [
+              "overview",
+              "desktop"
+            ]
+          }
+        },
+        "required": [
+          "view"
+        ],
         "additionalProperties": false
       },
       "reversibility": "reversible",
@@ -815,6 +867,31 @@
       "est_cost_ms": 90
     },
     {
+      "name": "os_switch_desktop",
+      "summary": "Switch to the adjacent virtual desktop on the left or right.",
+      "args": {
+        "type": "object",
+        "properties": {
+          "direction": {
+            "type": "string",
+            "enum": [
+              "left",
+              "right"
+            ]
+          }
+        },
+        "required": [
+          "direction"
+        ],
+        "additionalProperties": false
+      },
+      "reversibility": "reversible",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 70
+    },
+    {
       "name": "os_system_info",
       "summary": "Report OS, RAM, disk and uptime.",
       "args": {
@@ -889,6 +966,21 @@
       "path_scope": null,
       "undoable": false,
       "est_cost_ms": 500
+    },
+    {
+      "name": "os_window_close_target",
+      "summary": "Capture the active application window handle, process ID and title for close confirmation.",
+      "args": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "reversibility": "free",
+      "requires_confirmation": false,
+      "path_scope": null,
+      "undoable": false,
+      "est_cost_ms": 60
     },
     {
       "name": "os_window_geometry",

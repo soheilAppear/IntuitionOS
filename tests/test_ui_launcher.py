@@ -189,6 +189,7 @@ def test_hud_quit_stops_backend(monkeypatch):
 def test_electron_node_mode_is_removed_only_from_the_hud_child(monkeypatch):
     server, electron = Child(), Child([0])
     prepare_main(monkeypatch, [server, electron])
+    monkeypatch.setattr(launcher, "_project_python", lambda: (r"C:\Selected Python\python.exe", None))
     monkeypatch.setenv("ELECTRON_RUN_AS_NODE", "1")
     monkeypatch.setenv("INTUITION_LAUNCHER_TEST", "preserved")
     children = iter([server, electron])
@@ -203,6 +204,7 @@ def test_electron_node_mode_is_removed_only_from_the_hud_child(monkeypatch):
     assert "env" not in launches[0]  # Python backend inherits the original env.
     assert "ELECTRON_RUN_AS_NODE" not in launches[1]["env"]
     assert launches[1]["env"]["INTUITION_LAUNCHER_TEST"] == "preserved"
+    assert launches[1]["env"]["INTUITION_PYTHON"] == r"C:\Selected Python\python.exe"
     assert launcher.os.environ["ELECTRON_RUN_AS_NODE"] == "1"
 
 

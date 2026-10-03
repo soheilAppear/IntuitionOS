@@ -73,6 +73,10 @@ class ActionRegistry:
         leave it false. It skips another confirmation prompt, never the gate.
         ``confidence`` is action/prediction evidence, not a spelling rank.
         """
+        # A gesture close can be resumed only by consuming its parked token in
+        # confirm(), never by supplying the public confirmed=True shortcut.
+        if actor == "gesture" and name == "os_close_window":
+            confirmed = False
         cap = capabilities.get(name)
         if not cap:
             # A name that is registered but has no manifest entry is a bug, not a
@@ -166,6 +170,17 @@ class ActionRegistry:
         # Permissions can change while the prompt is visible (for example,
         # another client enables Safe Mode). Approval binds the stored args,
         # but never bypasses a fresh gate decision.
+        if p.actor == "gesture" and p.capability == "os_close_window":
+            # The sole irreversible gesture exception is authorized by this
+            # consumed token. Re-gate the bound HWND/PID without changing mode;
+            # the OS implementation checks the foreground target again.
+            decision = gate(cap, p.args, confidence=p.confidence, actor=p.actor,
+                            thresholds=_thresholds)
+            if decision.verdict == "deny":
+                return self.dispatch(p.capability, p.args, actor=p.actor,
+                                     confidence=p.confidence)
+            return self._execute(cap, decision.args, p.actor, p.confidence,
+                                 "confirm_granted")
         return self.dispatch(
             p.capability, p.args, actor=p.actor, confidence=p.confidence, confirmed=True
         )
@@ -1133,6 +1148,18 @@ def register_os_capabilities():
         schema=_schema({"title": {"type": "string"}}),
     )
     _os_cap(
+        "os_window_close_target", "snapshot_active_window", "free", 60, False,
+        "Capture the active application window handle, process ID and title for close confirmation.",
+    )
+    _os_cap(
+        "os_close_window", "close_window", "irreversible", 70, True,
+        "Request graceful close of the confirmed active window, preserving application save prompts.",
+        schema=_schema({
+            "hwnd": {"type": "integer", "minimum": 1},
+            "pid": {"type": "integer", "minimum": 1},
+        }, ["hwnd", "pid"]),
+    )
+    _os_cap(
         "os_move_window", "move_window", "reversible", 90, False,
         "Move or resize a window. Omit the title for the active window; zero "
         "width or height keeps the current size.",
@@ -1174,6 +1201,17 @@ def register_os_capabilities():
         "os_cycle_window", "cycle_window", "reversible", 70, False,
         "Focus the next or previous visible window.",
         schema=_schema({"direction": {"type": "string", "enum": ["next", "previous"]}}),
+    )
+    _os_cap(
+        "os_switch_desktop", "switch_desktop", "reversible", 70, False,
+        "Switch to the adjacent virtual desktop on the left or right.",
+        schema=_schema({"direction": {"type": "string", "enum": ["left", "right"]}}, ["direction"]),
+    )
+    _os_cap(
+        "os_desktop_view", "desktop_view", "reversible", 70, False,
+        "Toggle Windows Task View (overview of windows and virtual desktops), "
+        "or show/hide the desktop. The keyboard fallback toggles the selected view.",
+        schema=_schema({"view": {"type": "string", "enum": ["overview", "desktop"]}}, ["view"]),
     )
     _os_cap(
         "os_media_key", "media_key", "reversible", 60, False,

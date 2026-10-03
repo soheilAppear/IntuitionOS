@@ -20,8 +20,9 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 import yaml
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from core.actions import (
     actions,
@@ -57,6 +58,8 @@ from core.memory import Memory
 from core.retrieval import Retriever
 from core.scheduler import Scheduler
 from core.gestures import GestureRecognizer
+from core.hand_control import HandControls
+from core.hand_feedback import HandClickSound
 from core.voice import VoiceRecognizer
 
 # Shared services are created during lifespan, rather than per HUD connection.
@@ -107,6 +110,7 @@ async def _broadcast_status():
         "type": "status",
         "safe_mode": is_safe_mode(),
         "tasks_count": len(_state["mem"].list_open()),
+        "gestures": _gesture_info(),
     })
 
 
@@ -148,57 +152,153 @@ def _queue_voice_callback(loop, callback):
 
 
 def _queue_gesture(loop, event) -> None:
-    """Hand a gesture from the camera thread to the event loop."""
+    """Act in capture order; queue only feedback, never a delayed window target."""
     if loop.is_closed():
         return
-    future = asyncio.run_coroutine_threadsafe(_run_gesture(event), loop)
-    future.add_done_callback(
-        lambda done: done.exception() if not done.cancelled() else None
-    )
+    message = _handle_gesture(event)
+    if message:
+        _queue_hand_feedback(loop, message)
 
 
 def _queue_gesture_status(loop, status) -> None:
     if loop.is_closed():
         return
     future = asyncio.run_coroutine_threadsafe(
-        _broadcast({"type": "gesture_status", **status}), loop
+        _broadcast_gesture_status(), loop
     )
     future.add_done_callback(
         lambda done: done.exception() if not done.cancelled() else None
     )
 
 
-async def _run_gesture(event) -> None:
-    """Dispatch what a gesture is bound to, as the gesture actor.
+def _queue_hand_feedback(loop, message) -> None:
+    if loop.is_closed():
+        return
+    future = asyncio.run_coroutine_threadsafe(_deliver_hand_feedback(message), loop)
+    future.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
 
-    The actor is the whole safety story: the gate confines it to reversible
-    capabilities, so a misread hand can move a window but cannot close, delete
-    or shut down anything. Nothing here needs to re-check that.
-    """
+
+async def _deliver_hand_feedback(message):
     gestures = _state.get("gestures")
-    if not gestures:
+    if message.get("type") in ("gesture_progress", "gesture_click") and (
+            not gestures or not gestures.is_running()):
         return
-    binding = gestures.action_for(event.name)
-    if not binding:
+    if message.get("type") == "gesture_click" and (
+            getattr(gestures, "input_mode", "desktop") != "mouse"
+            or not 0 <= time.monotonic() - message.get("at", float("-inf")) <= 1.0):
         return
-    capability, args = binding
+    await _broadcast(message)
+
+
+def _queue_mouse_click(loop, event):
+    """A completed manual click gets one local tick and transient HUD feedback."""
+    gestures = _state.get("gestures")
+    if (not gestures or not gestures.is_running()
+            or getattr(gestures, "input_mode", "desktop") != "mouse"
+            or event.get("source") not in ("bend", "pinch")
+            or not isinstance(event.get("id"), str)
+            or not 0 <= time.monotonic() - event.get("at", float("-inf")) <= 1.0):
+        return
+    sound = _state.get("hand_click_sound")
+    if sound:
+        sound.play(event["id"])
+    _queue_hand_feedback(loop, {**event, "type": "gesture_click"})
+
+
+def _gesture_info() -> dict:
+    gestures = _state.get("gestures")
+    if gestures is None:
+        return {"state": "unavailable", "available": False, "running": False,
+                "text": "Gesture recognition is unavailable.", "bindings": {}}
+    info = gestures.status()
+    controls = _state.get("hand_controls")
+    if controls:
+        info.update(controls.status())
+    info["settings"] = dict(_state.get("gesture_settings", {}))
+    if _state.get("hand_click_sound"):
+        info["click_sound"] = _state["hand_click_sound"].status()
+    return info
+
+
+async def _broadcast_gesture_status() -> dict:
+    # Read when the callback is delivered: a queued startup snapshot must not
+    # overwrite a later stop/failure or make another HUD show the camera on.
+    info = _gesture_info()
+    await _broadcast({"type": "gesture_status", **info})
+    return info
+
+
+async def _change_gestures(enabled) -> dict:
+    """Serialize camera changes across HTTP, sockets, and slash commands."""
+    if type(enabled) is not bool:
+        return {"error": "Gestures require enabled to be a boolean.",
+                "status_code": 400}
+
+    # Capture startup and shutdown can block on a camera driver. Serialize them
+    # across HUDs while keeping the event loop free to send lifecycle events.
+    async with _state["gesture_lock"]:
+        gestures = _state.get("gestures")
+        if gestures is None:
+            outcome = {"error": "Gesture recognition is unavailable."}
+        else:
+            try:
+                controls = _state.get("hand_controls")
+                if enabled and controls and controls.status().get("desktop", {}).get("cleanup_pending"):
+                    return {"error": "Navigation input is still releasing. Turn the camera off again to retry.",
+                            "status_code": 503}
+                # Camera control must stay available even if all model/action
+                # workers are busy with long requests from connected HUDs.
+                outcome = await asyncio.to_thread(
+                    gestures.start if enabled else gestures.stop)
+                if not enabled and controls:
+                    cleanup = await asyncio.to_thread(controls.stop)
+                    if isinstance(cleanup, dict) and cleanup.get("error"):
+                        errors = [outcome.get("error"), cleanup["error"]]
+                        outcome = {**outcome, "error": "; ".join(error for error in errors if error)}
+                if not enabled and _state.get("hand_click_sound"):
+                    _state["hand_click_sound"].cancel_pending()
+            except Exception as error:
+                outcome = {"error": f"Could not change gesture recognition: {error}"}
+        return {**outcome, "status_code": 503 if outcome.get("error") else 200}
+
+
+async def _set_gestures(ws: WebSocket, enabled, *, reply=False) -> None:
+    outcome = await _change_gestures(enabled)
+    if outcome.get("error"):
+        await ws.send_json({"type": "error", "source": "gestures",
+                            "text": outcome["error"]})
+    info = await _broadcast_gesture_status()
+    if reply and not outcome.get("error"):
+        await ws.send_json({"type": "reply", "text": info["text"]})
+
+
+def _handle_gesture(event):
+    """Short gated actions run on the capture thread, independently of the model."""
+    gestures = _state.get("gestures")
+    if not gestures or not gestures.is_running():
+        return
+    if getattr(gestures, "input_mode", "desktop") != "desktop":
+        return
+    controls = _state.get("hand_controls")
+    if controls is None:
+        return
     try:
-        result = await asyncio.get_running_loop().run_in_executor(
-            _executor,
-            lambda: actions.dispatch(capability, dict(args), actor="gesture",
-                                     confidence=1.0),
-        )
+        outcome = controls.handle(event, gestures.action_for(event.name))
+        if outcome is None:
+            return
+        capability, args, result = outcome
     except Exception as error:
+        capability, args = "hand_control", {}
         result = {"error": str(error)}
 
-    await _broadcast({
+    return {
         "type": "gesture",
         "gesture": event.name,
         "capability": capability,
         "text": _format_os_result(capability, result, args)
         if isinstance(result, dict) else str(result),
         "ok": bool(isinstance(result, dict) and not result.get("error")),
-    })
+    }
 
 
 @asynccontextmanager
@@ -422,12 +522,39 @@ async def lifespan(app: FastAPI):
     # The camera is opened only once gestures are switched on, so a machine with
     # no webcam — or a user who does not want one watching — costs nothing.
     gesture_cfg = cfg.get("gestures", {}) or {}
+    gesture_settings = {
+        "input_mode": gesture_cfg.get("input_mode", "desktop"),
+        "bend_click": gesture_cfg.get("bend_click", False),
+        "desktop_mode": gesture_cfg.get("desktop_mode", "auto"),
+        "travel_palms": float(gesture_cfg.get("travel_palms", 1.2)),
+        "model_complexity": gesture_cfg.get("model_complexity", 1),
+        "tracker_backend": gesture_cfg.get("tracker_backend", "mediapipe"),
+    }
+    hand_controls = HandControls(
+        active=lambda: gestures.is_running() and (
+            gestures.input_mode == "desktop" or gestures.navigation_active),
+        feedback=lambda message: _queue_hand_feedback(loop, message),
+        mode=gesture_settings["desktop_mode"],
+    )
+    click_sound = HandClickSound(
+        enabled=gesture_cfg.get("click_sound", True),
+        on_status=lambda status: _queue_hand_feedback(loop, {"type": "gesture_sound", **status}),
+    )
     gestures = GestureRecognizer(
         camera_index=int(gesture_cfg.get("camera_index", 0)),
         hold_frames=int(gesture_cfg.get("hold_frames", 4)),
         cooldown_s=float(gesture_cfg.get("cooldown_s", 0.8)),
         on_gesture=lambda event: _queue_gesture(loop, event),
         on_status=lambda status: _queue_gesture_status(loop, status),
+        on_motion=hand_controls.motion,
+        on_progress=lambda progress: _queue_hand_feedback(
+            loop, {**progress, "type": "gesture_progress"}),
+        travel_palms=gesture_settings["travel_palms"],
+        model_complexity=gesture_settings["model_complexity"],
+        tracker_backend=gesture_settings["tracker_backend"],
+        input_mode=gesture_settings["input_mode"],
+        bend_click=gesture_settings["bend_click"],
+        on_click=lambda event: _queue_mouse_click(loop, event),
     )
 
     _state.update(
@@ -438,6 +565,10 @@ async def lifespan(app: FastAPI):
             "sched": sched,
             "ant": ant,
             "gestures": gestures,
+            "hand_controls": hand_controls,
+            "hand_click_sound": click_sound,
+            "gesture_settings": gesture_settings,
+            "gesture_lock": asyncio.Lock(),
             "voice": voice,
             "voice_status": voice_status,
             "voice_owner": None,
@@ -482,9 +613,13 @@ async def lifespan(app: FastAPI):
     if _state.get("voice"):
         _state["voice"].stop_now()
     if _state.get("gestures"):
+        if _state.get("hand_click_sound"):
+            _state["hand_click_sound"].close()
         # Release the camera. A held device stays unavailable to every other
         # application until the process actually exits.
         _state["gestures"].stop()
+    if _state.get("hand_controls"):
+        _state["hand_controls"].stop()
     try:
         if _state["episodes"].enabled:
             _state["predictor"].save()
@@ -518,6 +653,18 @@ def _format_os_result(action: str, result: dict, kwargs: dict) -> str:
     if action == "os_open_app":
         # Show the friendly name the user requested, not the full exe path
         return f"Opened {kwargs.get('name', result.get('launched', '?')).title()}"
+    if action == "os_close_window":
+        return f'Close requested for {result.get("title", "the window")}. The application may ask you to save.'
+    if action == "os_window_state":
+        verb = {"maximize": "Maximized", "minimize": "Minimized", "restore": "Restored"}.get(result.get("state"), "Changed")
+        return f'{verb} {result.get("title", "the active window")}. '
+    if action == "os_cycle_window":
+        return f'Switched to {result.get("title", "the next window")}. '
+    if action == "os_switch_desktop":
+        return f'Desktop switch requested: {result.get("direction", "next")}. '
+    if action == "os_desktop_view":
+        return ("Task View toggle requested." if result.get("view") == "overview"
+                else "Show/hide desktop requested.")
     if action == "os_set_volume":
         return f"Volume set to {result.get('volume', kwargs.get('level', '?'))}%"
     if action == "os_take_screenshot":
@@ -1317,27 +1464,17 @@ async def _handle_command(ws: WebSocket, text: str):
         return
 
     if text.startswith("/gestures"):
-        gestures = _state.get("gestures")
-        if not gestures:
-            await ws.send_json({"type": "error", "text": "gestures unavailable"})
-            return
         parts = text.split()
         argument = parts[1].lower() if len(parts) > 1 else "status"
 
-        if argument == "on":
-            outcome = gestures.start()
-            if outcome.get("error"):
-                await ws.send_json({"type": "error", "text": outcome["error"]})
-                return
-            await ws.send_json({"type": "reply", "text": "Gestures on — watching the camera."})
-        elif argument == "off":
-            gestures.stop()
-            await ws.send_json({"type": "reply", "text": "Gestures off. The camera is released."})
+        if argument in ("on", "off"):
+            await _set_gestures(ws, argument == "on", reply=True)
         elif argument == "status":
-            status = gestures.status()
+            status = await _broadcast_gesture_status()
             lines = [
                 f"available: {status['available']}",
                 f"running:   {status['running']}",
+                f"state:     {status['state']}",
                 status["text"],
                 "",
                 "Bindings:",
@@ -1346,8 +1483,8 @@ async def _handle_command(ws: WebSocket, text: str):
                       for name, capability in sorted(status["bindings"].items())]
             await ws.send_json({"type": "reply", "text": "\n".join(lines)})
         else:
-            await ws.send_json({"type": "error", "text": "usage: /gestures on|off|status"})
-        await _broadcast({"type": "gesture_status", **gestures.status()})
+            await ws.send_json({"type": "error", "source": "gestures",
+                                "text": "usage: /gestures on|off|status"})
         return
 
     if text == "/capabilities":
@@ -1729,6 +1866,7 @@ async def ws_endpoint(ws: WebSocket):
             "tasks_count": len(mem.list_open()),
             "version": "1.0",
             "voice": _voice_info(),
+            "gestures": _gesture_info(),
         }
     )
 
@@ -1779,6 +1917,9 @@ async def ws_endpoint(ws: WebSocket):
                 set_safe_mode(enabled)
                 await _broadcast_status()
 
+            elif t == "set_gestures":
+                await _set_gestures(ws, data.get("enabled"))
+
             elif t == "get_status":
                 await ws.send_json(
                     {
@@ -1786,6 +1927,7 @@ async def ws_endpoint(ws: WebSocket):
                         "safe_mode": is_safe_mode(),
                         "tasks_count": len(mem.list_open()),
                         "voice": _voice_info(),
+                        "gestures": _gesture_info(),
                     }
                 )
 
@@ -1891,6 +2033,112 @@ async def ws_endpoint(ws: WebSocket):
         _windows.pop(ws, None)
         _resolutions.pop(ws, None)
         _connections.pop(ws, None)
+
+
+@app.post("/gestures")
+async def set_gestures(request: Request):
+    """Control the camera even while the HUD socket awaits an AI reply."""
+    try:
+        payload = await request.json()
+    except (ValueError, UnicodeError):
+        payload = None
+    if not isinstance(payload, dict):
+        return JSONResponse(
+            {"gestures": _gesture_info(),
+             "error": "Expected a JSON object with an enabled boolean."},
+            status_code=400,
+        )
+    outcome = await _change_gestures(payload.get("enabled"))
+    result = {"gestures": await _broadcast_gesture_status()}
+    if outcome.get("error"):
+        result["error"] = outcome["error"]
+    return JSONResponse(result, status_code=outcome["status_code"])
+
+
+@app.get("/gestures/preview")
+async def gesture_preview(request: Request):
+    """Read the existing capture thread's snapshot; never open another camera."""
+    # The HUD uses native Node HTTP. Browser scripts cannot omit Origin on a
+    # cross-origin request with this custom header; the Host check also rejects
+    # same-origin DNS rebinding. Apply this before reading or leasing a frame.
+    if ("origin" in request.headers
+            or request.headers.get("x-intuition-preview") != "1"
+            or request.headers.get("host") not in ("127.0.0.1:7432", "localhost:7432")):
+        return JSONResponse({"error": "Camera preview is only available through the local HUD."},
+                            status_code=403, headers={"Cache-Control": "no-store"})
+    gestures = _state.get("gestures")
+    if gestures is None:
+        return JSONResponse({"running": False, "image": None, "tracked": False,
+                             "landmarks": [], "error": "Gesture recognition is unavailable."},
+                            status_code=503, headers={"Cache-Control": "no-store"})
+    return JSONResponse(gestures.preview(), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/gestures/sound")
+async def gesture_sound(request: Request):
+    """Mute click feedback without interrupting the user's pointer session."""
+    try:
+        payload = await request.json()
+    except (ValueError, UnicodeError):
+        payload = None
+    if not isinstance(payload, dict) or set(payload) != {"enabled"} or type(payload["enabled"]) is not bool:
+        return JSONResponse({"error": "Click sound requires an enabled boolean."}, status_code=400)
+    sound = _state.get("hand_click_sound")
+    if sound is None:
+        return JSONResponse({"error": "Restart the backend to enable click sound."}, status_code=503)
+    status = sound.set_enabled(payload["enabled"])
+    await _broadcast({"type": "gesture_sound", **status})
+    return {"click_sound": status}
+
+
+@app.post("/gestures/settings")
+async def gesture_settings(request: Request):
+    """Change hand controls and model only while the camera is off."""
+    try:
+        payload = await request.json()
+    except (ValueError, UnicodeError):
+        payload = None
+    if (not isinstance(payload, dict)
+            or not {"desktop_mode", "travel_palms"} <= set(payload)
+            or not set(payload) <= {"desktop_mode", "travel_palms", "model_complexity", "tracker_backend", "input_mode", "bend_click"}
+            or payload.get("desktop_mode") not in ("auto", "shortcut")
+            or type(payload.get("travel_palms")) not in (int, float)
+            or not 0.8 <= payload["travel_palms"] <= 3.0
+            or ("model_complexity" in payload and (
+                type(payload["model_complexity"]) is not int
+                or payload["model_complexity"] not in (0, 1)))
+            or ("tracker_backend" in payload and (
+                type(payload["tracker_backend"]) is not str
+                or payload["tracker_backend"] not in ("mediapipe", "rtmpose", "wilor")))
+            or ("input_mode" in payload and payload["input_mode"] not in ("desktop", "mouse"))
+            or ("bend_click" in payload and type(payload["bend_click"]) is not bool)):
+        return JSONResponse({"error": "Choose desktop or mouse controls, auto or shortcut desktop movement, hand travel from 0.8 to 3.0 palms, tracker mediapipe, rtmpose or wilor, MediaPipe model 0 (light) or 1 (full), and bend_click true or false."}, status_code=400)
+    async with _state["gesture_lock"]:
+        gestures = _state["gestures"]
+        if gestures.status()["state"] not in ("off", "error", "unavailable"):
+            return JSONResponse({"error": "Stop the camera before changing hand controls."}, status_code=409)
+        if _state["hand_controls"].status().get("desktop", {}).get("cleanup_pending"):
+            return JSONResponse({"error": "Finish releasing navigation input before changing hand controls."}, status_code=409)
+        recognizer_settings = {"travel_palms": float(payload["travel_palms"])}
+        if "model_complexity" in payload:
+            recognizer_settings["model_complexity"] = payload["model_complexity"]
+        if "tracker_backend" in payload:
+            recognizer_settings["tracker_backend"] = payload["tracker_backend"]
+        if "bend_click" in payload:
+            recognizer_settings["bend_click"] = payload["bend_click"]
+        if "input_mode" in payload:
+            recognizer_settings["input_mode"] = payload["input_mode"]
+            cleanup = _state["hand_controls"].stop()
+            if isinstance(cleanup, dict) and cleanup.get("error"):
+                return JSONResponse(cleanup, status_code=409)
+        result = gestures.configure(**recognizer_settings)
+        if result.get("error"):
+            return JSONResponse(result, status_code=409)
+        result = _state["hand_controls"].desktop.configure(mode=payload["desktop_mode"])
+        if result.get("error"):
+            return JSONResponse(result, status_code=409)
+        _state["gesture_settings"] = {**_state.get("gesture_settings", {}), **payload}
+    return {"gestures": await _broadcast_gesture_status()}
 
 
 @app.get("/health")

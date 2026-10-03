@@ -30,8 +30,10 @@
  */
 
 const { ipcRenderer } = require('electron');
+const { readCameraPreview } = require('./camera-preview.cjs');
 
 const WS_URL = 'ws://127.0.0.1:7432/ws';
+const GESTURE_CONTROL_URL = 'http://127.0.0.1:7432/gestures';
 const RECONNECT_MS = 2500;
 const DISCONNECTED_MESSAGE = 'The IntuitionOS backend is disconnected. Start the project launcher and wait for reconnection. Your text is preserved.';
 
@@ -57,6 +59,38 @@ const memoryBtn = document.getElementById('memory-btn');
 const closeBtn = document.getElementById('close-btn');
 const toastRoot = document.getElementById('toast-root');
 const micBtn = document.getElementById('mic-btn');
+const gestureToggle = document.getElementById('gesture-toggle');
+const gestureLabel = document.getElementById('gesture-label');
+const gestureStrip = document.getElementById('gesture-strip');
+const gestureStatusText = document.getElementById('gesture-status');
+const gestureHelp = document.getElementById('gesture-help');
+const gestureFeedbackText = document.getElementById('gesture-feedback');
+const gestureMotion = document.getElementById('gesture-motion');
+const gestureProgressText = document.getElementById('gesture-progress-text');
+const gestureMeter = document.getElementById('gesture-meter');
+const gestureMeterFill = document.getElementById('gesture-meter-fill');
+const gestureClose = document.getElementById('gesture-close');
+const gestureGuide = document.getElementById('gesture-guide');
+const gestureModeText = document.getElementById('gesture-mode');
+const gestureDesktopMode = document.getElementById('gesture-desktop-mode');
+const gestureTravel = document.getElementById('gesture-travel');
+const gestureTravelValue = document.getElementById('gesture-travel-value');
+const gestureSaveSettings = document.getElementById('gesture-save-settings');
+const gestureSettingsStatus = document.getElementById('gesture-settings-status');
+const handModeMouse = document.getElementById('hand-mode-mouse');
+const handModeDesktop = document.getElementById('hand-mode-desktop');
+const handModeStatus = document.getElementById('hand-mode-status');
+const handClickSound = document.getElementById('hand-click-sound');
+const handClickFeedback = document.getElementById('hand-click-feedback');
+const gestureModel = document.getElementById('gesture-model');
+const gestureBendClick = document.getElementById('gesture-bend-click');
+const gesturePreviewToggle = document.getElementById('gesture-preview-toggle');
+const gesturePreview = document.getElementById('gesture-preview');
+const gesturePreviewCanvas = document.getElementById('gesture-preview-canvas');
+const gesturePreviewPose = document.getElementById('gesture-preview-pose');
+const gesturePreviewHint = document.getElementById('gesture-preview-hint');
+const gesturePreviewModel = document.getElementById('gesture-preview-model');
+const gesturePreviewReason = document.getElementById('gesture-preview-reason');
 const recordingBar = document.getElementById('recording-bar');
 const recLabel = document.getElementById('rec-label');
 const confirmBar = document.getElementById('confirm-bar');
@@ -77,6 +111,27 @@ let safeMode = null;
 let requestedSafeMode = null;
 let voiceAvailable = null;
 let voiceStatusText = '';
+let gestureStatus = null;
+let requestedGestures = null;
+let gestureRequestId = 0;
+let gestureFeedback = '';
+let gestureError = '';
+let cameraMayBeRunning = false;
+let gestureSettingsPending = false;
+let handModeError = '';
+let clickSoundStatus = null;
+let requestedClickSound = null;
+let clickSoundRequestId = 0;
+let handClickTimer = null;
+const seenHandClicks = new Set();
+let gestureProgress = null;
+let gestureCloseRequest = null;
+let gesturePreviewActive = false;
+let gesturePreviewEpoch = 0;
+let gesturePreviewTimer = null;
+let gesturePreviewStaleTimer = null;
+let gesturePreviewInFlight = false;
+let gesturePreviewFrame = 0;
 let bufferTimer = null;
 let memoryOpen = false;
 let tasksOpen = false;
@@ -93,6 +148,17 @@ let selectedCorrection = null; // null explicitly keeps the original
 
 // ── IPC ──
 ipcRenderer.on('focus-input', () => cmdInput.focus());
+ipcRenderer.on('desktop-visibility', (_event, status) => {
+  if (!status || typeof status.pinned !== 'boolean') return;
+  document.getElementById('hud-desktop-indicator').textContent = status.pinned
+    ? 'All desktops' : status.state === 'unavailable' ? 'Desktop visibility needs attention' : 'All desktops: preparing…';
+  document.getElementById('desktop-visibility-warning').hidden = status.state !== 'unavailable';
+  document.getElementById('desktop-visibility-text').textContent = status.text || 'Could not keep the HUD on all desktops.';
+  setTimeout(syncHeight, 16);
+});
+document.getElementById('desktop-visibility-retry').addEventListener('click', () => {
+  ipcRenderer.send('desktop-visibility-retry');
+});
 
 closeBtn.addEventListener('click', () => {
   // Hiding preserves the renderer; main.js owns the native window lifecycle.
@@ -138,6 +204,13 @@ function connect() {
     hasConnected = true;
     voiceAvailable = null;
     voiceStatusText = '';
+    gestureStatus = null;
+    handModeError = '';
+    clickSoundStatus = null;
+    requestedClickSound = null;
+    ++clickSoundRequestId;
+    requestedGestures = null;
+    gestureRequestId += 1;
     cmdInput.placeholder = 'Ask or command…';
     updateConnectionUI();
     if (connectionErrorVisible) {
@@ -187,6 +260,7 @@ function updateConnectionUI() {
   micBtn.style.opacity = voiceBlocked ? '0.45' : '';
   micBtn.title = !connected ? 'Voice unavailable: backend disconnected'
     : voiceStatusText || 'Voice input (Alt+V)';
+  updateGestureUI();
 }
 
 /** Change only the mode; a pending action still needs its own explicit answer. */
@@ -204,6 +278,16 @@ function disconnected(socket) {
   if (socket !== ws) return;
   safeMode = null;
   requestedSafeMode = null;
+  cameraMayBeRunning = cameraMayBeRunning || requestedGestures === true;
+  gestureStatus = null;
+  clickSoundStatus = null;
+  requestedClickSound = null;
+  ++clickSoundRequestId;
+  requestedGestures = null;
+  gestureRequestId += 1;
+  gestureFeedback = '';
+  gestureError = '';
+  gestureSettingsPending = false;
   clearGhost();
   hud.classList.remove('anticipating');
   cmdInput.placeholder = 'Backend disconnected — reconnecting…';
@@ -264,6 +348,12 @@ function handleMessage(msg) {
       onReminder(msg);
       break;
     case 'error':
+      if (msg.source === 'gestures') {
+        requestedGestures = null;
+        gestureError = msg.text || 'Could not change hand tracking.';
+        updateGestureUI();
+        break;
+      }
       if (msg.source === 'safe_mode') {
         requestedSafeMode = null;
         updateConnectionUI();
@@ -272,6 +362,27 @@ function handleMessage(msg) {
       break;
     case 'voice_status':
       onVoiceStatus(msg);
+      break;
+    case 'gesture_status':
+      onGestureStatus(msg);
+      break;
+    case 'gesture':
+      onGesture(msg);
+      break;
+    case 'gesture_progress':
+      onGestureProgress(msg);
+      break;
+    case 'gesture_click':
+      onHandClick(msg);
+      break;
+    case 'gesture_sound':
+      onClickSound(msg);
+      break;
+    case 'gesture_close':
+      onGestureClose(msg);
+      break;
+    case 'gesture_desktop':
+      onGestureDesktop(msg);
       break;
     case 'voice_recording':
       onVoiceRecording(msg);
@@ -305,6 +416,7 @@ function handleMessage(msg) {
 
 function onStatus(msg) {
   if (msg.voice) onVoiceStatus(msg.voice);
+  if (msg.gestures) onGestureStatus(msg.gestures);
   if (typeof msg.safe_mode === 'boolean') {
     safeMode = msg.safe_mode;
     if (safeMode === requestedSafeMode) requestedSafeMode = null;
@@ -550,6 +662,493 @@ function clearConfirm() {
 
 confirmAllow.addEventListener('click', () => answerConfirm(true));
 confirmDeny.addEventListener('click',  () => answerConfirm(false));
+
+// ── Camera hand tracking ──
+
+function onGestureStatus(msg) {
+  if (msg.click_sound) onClickSound(msg.click_sound);
+  if (typeof msg.running !== 'boolean') return;
+  const previousState = gestureStatus?.state;
+  gestureStatus = { ...msg, state: msg.state || (msg.running ? 'running' : 'off') };
+  cameraMayBeRunning = msg.running || ['starting', 'stopping'].includes(gestureStatus.state);
+  if ((requestedGestures === true && ['starting', 'running', 'error', 'unavailable'].includes(gestureStatus.state))
+      || (requestedGestures === false && ['off', 'stopping', 'error', 'unavailable'].includes(gestureStatus.state))) {
+    requestedGestures = null;
+  }
+  // A failed start may leave the authoritative state "off". Keep its error
+  // visible until a retry or a successful transition, including other HUDs.
+  if (previousState !== gestureStatus.state
+      && ['starting', 'running', 'stopping'].includes(gestureStatus.state)) gestureError = '';
+  if (!msg.running) {
+    gestureFeedback = '';
+    gestureProgress = null;
+    gestureCloseRequest = null;
+  }
+  const trackerBackend = msg.tracker_backend || msg.settings?.tracker_backend || 'mediapipe';
+  gestureModel.value = ['rtmpose', 'wilor'].includes(trackerBackend)
+    ? trackerBackend : String(msg.model_complexity ?? msg.settings?.model_complexity ?? 1);
+  gestureBendClick.checked = (msg.bend_click ?? msg.settings?.bend_click) === true;
+  if (msg.settings) {
+    gestureDesktopMode.value = msg.settings.desktop_mode || 'auto';
+    gestureTravel.value = String(msg.settings.travel_palms || 1.2);
+    gestureTravelValue.textContent = `${Number(gestureTravel.value).toFixed(1)} palms`;
+  }
+  if (msg.close?.pending && msg.running) gestureCloseRequest = msg.close;
+  if (previousState !== gestureStatus.state) {
+    if (msg.running && previousState !== 'running') ipcRenderer.send('gesture-release-focus');
+  }
+  updateGestureUI();
+}
+
+/** Reflect backend acknowledgement; losing a socket does not turn off its camera. */
+function gestureCleanupPending(status = gestureStatus) {
+  return status?.tracker_cleanup_pending === true
+    || status?.navigation_cleanup_pending === true || status?.desktop?.cleanup_pending === true;
+}
+
+function updateGestureUI() {
+  const connected = isConnected();
+  const known = connected && gestureStatus !== null;
+  const state = known ? gestureStatus.state : 'unknown';
+  const running = known && gestureStatus.running;
+  const cleanupPending = known && gestureCleanupPending();
+  const canStop = running || state === 'starting' || cleanupPending;
+  const pending = requestedGestures !== null;
+  const busy = pending || ['starting', 'stopping'].includes(state);
+  const problem = known && (['error', 'unavailable'].includes(state) || !!gestureError);
+  const blocked = !known || pending || gestureSettingsPending || state === 'stopping'
+    || (gestureStatus?.available === false && !canStop);
+  gestureToggle.setAttribute('aria-checked', String(!!running));
+  gestureToggle.setAttribute('aria-disabled', String(blocked));
+  gestureToggle.setAttribute('aria-busy', String(busy));
+  gestureToggle.classList.toggle('active', !!running);
+  gestureToggle.classList.toggle('busy', busy);
+  gestureToggle.classList.toggle('error', !!problem);
+  gestureLabel.textContent = !known ? 'CAMERA ?'
+    : requestedGestures === false && cleanupPending ? 'CLEANING…'
+    : requestedGestures === false || state === 'stopping' ? 'STOPPING…'
+    : requestedGestures === true || state === 'starting' ? 'STARTING…'
+    : running ? 'CAMERA ON'
+    : cleanupPending ? 'Retry cleanup'
+    : state === 'unavailable' ? 'CAMERA N/A'
+    : problem ? 'CAMERA ERROR' : 'CAMERA OFF';
+  gestureToggle.title = !connected ? 'Camera status unknown: backend disconnected'
+    : !known ? 'Waiting for camera status'
+    : pending ? 'Waiting for camera acknowledgement…'
+    : cleanupPending ? 'Retry releasing hand input and stopping hand tracking.'
+    : canStop ? 'Stop hand tracking and release the camera'
+    : state === 'stopping' ? 'Releasing the camera…'
+    : problem ? `${gestureError || gestureStatus.text} Click to ${gestureStatus.available === false ? 'see details' : 'retry'}.`
+    : 'Start hand tracking with your webcam';
+
+  const unknownActive = !known && cameraMayBeRunning;
+  gestureStrip.classList.toggle('visible', !!(canStop || state === 'stopping' || problem || unknownActive));
+  gestureStrip.classList.toggle('error', !!(problem || unknownActive));
+  gestureStatusText.textContent = unknownActive
+    ? 'Camera state unknown. It may still be running; press Ctrl+C in the launcher to stop it.'
+    : gestureError || (known ? gestureStatus.text || 'Hand tracking is off.' : 'Waiting for camera status.');
+  gestureHelp.hidden = !running || state !== 'running';
+  const mouseMode = (gestureStatus?.input_mode || gestureStatus?.settings?.input_mode) === 'mouse';
+  const bendClick = (gestureStatus?.bend_click ?? gestureStatus?.settings?.bend_click) === true;
+  gestureHelp.textContent = mouseMode
+    ? 'Point briefly to begin, then relax your fingers to move. Pinch and release to click; hold to drag.'
+      + (bendClick ? ' Index bend click is also enabled.' : '')
+      + ' Fully open four fingers and hold still, then move to navigate desktops.'
+    : 'Hold an open palm still until ready, then move. Hold briefly at 100% to finish automatically; a fist or pinch cancels before completion.';
+  document.getElementById('gesture-guide-intro').textContent = mouseMode
+    ? 'Hand Mouse: point briefly to begin, then relax your fingers to move. Fully open four fingers for navigation. Pinch and release to click; hold to drag. Make a full fist or lower your hand to pause.'
+    : 'Desktop gestures: hold an open palm still until ready. Move sideways for desktops, up for Task View, or down to show the desktop.';
+  document.getElementById('mouse-gesture-guide').hidden = !mouseMode;
+  document.getElementById('mouse-bend-guide').hidden = !mouseMode || !bendClick;
+  document.getElementById('mouse-gesture-note').hidden = !mouseMode;
+  document.getElementById('desktop-gesture-guide').hidden = mouseMode;
+  document.getElementById('desktop-gesture-note').hidden = mouseMode;
+  gestureModeText.hidden = false;
+  gestureFeedbackText.textContent = gestureFeedback;
+  if (!running) {
+    gestureProgress = null;
+    gestureCloseRequest = null;
+  }
+  gestureMotion.hidden = !running || !gestureProgress;
+  gestureClose.hidden = !running || !gestureCloseRequest;
+  gestureClose.textContent = gestureCloseRequest
+    ? `Close “${gestureCloseRequest.title}”?\nHold thumbs-up within ${Math.ceil(gestureCloseRequest.remaining_s || 6)} seconds. Fist or lower hand cancels.` : '';
+  const desktop = gestureStatus?.desktop;
+  gestureModeText.textContent = desktop?.preference !== 'shortcut'
+    && (desktop?.mode === 'native' || desktop?.native_available) && !desktop?.fallback
+    ? 'Sideways movement follows your hand through Windows touchpad input. Windows Settings → Touchpad → Four-finger gestures controls desktop switching. Windows handles the animation and final snap. Up/down uses a shortcut after completion for Task View or Show desktop.'
+    : desktop?.preference === 'shortcut' || desktop?.fallback || desktop?.text?.startsWith('Measured shortcut fallback')
+      ? 'Measured steps: reach 100% and hold briefly to request the action once. There is no live desktop movement in this mode; Windows animates after completion. Up/down uses shortcuts for Task View or Show desktop.'
+      : 'Smooth mode checks Windows support for sideways swipes; measured steps take over if unavailable. Up/down always uses a shortcut after completion for Task View or Show desktop.';
+  const settingsBlocked = !known || busy || running || cleanupPending || gestureSettingsPending;
+  gestureDesktopMode.disabled = settingsBlocked;
+  gestureModel.disabled = settingsBlocked;
+  gestureBendClick.disabled = settingsBlocked || !mouseMode;
+  gestureTravel.disabled = settingsBlocked;
+  gestureSaveSettings.disabled = settingsBlocked;
+  handModeMouse.disabled = settingsBlocked;
+  handModeDesktop.disabled = settingsBlocked;
+  handModeMouse.setAttribute('aria-pressed', String(!!known && mouseMode));
+  handModeDesktop.setAttribute('aria-pressed', String(!!known && !mouseMode));
+  handModeStatus.textContent = !known ? 'Waiting for hand controls…'
+    : gestureSettingsPending ? 'Applying hand controls…'
+    : cleanupPending ? 'Finish cleanup to change modes'
+    : handModeError || (busy || running ? 'Camera off to change modes'
+      : mouseMode ? 'Camera on → point to move' : 'Camera on → open palm to swipe');
+  if (!known || !running || !mouseMode) {
+    clearTimeout(handClickTimer);
+    handClickFeedback.hidden = true;
+  }
+  updateClickSoundUI();
+  syncGesturePreview();
+  setTimeout(syncHeight, 16);
+}
+
+gestureToggle.addEventListener('click', async () => {
+  if (!isConnected()) { showDisconnected(); return; }
+  if (!gestureStatus || requestedGestures !== null || gestureSettingsPending || gestureStatus.state === 'stopping') return;
+  const enabled = !(gestureStatus.running || gestureStatus.state === 'starting'
+    || gestureCleanupPending());
+  if (enabled && gestureStatus.available === false) {
+    gestureError = gestureStatus.text || 'Hand tracking is unavailable.';
+    updateGestureUI();
+    return;
+  }
+  requestedGestures = enabled;
+  gestureError = '';
+  gestureFeedback = '';
+  updateGestureUI();
+  const requestId = ++gestureRequestId;
+  try {
+    // A model reply can occupy the command socket. Camera controls must still
+    // reach the backend immediately, without submitting or interrupting a draft.
+    const response = await fetch(GESTURE_CONTROL_URL, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }), signal: AbortSignal.timeout(5000),
+    });
+    const result = await response.json();
+    if (requestId !== gestureRequestId) return;
+    requestedGestures = null;
+    if (result.gestures) onGestureStatus(result.gestures);
+    if (!response.ok || result.error) {
+      gestureError = result.error || 'Could not change hand tracking. Click to retry.';
+    }
+    updateGestureUI();
+  } catch (_) {
+    if (requestId !== gestureRequestId) return;
+    requestedGestures = null;
+    gestureError = 'Camera change could not be confirmed. Click to retry, or press Ctrl+C in the launcher to stop it.';
+    updateGestureUI();
+  }
+});
+
+function onGesture(msg) {
+  if (!isConnected() || !gestureStatus?.running) return;
+  const names = { swipe_left: 'Swipe left', swipe_right: 'Swipe right', swipe_up: 'Swipe up',
+    swipe_down: 'Swipe down', two_finger: 'Two fingers', fist: 'Fist', thumbs_up: 'Thumbs up',
+    restore_window: 'One finger', four_finger: 'Four fingers',
+    close_request: 'Pinch', close_confirm: 'Thumbs up' };
+  const name = names[msg.gesture] || 'Hand gesture';
+  gestureFeedback = `${name} — ${msg.ok ? '' : 'Action failed: '}${msg.text || (msg.ok ? 'Done' : 'Please try again')}`;
+  updateGestureUI();
+}
+
+function onGestureProgress(msg) {
+  if (!isConnected() || !gestureStatus?.running) return;
+  gestureProgress = msg.state === 'idle' ? null : msg;
+  const value = Number.isFinite(msg.progress) ? Math.max(-1, Math.min(1, msg.progress)) : 0;
+  const directional = ['desktop', 'overview'].includes(msg.state)
+    || (['uncertain', 'committing'].includes(msg.state) && ['horizontal', 'vertical'].includes(msg.axis));
+  const navigation = msg.gesture === 'hand_navigation' || directional;
+  const mouseProgress = !navigation && (msg.input_mode === 'mouse' || String(msg.state || '').startsWith('mouse_'));
+  const showMeter = !['completed', 'cancelled', 'error'].includes(msg.state)
+    && (!mouseProgress || ['mouse_arming', 'mouse_pinch', 'mouse_bend'].includes(msg.state));
+  const commitReady = msg.state === 'committing';
+  const meterWasHidden = gestureMeter.hidden;
+  gestureMeter.hidden = !showMeter;
+  gestureMeter.classList.toggle('directional', directional);
+  gestureMeter.classList.toggle('commit-ready', commitReady);
+  gestureMeter.setAttribute('aria-label', navigation ? 'Navigation travel' : 'Hand movement');
+  gestureMeter.setAttribute('aria-valuemin', directional ? '-100' : '0');
+  gestureMeter.setAttribute('aria-valuenow', String(Math.round(value * 100)));
+  gestureMeterFill.style.left = directional ? `${50 + Math.min(0, value) * 50}%` : '0%';
+  gestureMeterFill.style.width = `${Math.abs(value) * (directional ? 50 : 100)}%`;
+  const releaseHint = ['desktop', 'overview'].includes(msg.state)
+    ? ' · Reach 100% and hold briefly' : '';
+  gestureProgressText.textContent = `${msg.text || 'Watching your hand'}${gestureProgress && showMeter ? ` · ${Math.round(Math.abs(value) * 100)}%` : ''}${releaseHint}`;
+  gestureMeter.setAttribute('aria-valuetext', gestureProgressText.textContent);
+  // Native window resize is only needed when the meter appears/disappears.
+  const wasHidden = gestureMotion.hidden;
+  gestureMotion.hidden = !gestureProgress;
+  if (wasHidden !== gestureMotion.hidden || meterWasHidden !== gestureMeter.hidden) setTimeout(syncHeight, 16);
+}
+
+function onHandClick(msg) {
+  if (!isConnected() || !gestureStatus?.running
+      || (gestureStatus.input_mode || gestureStatus.settings?.input_mode) !== 'mouse'
+      || typeof msg.id !== 'string' || !msg.id || msg.id.length > 160
+      || !['bend', 'pinch'].includes(msg.source) || seenHandClicks.has(msg.id)) return;
+  seenHandClicks.add(msg.id);
+  if (seenHandClicks.size > 128) seenHandClicks.delete(seenHandClicks.values().next().value);
+  clearTimeout(handClickTimer);
+  handClickFeedback.textContent = msg.source === 'bend' ? 'Clicked · index bend' : 'Clicked · pinch';
+  handClickFeedback.hidden = false;
+  handClickTimer = setTimeout(() => { handClickFeedback.hidden = true; }, 650);
+}
+
+function updateClickSoundUI() {
+  const known = isConnected() && clickSoundStatus && typeof clickSoundStatus.enabled === 'boolean';
+  handClickSound.disabled = !known || requestedClickSound !== null || clickSoundStatus?.available === false;
+  handClickSound.setAttribute('aria-pressed', String(!!known && clickSoundStatus.enabled));
+  handClickSound.textContent = !known ? 'Sound …' : clickSoundStatus.available === false ? 'Sound N/A'
+    : clickSoundStatus.error ? 'Sound error' : requestedClickSound !== null ? 'Sound …'
+      : clickSoundStatus.enabled ? 'Sound on' : 'Sound off';
+  handClickSound.title = !known ? 'Waiting for click sound status'
+    : clickSoundStatus.error || (clickSoundStatus.enabled ? 'Mute hand click sounds' : 'Enable hand click sounds');
+}
+
+function onClickSound(msg) {
+  if (typeof msg.enabled !== 'boolean') return;
+  clickSoundStatus = { enabled: msg.enabled, available: msg.available !== false, error: msg.error || '' };
+  if (requestedClickSound === msg.enabled) requestedClickSound = null;
+  updateClickSoundUI();
+}
+
+handClickSound.addEventListener('click', async () => {
+  if (!isConnected() || !clickSoundStatus || requestedClickSound !== null || clickSoundStatus.available === false) return;
+  requestedClickSound = !clickSoundStatus.enabled;
+  const requestId = ++clickSoundRequestId;
+  updateClickSoundUI();
+  try {
+    const response = await fetch(`${GESTURE_CONTROL_URL}/sound`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: requestedClickSound }), signal: AbortSignal.timeout(3000),
+    });
+    const result = await response.json();
+    if (requestId !== clickSoundRequestId) return;
+    requestedClickSound = null;
+    if (result.click_sound) onClickSound(result.click_sound);
+    if (!response.ok || result.error) clickSoundStatus.error = result.error || 'Could not change click sound.';
+  } catch (_) {
+    if (requestId !== clickSoundRequestId) return;
+    requestedClickSound = null;
+    clickSoundStatus.error = 'Sound change could not be confirmed. Click to retry.';
+  }
+  updateClickSoundUI();
+});
+
+function onGestureClose(msg) {
+  if (!isConnected() || !gestureStatus?.running) return;
+  gestureCloseRequest = msg.pending ? msg : null;
+  if (msg.pending) ipcRenderer.send('gesture-attention');
+  else if (msg.text) gestureFeedback = msg.text;
+  updateGestureUI();
+}
+
+function onGestureDesktop(msg) {
+  if (!isConnected() || !gestureStatus?.running) return;
+  gestureStatus.desktop = msg;
+  if (msg.error) gestureFeedback = msg.error;
+  else if (msg.completed) gestureFeedback = (msg.axis !== 'vertical' && msg.mode === 'native'
+    ? 'Desktop swipe completed. Windows handles the final transition.'
+    : msg.direction === 'up' ? 'Task View requested.'
+      : msg.direction === 'down' ? 'Show desktop toggle requested.' : 'Desktop switch requested.')
+    + ' Lower your hand or make a fist before another swipe.';
+  updateGestureUI();
+}
+
+gestureGuide.addEventListener('toggle', () => { syncGesturePreview(); setTimeout(syncHeight, 16); });
+gestureTravel.addEventListener('input', () => {
+  gestureTravelValue.textContent = `${Number(gestureTravel.value).toFixed(1)} palms`;
+});
+async function applyGestureSettings(inputMode) {
+  if (!isConnected() || !gestureStatus || gestureStatus.running || gestureSettingsPending
+      || gestureCleanupPending()
+      || ['starting', 'stopping'].includes(gestureStatus.state)) return;
+  gestureSettingsPending = true;
+  handModeError = '';
+  gestureSettingsStatus.textContent = 'Applying…';
+  updateGestureUI();
+  const requestId = ++gestureRequestId;
+  const trackerBackend = ['rtmpose', 'wilor'].includes(gestureModel.value)
+    ? gestureModel.value : 'mediapipe';
+  const modelComplexity = trackerBackend !== 'mediapipe'
+    ? (gestureStatus.model_complexity ?? gestureStatus.settings?.model_complexity ?? 1)
+    : Number(gestureModel.value);
+  try {
+    const response = await fetch(`${GESTURE_CONTROL_URL}/settings`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ desktop_mode: gestureDesktopMode.value,
+        travel_palms: Number(gestureTravel.value), model_complexity: modelComplexity,
+        tracker_backend: trackerBackend, bend_click: gestureBendClick.checked === true,
+        ...(inputMode ? { input_mode: inputMode } : {}) }), signal: AbortSignal.timeout(5000),
+    });
+    const result = await response.json();
+    if (requestId !== gestureRequestId) return;
+    if (result.gestures) onGestureStatus(result.gestures);
+    gestureSettingsStatus.textContent = response.ok && !result.error
+      ? 'Applied for this session. Turn on the camera when ready.'
+      : result.error || 'Could not apply settings.';
+    if (inputMode && (!response.ok || result.error)) handModeError = result.error || 'Could not change mode.';
+  } catch (_) {
+    if (requestId !== gestureRequestId) return;
+    gestureSettingsStatus.textContent = 'Settings could not be confirmed. Reconnect and try again.';
+    if (inputMode) handModeError = 'Mode change not confirmed. Reconnect and try again.';
+  } finally {
+    if (requestId === gestureRequestId) {
+      gestureSettingsPending = false;
+      updateGestureUI();
+    }
+  }
+}
+gestureSaveSettings.addEventListener('click', () => applyGestureSettings());
+handModeMouse.addEventListener('click', () => applyGestureSettings('mouse'));
+handModeDesktop.addEventListener('click', () => applyGestureSettings('desktop'));
+
+// Preview pulls reuse the recognizer's camera. Opening this panel never starts it.
+const HAND_CONNECTIONS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
+  [5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],
+  [13,17],[0,17],[17,18],[18,19],[19,20]];
+const HAND_POSE_NAMES = { open_palm: 'Open palm', fist: 'Fist', point: 'One finger',
+  pinch: 'Pinch', two_finger: 'Two fingers', four_finger: 'Four fingers',
+  thumbs_up: 'Thumbs up', none: 'Pose unclear' };
+const HAND_CANCEL_REASONS = { hand_lost: 'Hand left the camera view',
+  pose_unclear: 'Finger pose stayed unclear too long', tracking_gap: 'Tracking paused too long',
+  tracking_jump: 'Hand position jumped', stopped: 'Camera stopped',
+  input_failed: 'Windows input failed' };
+
+function clearGesturePreview(text) {
+  ++gesturePreviewFrame; // Invalidate an image that is still decoding.
+  clearTimeout(gesturePreviewStaleTimer);
+  const context = gesturePreviewCanvas.getContext('2d');
+  context.clearRect(0, 0, gesturePreviewCanvas.width, gesturePreviewCanvas.height);
+  gesturePreviewPose.textContent = text;
+  gesturePreviewHint.textContent = '';
+  gesturePreviewModel.textContent = '';
+  gesturePreviewReason.textContent = '';
+}
+
+function syncGesturePreview() {
+  gesturePreview.hidden = !gesturePreviewToggle.checked;
+  const active = !!(gesturePreviewToggle.checked && gestureGuide.open
+    && document.hidden !== true && isConnected() && gestureStatus?.running);
+  if (!active) {
+    if (gesturePreviewActive) ++gesturePreviewEpoch;
+    gesturePreviewActive = false;
+    clearTimeout(gesturePreviewTimer);
+    gesturePreviewTimer = null;
+    clearGesturePreview(!isConnected() ? 'Backend disconnected'
+      : !gestureStatus?.running ? 'Turn on the camera to see your hand' : 'Preview hidden');
+    return;
+  }
+  if (!gesturePreviewActive) {
+    gesturePreviewActive = true;
+    ++gesturePreviewEpoch;
+    clearGesturePreview('Waiting for a camera frame…');
+    pollGesturePreview();
+  }
+}
+
+function renderGesturePreview(snapshot, epoch) {
+  if (!gesturePreviewActive || epoch !== gesturePreviewEpoch) return;
+  if (!snapshot.running || !snapshot.image || !Number.isFinite(snapshot.age_ms)
+      || snapshot.age_ms < 0 || snapshot.age_ms > 700) {
+    clearGesturePreview(snapshot.running ? 'Waiting for a fresh camera frame…' : 'Camera is off');
+    return;
+  }
+  if (!/^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(snapshot.image)) {
+    clearGesturePreview('Camera frame could not be displayed');
+    return;
+  }
+  const frame = ++gesturePreviewFrame;
+  const received = Date.now();
+  const picture = new Image();
+  picture.onload = () => {
+    if (!gesturePreviewActive || epoch !== gesturePreviewEpoch || frame !== gesturePreviewFrame) return;
+    if (snapshot.age_ms + Date.now() - received > 700) {
+      clearGesturePreview('Waiting for a fresh camera frame…'); return;
+    }
+    if (Number.isInteger(snapshot.width) && snapshot.width > 0 && snapshot.width <= 480
+        && Number.isInteger(snapshot.height) && snapshot.height > 0 && snapshot.height <= 960) {
+      gesturePreviewCanvas.width = snapshot.width;
+      gesturePreviewCanvas.height = snapshot.height;
+    }
+    const context = gesturePreviewCanvas.getContext('2d');
+    const width = gesturePreviewCanvas.width, height = gesturePreviewCanvas.height;
+    context.clearRect(0, 0, width, height);
+    context.drawImage(picture, 0, 0, width, height);
+    const region = snapshot.control_region;
+    if (snapshot.input_mode === 'mouse' && Array.isArray(region) && region.length === 4
+        && region.every(v => Number.isFinite(v) && v >= 0 && v <= 1)
+        && region[0] < region[2] && region[1] < region[3]) {
+      context.strokeStyle = '#93c5fd'; context.lineWidth = 1; context.setLineDash([5, 5]);
+      context.strokeRect(region[0] * width, region[1] * height,
+        (region[2] - region[0]) * width, (region[3] - region[1]) * height);
+      context.setLineDash([]); context.fillStyle = '#bfdbfe'; context.font = '12px sans-serif';
+      context.fillText('Pointer area', region[0] * width + 6, region[1] * height + 16);
+    }
+    const points = snapshot.landmarks;
+    if (snapshot.tracked && Array.isArray(points) && points.length === 21
+        && points.every(p => Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1]))) {
+      context.strokeStyle = '#5eead4'; context.lineWidth = 2;
+      context.beginPath();
+      for (const [a, b] of HAND_CONNECTIONS) {
+        context.moveTo(points[a][0] * width, points[a][1] * height);
+        context.lineTo(points[b][0] * width, points[b][1] * height);
+      }
+      context.stroke(); context.fillStyle = '#fef3c7';
+      for (const p of points) {
+        context.beginPath(); context.arc(p[0] * width, p[1] * height, 3, 0, Math.PI * 2); context.fill();
+      }
+    }
+    const raw = HAND_POSE_NAMES[snapshot.raw_pose] || 'Pose unclear';
+    const effective = snapshot.effective_pose || snapshot.pose;
+    const mouseStateNames = { mouse_pointer: 'Pointer active', mouse_arming: 'Hold to start',
+      mouse_bend: 'Index bend', mouse_clicked: 'Clicked', mouse_pinch: 'Pinching',
+      mouse_dragging: 'Dragging', mouse_recovering: 'Pointer frozen · recovering',
+      mouse_paused: 'Paused', mouse_error: 'Input needs attention',
+      error: 'Input needs attention' };
+    gesturePreviewPose.textContent = !snapshot.tracked ? 'No hand detected'
+      : snapshot.input_mode === 'mouse' && mouseStateNames[snapshot.state]
+        ? mouseStateNames[snapshot.state]
+        : `${raw}${effective && effective !== snapshot.raw_pose && effective !== 'none' ? ' · holding swipe' : ''}`;
+    const progress = ['desktop', 'overview', 'uncertain', 'committing'].includes(snapshot.state) && Number.isFinite(snapshot.progress)
+      ? ` · ${Math.round(Math.abs(snapshot.progress) * 100)}%` : '';
+    gesturePreviewHint.textContent = (snapshot.hint || 'Face one open palm toward the camera.') + progress;
+    const fps = Number.isFinite(snapshot.fps) ? `${snapshot.fps.toFixed(0)} tracking FPS` : '';
+    gesturePreviewModel.textContent = [snapshot.model_name || snapshot.model, fps].filter(Boolean).join(' · ');
+    const reason = snapshot.last_cancel_reason || snapshot.last_reason;
+    gesturePreviewReason.textContent = reason ? `Last cancellation: ${HAND_CANCEL_REASONS[reason] || reason}` : '';
+    clearTimeout(gesturePreviewStaleTimer);
+    gesturePreviewStaleTimer = setTimeout(() => {
+      if (gesturePreviewActive && epoch === gesturePreviewEpoch && frame === gesturePreviewFrame)
+        clearGesturePreview('Waiting for a fresh camera frame…');
+    }, Math.max(1, 700 - snapshot.age_ms - (Date.now() - received)));
+  };
+  picture.onerror = () => {
+    if (gesturePreviewActive && epoch === gesturePreviewEpoch && frame === gesturePreviewFrame)
+      clearGesturePreview('Camera frame could not be displayed');
+  };
+  picture.src = snapshot.image;
+}
+
+async function pollGesturePreview() {
+  if (!gesturePreviewActive || gesturePreviewInFlight) return;
+  gesturePreviewInFlight = true;
+  const epoch = gesturePreviewEpoch;
+  try {
+    renderGesturePreview(await readCameraPreview(), epoch);
+  } catch (_) {
+    if (gesturePreviewActive && epoch === gesturePreviewEpoch)
+      clearGesturePreview('Preview unavailable. Restart the backend to load the update.');
+  } finally {
+    gesturePreviewInFlight = false;
+    if (gesturePreviewActive) gesturePreviewTimer = setTimeout(pollGesturePreview, 125);
+  }
+}
+
+gesturePreviewToggle.addEventListener('change', () => { syncGesturePreview(); setTimeout(syncHeight, 16); });
+document.addEventListener('visibilitychange', syncGesturePreview);
 
 // ── Voice ──
 

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src ws://127.0.0.1:7432">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src ws://127.0.0.1:7432 http://127.0.0.1:7432">
   <title>IntuitionOS</title>
   <link rel="stylesheet" href="style.css">
 </head>
@@ -23,6 +23,15 @@
         <span class="app-name">IntuitionOS</span>
       </div>
       <div class="status-right">
+        <button class="gesture-toggle" id="gesture-toggle" type="button" role="switch"
+                aria-label="Hand tracking camera" aria-checked="false" aria-disabled="true"
+                aria-describedby="gesture-status" title="Waiting for camera status">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <rect x="3" y="6" width="13" height="12" rx="3"></rect>
+            <path d="m16 10 5-3v10l-5-3"></path>
+          </svg>
+          <span id="gesture-label">CAMERA ?</span>
+        </button>
         <span class="tasks-badge" id="tasks-badge">0</span>
         <button class="icon-btn" id="tasks-btn" title="Tasks (T)">&#x2261;</button>
         <button class="icon-btn" id="memory-btn" title="Memory (M)">&#x25CE;</button>
@@ -66,6 +75,81 @@
       </div>
       <button class="mic-btn" id="mic-btn" title="Voice input (Alt+V)">&#x25C9;</button>
     </div>
+
+    <div class="hand-input-mode" role="group" aria-label="Hand control mode">
+      <button id="hand-mode-mouse" type="button" aria-pressed="false" disabled>Hand Mouse</button>
+      <button id="hand-mode-desktop" type="button" aria-pressed="false" disabled>Desktop gestures</button>
+      <span id="hand-mode-status">Waiting for hand controls…</span>
+      <button id="hand-click-sound" type="button" aria-label="Hand click sound" aria-pressed="false" disabled>Sound …</button>
+    </div>
+    <div class="desktop-visibility-warning" id="desktop-visibility-warning" role="status" hidden>
+      <span id="desktop-visibility-text"></span>
+      <button id="desktop-visibility-retry" type="button">Retry</button>
+    </div>
+    <div class="gesture-strip" id="gesture-strip" role="status" aria-live="polite">
+      <div id="gesture-status"></div>
+      <div id="hand-click-feedback" class="hand-click-feedback" role="status" hidden></div>
+      <div class="gesture-help" id="gesture-help" hidden>Hold four fingers still until ready, then move. Hold briefly at 100% to finish automatically; a fist or pinch cancels before completion.</div>
+      <div class="gesture-motion" id="gesture-motion" hidden>
+        <div id="gesture-progress-text"></div>
+        <div class="gesture-meter" id="gesture-meter" role="progressbar" aria-label="Hand movement" aria-valuemin="-100" aria-valuemax="100" aria-valuenow="0">
+          <span id="gesture-meter-fill"></span><i></i>
+        </div>
+      </div>
+      <div class="gesture-close" id="gesture-close" role="alert" hidden></div>
+      <div class="gesture-feedback" id="gesture-feedback"></div>
+    </div>
+
+    <details class="gesture-guide" id="gesture-guide">
+      <summary>Hand controls <span>Gestures &amp; sensitivity</span><span id="hud-desktop-indicator">All desktops: preparing…</span></summary>
+      <div class="gesture-guide-body">
+        <div class="gesture-guide-intro" id="gesture-guide-intro">Keep one hand facing the camera. Hold four fingers still until ready, then move to navigate.</div>
+        <label class="gesture-preview-toggle"><input id="gesture-preview-toggle" type="checkbox"> Show camera preview</label>
+        <div id="gesture-preview" class="gesture-preview" hidden>
+          <canvas id="gesture-preview-canvas" width="480" height="360" aria-label="Mirrored camera image with tracked hand landmarks"></canvas>
+          <div class="gesture-preview-info">
+            <b id="gesture-preview-pose">Camera is off</b>
+            <div id="gesture-preview-hint">Turn on the camera to see your hand.</div>
+            <div id="gesture-preview-model"></div>
+            <div id="gesture-preview-reason"></div>
+            <small>Live, mirrored, processed locally. No recording. Hand actions stay enabled.</small>
+          </div>
+        </div>
+        <div class="gesture-guide-grid" id="navigation-gesture-guide">
+          <div><b>Hand Mouse: four fingers → navigation</b><span>Raise index, middle, ring and pinky with your thumb relaxed apart from the index. Hold still for 0.3 seconds until ready. Once moving, one finger can relax. In Desktop gestures mode, start with an open palm.</span></div>
+          <div><b>Move ← / → · desktops</b><span>Move sideways at your own pace. Left reveals the next desktop; right reveals the previous. Move back to reduce progress.</span></div>
+          <div><b>Move ↑ · Task View</b><span>Reach 100% and hold briefly to open the Windows overview. In Hand Mouse, lower your hand briefly, point to resume the pointer, then pinch/release on a desktop thumbnail to select it.</span></div>
+          <div><b>Move ↓ · show desktop</b><span>Reach 100% and hold briefly to reveal the desktop. A new downward gesture restores your windows.</span></div>
+        </div>
+        <div class="gesture-guide-note">Small movements do nothing. The first clear movement chooses sideways or vertical navigation. Reach 100% and hold for 0.1 seconds to finish automatically; small tremors are tolerated. Before completion, move back below 90% to stop finishing, or make a fist or pinch to cancel. Brief tracking loss freezes progress for 150 ms; a longer loss cancels. Lower your hand or make a fist for 0.2 seconds before another swipe. Point again for the pointer. Stop the camera to change Hand travel: a smaller value needs less movement.</div>
+        <div class="gesture-guide-grid" id="mouse-gesture-guide" hidden>
+          <div><b>Point briefly → pointer</b><span>Raise your index with the other fingers curled to begin. Then relax your fingers and move your hand. Fully opening all four fingers enters navigation.</span></div>
+          <div id="mouse-bend-guide" hidden><b>Bend index → click (optional)</b><span>Keep your other fingers curled and thumb apart. Curl the end of your index while keeping its knuckle raised. Hold briefly for one click; straighten before the next.</span></div>
+          <div><b>Pinch then release → click</b><span>Touch thumb and index after pointing. The pointer stays steady while you pinch.</span></div>
+          <div><b>Hold pinch → drag</b><span>Keep pinching until “Dragging”, then move your hand. Separate thumb and index to drop.</span></div>
+          <div><b>Full fist or lower hand → pause</b><span>Close your whole hand or lower it out of view to pause and release a drag. Point again to resume.</span></div>
+          <div><b>Click sound &amp; feedback</b><span>A short tick and “Clicked” badge confirm each completed click. The Sound button mutes the tick at any time.</span></div>
+        </div>
+        <div class="gesture-guide-note" id="mouse-gesture-note" hidden>Hand Mouse controls the primary screen and sends real mouse clicks to the app under the pointer. Keep your hand visible in the central camera area. Brief tracking uncertainty freezes the pointer for up to 150 ms; recovery does not click. Change settings with the camera off. Alt+Space shows or hides this panel.</div>
+        <div class="gesture-guide-grid" id="desktop-gesture-guide">
+          <div><b>Open palm → navigation</b><span>In Desktop gestures mode, hold your open palm still until ready. Use the same sideways, up and down movements above.</span></div>
+          <div><b>One finger · hold</b><span>Restore the active window to its normal size.</span></div>
+          <div><b>Two fingers · hold</b><span>Switch to the next window. Lower and repeat.</span></div>
+          <div><b>Pinch · hold 1 second</b><span>Choose the active window to close. Hold thumbs-up to confirm within 6 seconds.</span></div>
+          <div><b>Fist or lower hand</b><span>Cancel a close request. Unsaved work keeps the application's normal save prompt.</span></div>
+        </div>
+        <div class="gesture-guide-note" id="desktop-gesture-note">You need two desktops to switch between them: create another once with Win+Ctrl+D. The HUD stays on all virtual desktops automatically, including while the camera is off. Alt+Space hides or shows it everywhere.</div>
+        <div id="gesture-mode" class="gesture-mode"></div>
+        <div class="gesture-settings">
+          <label>Hand model <select id="gesture-model"><option value="wilor">WiLoR + AnyHand · GPU</option><option value="rtmpose">RTMPose Hand5 · GPU</option><option value="1" selected>MediaPipe Full</option><option value="0">MediaPipe Lite</option></select></label>
+          <label>Desktop movement <select id="gesture-desktop-mode"><option value="auto">Smooth when supported</option><option value="shortcut">Measured steps</option></select></label>
+          <label>Hand travel to 100% <input id="gesture-travel" type="range" min="0.8" max="3" step="0.1" value="1.2"><output id="gesture-travel-value">1.2 palms</output></label>
+          <label class="gesture-checkbox"><input id="gesture-bend-click" type="checkbox"> Index bend click (optional)</label>
+          <button id="gesture-save-settings" type="button">Apply</button>
+        </div>
+        <div id="gesture-settings-status" class="gesture-guide-note">Stop the camera to adjust. Settings last until the backend restarts.</div>
+      </div>
+    </details>
 
     <!-- Full command candidates are shown before submission. -->
     <div class="correction-bar" id="correction-bar" aria-live="polite">

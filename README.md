@@ -388,9 +388,10 @@ with your full privileges. What it has instead is a gate and a record:
   stating how bad it is to be wrong — `free`, `reversible`, or `irreversible` —
   whether a human must approve it, and where in the filesystem it may look.
 - Paths are **resolved and jailed** by path component, not by string prefix.
-- Anything `irreversible` is **never** run without a human saying yes, at any
-  confidence, and cannot execute while Safe Mode is on. The HUD can ask for
-  explicit permission to turn it off and run the displayed action.
+- Anything `irreversible` requires explicit confirmation, at any confidence.
+  Safe Mode also blocks it, except the narrowly scoped hand-control close flow
+  described below: pinch selects one window and a separate thumbs-up approves
+  its normal close request. This exception does not turn Safe Mode off.
 - Every action that changes something is written to an **audit journal**
   (`/journal`), and reversible ones can be taken back with `/undo`.
 
@@ -409,10 +410,12 @@ deliberate its input is:
 | `model` | The LLM proposed it in its tool loop | reversible freely; irreversible parks for your approval |
 | `scheduler` | A reminder fired unattended | nothing irreversible — nobody is present to answer |
 | `anticipator` | A guess about what you might do next | `free` only. It is speculating; it may not change anything |
-| `gesture` | A camera's reading of your hand | reversible only. Irreversible is refused outright, not offered |
+| `gesture` | A camera's reading of your hand | reversible actions; closing one captured window requires a separate confirming gesture. Other irreversible actions are refused |
 
-This is why prewarming is safe to do at all, and why a misread gesture can snap a
-window but can never close one. It also draws a line the plain
+An isolated gesture can move a window; closing requires the deliberate sequence
+in [Hand controls](#hand-controls), with a short-lived approval for that exact
+window. Shutdown, process termination, and deletion remain unavailable to the
+camera. The actor distinction also draws a line the plain
 `requires_confirmation` flag could not: opening a browser window is a *request*
 when you ask for it and a *surprise* when the model decides on its own, so
 `os_open_url` asks the model to confirm and lets you through directly.
@@ -490,7 +493,15 @@ That check happens at resolution time and redirects are still followed, so it
 raises the cost of reaching your private network rather than making it
 impossible. Every fetch is journalled like any other non-free action.
 
-### Hand gestures
+### Hand controls
+
+Choose **Hand Mouse** or **Desktop gestures** in the visible mode bar while the
+camera is off. The supplied configuration selects **Hand Mouse**. Click
+**CAMERA OFF** in the HUD header to start hand tracking. The button shows
+**STARTING…** until recognition is ready, then **CAMERA ON**. Click it again to
+stop tracking and release the webcam. Camera errors appear below the input, and
+when a gesture triggers an action, its result appears there. The button also
+stays in sync when you use these commands:
 
 ```
 /gestures on
@@ -498,41 +509,209 @@ impossible. Every fetch is journalled like any other non-free action.
 /gestures off
 ```
 
-A webcam watches for hand poses and movements and binds them to actions. Off
-until you ask for it: opening a camera is not something to do because a config
-file said so.
+A webcam tracks one hand. Tracking stays off until you enable it. Open **Hand
+controls** below the input for the gesture guide, live movement meter, desktop
+mode, model choice, sensitivity settings, and optional **Show camera preview**.
+The preview shows the mirrored camera image, a 21-point hand skeleton, the
+recognized pose, the current movement hint, and capture FPS. It uses the same
+camera frames as recognition; opening the preview does not start tracking or
+open a second camera. Frames stay local in memory and are not recorded to disk.
+The preview endpoint accepts the local desktop client and rejects requests from
+web pages, even when the rest of the local API permits cross-origin requests.
 
-| Gesture | Does |
+#### Hand Mouse
+
+In **Hand Mouse**, extend your index finger and curl the other three fingers.
+Hold that pose briefly (about 0.2 seconds), then move your hand to move the pointer
+on the primary screen. Tracking uses a stable point near the finger base, so small
+fingertip bends keep control active and do not pull the click target away.
+Once active, relax your fingers to move; fully opening all four fingers enters
+navigation. Brief tracking loss freezes the pointer for up to 150 ms, and recovery
+does not click. A longer interruption requires pointing again.
+Smoothing is stronger during small, shaky movements and responds faster during
+deliberate travel. Use **Show camera preview** to check the current pointer hint.
+The central camera area maps to the screen.
+
+| Hand Mouse gesture | Action |
 |---|---|
-| swipe left / right | snap the active window to that half of the screen |
-| swipe up / down | maximise / minimise it |
-| two fingers | switch to the next window |
-| fist | play / pause |
-| thumbs up | next track |
+| Point with index finger | Move the pointer |
+| Raise index, middle, ring and pinky; hold still for 0.3 seconds, then move | Navigate desktops sideways, Task View upward, or Show desktop downward; hold briefly at 100% to finish automatically |
+| With optional index bend click enabled, keep thumb apart and curl the end of the index while keeping its knuckle raised | Hold about 0.12 seconds for one left click; straighten about 0.15 seconds before another |
+| After pointing, pinch thumb and index briefly, then separate them | Left click at the pointer |
+| Hold that pinch until the hint says **Dragging**, then move your hand | Drag; separate thumb and index to release |
+| Make a full fist, lower your hand, or turn the camera off | Pause movement and release any held mouse button |
 
-**A gesture is the least deliberate input this system takes.** There is no
-keystroke behind it, you may have been waving at someone else in the room, and a
-frame or two of noise can look like a swipe. Three things follow, and they are
-the whole design:
+Point again to resume. A bend or pinch already held when tracking starts cannot
+click; point first. **Index bend click is off by default**; enable its checkbox
+in Hand controls with the camera off and press **Apply**. Holding a bent finger
+does not repeat clicks. Keep your thumb apart for bend clicks: bringing thumb
+and index together selects pinch/drag instead. Opening a fist into a point does
+not click. Releasing an active drag
+can complete a drop in the target application; pausing does not undo a drop.
 
-- **It is its own actor.** Gestures dispatch as `gesture`, which the capability
-  gate confines to reversible actions — the same mechanism that stops the
-  anticipator from doing anything but prewarm. A gesture can move a window; it
-  can *never* reach `os_shutdown_computer` or `os_kill_process`, at any
-  confidence, and no confirmation is even offered for those. A badly wrong
-  classifier cannot close or delete anything.
-- **A pose must persist.** One frame is noise, so a pose has to hold for several
-  consecutive frames before it becomes an event (`hold_frames`).
-- **And it must then stop.** A fired gesture cannot fire again until `cooldown_s`
-  has passed. Without that a hand resting in frame dispatches the same action
-  thirty times a second.
+Each completed bend or pinch click gets a soft local tick and a brief **Clicked**
+badge. Use **Sound on/off** in the mode bar to mute it while keeping tracking on.
+The sound plays independently of the HUD being focused or visible and never
+blocks pointer processing. It plays after successful mouse input, not merely a
+recognized pose; failed clicks and drag releases do not generate a click tick.
+Set `gestures.click_sound` in `config/config.yaml` to keep the preference across
+backend restarts. Sound errors are shown by the sound button and do not stop
+mouse control.
 
-Everything it does is undoable. `/undo` after a snap puts the window back to the
-exact position it had, because the journal captured the geometry first.
+This mode is deliberate, direct mouse input: clicks act on whatever is under the
+pointer, like a physical mouse, including while automation Safe Mode is on.
+The model and planner cannot invoke this input controller. Existing automated
+mouse capabilities retain their capability checks. Four raised fingers pause
+the pointer and activate navigation; your thumb can rest comfortably apart from
+the index. Point again to resume the mouse. Window poses remain inactive in Hand
+Mouse, so pointing does not restore a window and pinching does not request closing
+one. Change modes with the camera off.
 
-Requires a webcam plus `mediapipe` and `opencv-python`, both in
-`requirements.txt`. If either is missing, or no camera is connected, `/gestures
-status` says which — the backend still starts normally.
+#### Desktop gestures
+
+Select **Desktop gestures** before enabling the camera. For desktop switching,
+first create a second Windows desktop if needed:
+press **Win+Ctrl+D once**. In Windows **Settings → Bluetooth & devices →
+Touchpad → Four-finger gestures**, set horizontal swipes to switch desktops.
+If your Windows touchpad settings differ or that setting is unavailable, select
+**Measured steps** in the HUD instead.
+
+Keep your hand facing the webcam and hold an open palm still for about
+**0.3 seconds**, until the meter says ready. Then move it along one axis. After
+activation, three raised fingers are enough to continue. A 0.25-palm dead zone
+filters small movements and the first clear movement locks the axis.
+Movement is measured relative to palm length (wrist to middle knuckle), so
+slow, deliberate swipes count too. The default full movement is **1.2 palm
+lengths**. The meter shows hand travel, not the exact percentage of the Windows
+desktop animation.
+
+| Gesture | Action |
+|---|---|
+| Hold an open palm, then move left | Reveal the next desktop, to the right of the current one |
+| Hold an open palm, then move right | Reveal the previous desktop, to the left of the current one |
+| Hold an open palm, then move up to 100% and hold briefly | Toggle Task View with windows and desktops |
+| Hold an open palm, then move down to 100% and hold briefly | Show/hide the desktop |
+| Hold up one index finger for 0.65 seconds | Restore the active window to its normal size |
+| Hold up index and middle fingers for 0.65 seconds | Switch to the next window |
+| Touch thumb and index finger together; hold the pinch for 1 second | Request closing the active window; the HUD shows its title |
+| After a close request, hold a thumbs-up for 0.65 seconds within 6 seconds | Confirm closing that selected window |
+| Make a fist or lower the hand while a close request is pending | Cancel the close request |
+
+For navigation, **reach 100% and hold for 0.1 seconds to finish automatically**.
+No fist is required. A small tremor down to 90% is tolerated during that short
+hold; reversing below 90% resets it. A fist or pinch before completion cancels.
+Brief tracking loss or uncertainty freezes progress for up to 150 ms; a longer
+loss or distant reappearance cancels. Lower the hand or make a fist for 0.2 seconds
+before another swipe; point again for the pointer. Holding the same pose does not repeat an action, and a
+pinch used to cancel cannot turn into a click or close request. The HUD shows
+completion or cancellation and when to reset your hand.
+In Desktop gestures, that reset is also required before a new window-control
+pose: keeping a point, two fingers, thumbs-up, or pinch held cannot fall through
+from navigation into a window action.
+
+**Smooth when supported** follows sideways hand movement using Windows' native
+four-contact touchpad input, smoothed at 60 Hz with follow-through and release.
+Windows controls the animation, final snap, and the assigned horizontal gesture.
+If native input is unavailable, **Measured steps** sends one desktop shortcut
+after completion, with no continuous desktop movement. A failure during a native
+swipe stops that swipe; it does not also send a desktop shortcut.
+
+Up/down always uses **Win+Tab** for Task View or **Win+D** for Show desktop after
+completion, in either desktop movement setting. These shortcuts toggle their
+views and do not animate progressively with the hand. In Hand Mouse, begin with
+four raised fingers; in Desktop gestures, begin with an open palm.
+To choose from all desktops in **Hand Mouse**, swipe up to open Task View, lower
+your hand briefly, point to resume the pointer, then pinch and release on the
+desktop thumbnail you want.
+Microsoft documents the [synthetic touchpad API](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createsyntheticpointerdevice2)
+and [four-finger gesture settings](https://support.microsoft.com/en-US/Windows/Hardware/input-devices/touch-gestures-for-windows).
+Controlled Windows input checks switched to the expected adjacent desktop and
+restored it, displayed Task View, and showed/restored the desktop. These checks
+do not measure webcam gesture accuracy or perceived smoothness. The
+[navigation validation guide](docs/hand-navigation-validation.md) records the
+evidence, automated coverage, and remaining live hand test sequence.
+
+The HUD automatically stays visible on **every virtual desktop**, including
+when the camera is off. It remains the same window, with the same command draft
+and hand feedback; switching desktops does not reopen or refocus it. **Alt+Space**
+and the hide button hide that window everywhere.
+
+On Windows, a small isolated helper pins the exact HUD window through the shell
+and verifies the result. The HUD rechecks periodically so it can recover after
+Explorer restarts. Electron's [all-workspaces API has no effect on Windows](https://www.electronjs.org/docs/latest/api/browser-window#winsetvisibleonallworkspacesvisible-options),
+and the shell pin interfaces are not a public compatibility guarantee. If a
+Windows update prevents automatic pinning, the HUD displays a **Retry** notice;
+the manual fallback is **Win+Tab → right-click IntuitionOS → Show this window on
+all desktops**. Pinning applies only to this HUD, not other Electron applications.
+
+Turn the camera **off** before changing **Desktop movement**, **Hand travel**,
+or the hand model, then press **Apply**. Hand travel ranges from **0.8 to 3.0
+palms**; smaller values need less motion. The supplied configuration selects
+**WiLoR + AnyHand · GPU**. **MediaPipe Full**, **MediaPipe Lite**, and **RTMPose Hand5** remain available
+for comparison or machines without the optional GPU runtime. The same gesture
+and confirmation rules apply to each tracker.
+HUD adjustments last until the backend restarts. To keep preferences across
+restarts, edit `gestures.desktop_mode`, `gestures.travel_palms`, `gestures.tracker_backend`, and
+`gestures.model_complexity` in `config/config.yaml`, then restart the backend.
+
+#### Optional Windows GPU hand tracker
+
+Install once on a new machine:
+
+```powershell
+.\.venv\Scripts\python.exe setup_wilor.py
+```
+
+This installs the **full 32-layer WiLoR transformer with AnyHand fine-tuned weights**
+from the [AnyHand project](https://github.com/chen-si-cs/AnyHand), together with its
+hand detector. It reconstructs 21 hand joints in 3D and projects them into the
+camera image for the existing controls. An NVIDIA GPU and CUDA-compatible driver
+are required; the installer uses CUDA 13.0 PyTorch, including RTX 5090 support.
+The runtime is isolated in `data/wilor-env`, with about 2.6 GB of model assets in
+`data/wilor-models`, verified against pinned SHA-256 checksums. Initial GPU loading
+takes several seconds; the HUD displays Starting until capture is ready.
+
+The published WiLoR/AnyHand weights and MANO assets carry noncommercial/research
+restrictions. They remain local and are not bundled in the repository. See
+[WiLoR's license declaration](https://github.com/rolpotamias/WiLoR#license) and
+[MANO's terms](https://mano.is.tue.mpg.de/license.html) before redistribution or
+commercial deployment.
+
+Select **WiLoR + AnyHand · GPU** in **Hand controls → Hand model**, press **Apply**,
+then turn on the camera. The preview reports the selected model. Installation
+and opening the guide never activate the camera. Inference stays local, with
+one frame in memory at a time; the worker performs no network requests. Turning
+the camera off releases the GPU worker, and Windows also terminates it if its
+owning backend exits. If cleanup fails, **Retry cleanup** retries release before
+another model can start. Startup errors are visible rather than silently using
+a CPU or a different model; details are in `data/hand-tracker.log`.
+
+WiLoR has stronger published 3D hand-pose and occlusion results than the previous
+lightweight trackers, but results depend on the task. Our small reference-image
+comparison retained more hands than RTMPose; MediaPipe still placed visible 2D
+joints more accurately in that test. See [model evaluation notes](docs/hand-tracking.md).
+The app still uses its existing gesture rules. Missing detections, implausible
+skeletons and results older than 250 ms pause control. Compare the live skeleton
+using your failing movements before judging your own webcam accuracy.
+To use MediaPipe instead, choose it while the camera is off; persistent config
+is `tracker_backend: mediapipe`, with `model_complexity: 1` for Full or `0` for Lite.
+The earlier RTMPose alternative uses `setup_hand_tracking.py` and
+`tracker_backend: rtmpose`; it runs through Windows DirectML in `data/tracking-env`.
+
+In Desktop gestures, window actions still pass through the capability gate. Closing is the sole
+exception to the ban on irreversible camera actions: the pinch captures an exact
+window and process, and a separate thumbs-up consumes its expiring approval.
+The app receives a normal close request and keeps its own unsaved-work prompts;
+IntuitionOS does not force-kill the app, answer save dialogs, or disable Safe
+Mode. Closing cannot be undone with `/undo`. Shutdown, process termination,
+file deletion, and other irreversible capabilities remain denied to gestures.
+Camera loss, cancellation, and stopping tracking release synthetic contacts and
+cancel any pending close approval.
+
+Requires a webcam and the dependencies for the selected tracker. MediaPipe and
+OpenCV are in `requirements.txt`; GPU trackers use their optional setup scripts. Missing
+dependencies or a missing camera are reported by `/gestures status`; the backend
+still starts normally.
 
 ### Hardware
 
@@ -818,10 +997,20 @@ Gestures are configured too, and are off until `/gestures on`:
 
 ```yaml
 gestures:
-  camera_index: 0    # first webcam; raise this if you have several
-  hold_frames: 4     # frames a pose must persist before it counts as deliberate
-  cooldown_s: 0.8    # minimum gap between two firings of the same gesture
+  input_mode: mouse  # mouse = index-finger pointer; desktop = window/desktop gestures
+  bend_click: false  # optional index bend clicks; pinch is the default click gesture
+  click_sound: true  # soft tick for completed bend/pinch clicks; HUD can mute live
+  camera_index: 0     # first webcam; raise this if you have several
+  desktop_mode: auto # auto = smooth when supported; shortcut = measured steps
+  travel_palms: 1.2  # 0.8–3.0; smaller values need less hand travel
+  tracker_backend: wilor # NVIDIA GPU; alternatives: mediapipe, rtmpose
+  model_complexity: 1 # MediaPipe only: 1 = full; 0 = light
 ```
+
+Gesture timing is measured in seconds, as shown in the hand-control guide.
+Legacy `hold_frames` and `cooldown_s` settings do not control these timed poses.
+HUD sensitivity, mode and model changes are session settings; edit the YAML and restart
+to retain your chosen defaults.
 
 Environment variables (`.env` or shell):
 
@@ -981,10 +1170,22 @@ Ollama is already running. Do not start a second one — check with
 `curl http://127.0.0.1:11434/api/version`.
 
 **Gestures do nothing**
-Run `/gestures status`. It reports which part is missing: `mediapipe` or
-`opencv-python` absent, no camera at `camera_index`, or the camera held by
+Run `/gestures status`. It reports missing tracker dependencies,
+no camera at `camera_index`, or a camera held by
 another application. A camera that Windows lists but reports as not present is
 unplugged or powered off.
+
+If tracking is on, open **Hand controls → Show camera preview** to check that
+your whole hand and its skeleton are visible. Check the selected mode: **Hand
+Mouse** needs an extended index finger with the other fingers curled; **Desktop
+gestures** needs an open palm held still until ready. Watch the movement hint.
+For a missing WiLoR runtime, run `setup_wilor.py` or select MediaPipe Full.
+If capture FPS is low, stop the camera, try another model, press **Apply**, and restart tracking. Desktop switching
+needs at least two desktops.
+For native mode, Windows' four-finger swipes must be configured to switch
+desktops. Try **Measured steps** with the camera off, then turn it on, move
+to 100%, and hold briefly. The HUD normally stays visible across desktops
+automatically; use its **Retry** notice if Windows reports a pinning problem.
 
 **Safe Mode blocking exec**
 ```

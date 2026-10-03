@@ -725,7 +725,28 @@ def _user32():
     if sys.platform != "win32":
         return None
     import ctypes
-    return ctypes.WinDLL("user32", use_last_error=True)
+    from ctypes import wintypes
+    api = ctypes.WinDLL("user32", use_last_error=True)
+    # HWND is pointer-sized. ctypes' default c_int return/arguments can truncate
+    # a captured target on 64-bit Windows, so bind the close path explicitly.
+    for name in ("GetForegroundWindow", "GetShellWindow", "GetDesktopWindow"):
+        getattr(api, name).argtypes = []
+        getattr(api, name).restype = wintypes.HWND
+    for name in ("IsWindow", "IsWindowVisible", "IsIconic", "SetForegroundWindow"):
+        getattr(api, name).argtypes = [wintypes.HWND]
+        getattr(api, name).restype = wintypes.BOOL
+    api.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    api.ShowWindow.restype = wintypes.BOOL
+    api.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    api.GetWindowThreadProcessId.restype = wintypes.DWORD
+    api.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    api.GetWindowTextLengthW.restype = ctypes.c_int
+    for name in ("GetWindowTextW", "GetClassNameW"):
+        getattr(api, name).argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        getattr(api, name).restype = ctypes.c_int
+    api.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    api.PostMessageW.restype = wintypes.BOOL
+    return api
 
 
 def _window_title(user32, handle) -> str:
@@ -736,6 +757,124 @@ def _window_title(user32, handle) -> str:
     buffer = ctypes.create_unicode_buffer(length + 1)
     user32.GetWindowTextW(handle, buffer, length + 1)
     return buffer.value
+
+
+def _window_is_cloaked(hwnd: int) -> bool:
+    """DWM hides windows on inactive virtual desktops without clearing WS_VISIBLE."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    from ctypes import wintypes
+    try:
+        query = ctypes.WinDLL("dwmapi", use_last_error=True).DwmGetWindowAttribute
+        query.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+        query.restype = ctypes.c_long
+        cloaked = wintypes.DWORD()
+        result = query(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))  # DWMWA_CLOAKED
+        return result == 0 and bool(cloaked.value)
+    except (OSError, AttributeError):
+        return False  # Older Windows versions do not expose virtual desktop cloaking.
+
+
+def _window_control_error(user32, hwnd: int, title: str) -> Optional[str]:
+    """Keep application actions away from the HUD, Windows shell and other desktops."""
+    import ctypes
+    if not user32.IsWindow(hwnd) or not user32.IsWindowVisible(hwnd):
+        return "The application window is no longer available."
+    if hwnd in (user32.GetShellWindow(), user32.GetDesktopWindow()):
+        return "Choose an application window instead of the Windows desktop."
+    window_class = ctypes.create_unicode_buffer(256)
+    if not user32.GetClassNameW(hwnd, window_class, len(window_class)):
+        return "Could not verify the application window."
+    if window_class.value in {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}:
+        return "Choose an application window instead of the Windows desktop or taskbar."
+    if title.strip().casefold() in {"intuitionos", "intuitionos hud"}:
+        return "Choose an application window first; hand controls do not resize the IntuitionOS HUD."
+    if _window_is_cloaked(hwnd):
+        return "The application window is not on the current visible desktop."
+    return None
+
+
+def _close_target_info(user32, hwnd: int) -> dict:
+    """Read one current application target; desktop, taskbars and HUD are excluded."""
+    import ctypes
+    from ctypes import wintypes
+
+    if not hwnd or not user32.IsWindow(hwnd) or not user32.IsWindowVisible(hwnd):
+        return {"error": "The captured window is no longer available."}
+    if hwnd in (user32.GetShellWindow(), user32.GetDesktopWindow()):
+        return {"error": "The Windows desktop cannot be closed with a gesture."}
+    window_class = ctypes.create_unicode_buffer(256)
+    if not user32.GetClassNameW(hwnd, window_class, len(window_class)):
+        return {"error": "Could not verify the active window."}
+    if window_class.value in {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}:
+        return {"error": "The Windows desktop or taskbar cannot be closed with a gesture."}
+    title = _window_title(user32, hwnd)
+    if title.strip().casefold() in {"intuitionos", "intuitionos hud"}:
+        return {"error": "The IntuitionOS HUD cannot be closed with a gesture."}
+    pid = wintypes.DWORD()
+    if not user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)) or not pid.value:
+        return {"error": "Could not verify the window's process."}
+    if user32.GetForegroundWindow() != hwnd:
+        return {"error": "The active window changed. Make the close gesture again."}
+    return {"ok": True, "hwnd": int(hwnd), "pid": int(pid.value), "title": title}
+
+
+def snapshot_active_window() -> dict:
+    """Capture the exact foreground window for a later explicit close approval."""
+    user32 = _user32()
+    if user32 is None:
+        return {"error": "Window control is only implemented on Windows."}
+    try:
+        return _close_target_info(user32, user32.GetForegroundWindow())
+    except Exception as exc:
+        return {"error": f"Could not capture the active window: {exc}"}
+
+
+def close_window(hwnd: int, pid: int) -> dict:
+    """Request graceful close of the still-active approved HWND/PID, never kill it."""
+    if type(hwnd) is not int or type(pid) is not int or hwnd <= 0 or pid <= 0:
+        return {"error": "A captured window handle and process ID are required."}
+    user32 = _user32()
+    if user32 is None:
+        return {"error": "Window control is only implemented on Windows."}
+    try:
+        target = _close_target_info(user32, hwnd)
+        if target.get("error"):
+            return target
+        if target["pid"] != pid:
+            return {"error": "The captured window's process changed. Make the close gesture again."}
+        # WM_CLOSE gives the application control over unsaved documents and its
+        # save/cancel dialogs. Do not use WM_QUIT, TerminateProcess or Alt+F4.
+        if not user32.PostMessageW(hwnd, 0x0010, 0, 0):
+            return {"error": "The window did not accept the close request."}
+        return {**target, "status": "close_requested",
+                "message": "Close requested. The application may show a save prompt."}
+    except Exception as exc:
+        return {"error": f"Could not request window close: {exc}"}
+
+
+def switch_desktop(direction: str) -> dict:
+    """Switch one virtual desktop using the Windows shortcut implementation."""
+    if direction not in {"left", "right"}:
+        return {"error": "Choose left or right."}
+    try:
+        from .desktop import shortcut_switch
+        return shortcut_switch(direction)
+    except Exception as exc:
+        return {"error": f"Could not switch desktops: {exc}"}
+
+
+def desktop_view(view: str) -> dict:
+    """Request Task View or show/hide the desktop using public Windows chords."""
+    if view not in ("overview", "desktop"):
+        return {"error": "Choose overview or desktop."}
+    try:
+        from .desktop import shortcut_overview
+        result = shortcut_overview("up" if view == "overview" else "down")
+        return {**result, "view": view}
+    except Exception as exc:
+        return {"error": f"Could not change desktop view: {exc}"}
 
 
 def _enumerate_windows(user32) -> list:
@@ -898,6 +1037,9 @@ def set_window_state(title: str = "", state: str = "restore") -> dict:
     if key not in commands:
         return {"error": "Choose minimize, maximize or restore."}
     name = _window_title(user32, handle)
+    error = _window_control_error(user32, handle, name)
+    if error:
+        return {"error": error}
     user32.ShowWindow(handle, commands[key])
     return {"ok": True, "title": name, "state": key}
 
@@ -920,14 +1062,17 @@ def focus_window(title: str = "") -> dict:
 
 
 def cycle_window(direction: str = "next") -> dict:
-    """Focus the next or previous visible window, in a stable order."""
+    """Traverse application HWNDs on this desktop, independent of changing z-order."""
     user32 = _user32()
     if user32 is None:
         return {"error": "Window control is only implemented on Windows."}
-    windows = [(h, t) for h, t in _enumerate_windows(user32)]
-    if len(windows) < 2:
-        return {"error": "There are not two visible windows to switch between."}
+    windows = sorted(
+        ((h, t) for h, t in _enumerate_windows(user32)
+         if not _window_control_error(user32, h, t)), key=lambda window: int(window[0]),
+    )
     current = user32.GetForegroundWindow()
+    if not windows or (len(windows) == 1 and windows[0][0] == current):
+        return {"error": "There is no other application window on this desktop."}
     handles = [h for h, _t in windows]
     step = -1 if (direction or "next").strip().lower() in ("previous", "prev", "back") else 1
     try:
@@ -935,8 +1080,12 @@ def cycle_window(direction: str = "next") -> dict:
     except ValueError:
         index = -1 if step == 1 else 0
     target, name = windows[(index + step) % len(windows)]
-    user32.ShowWindow(target, _SW_RESTORE)
-    user32.SetForegroundWindow(target)
+    # Minimized apps remain in the cycle. Preserve maximized apps' state when
+    # switching to them; restoring unconditionally would shrink them each time.
+    if user32.IsIconic(target):
+        user32.ShowWindow(target, _SW_RESTORE)
+    if not user32.SetForegroundWindow(target) and user32.GetForegroundWindow() != target:
+        return {"error": "Windows did not allow switching to the selected application.", "title": name}
     return {"ok": True, "title": name, "direction": "previous" if step < 0 else "next"}
 
 

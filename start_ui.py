@@ -260,6 +260,7 @@ def main():
         # Remove it only for this child; keep the caller's environment intact.
         electron_env = os.environ.copy()
         electron_env.pop("ELECTRON_RUN_AS_NODE", None)
+        electron_env["INTUITION_PYTHON"] = backend_python
         electron = subprocess.Popen([electron_bin, "."], cwd=UI_DIR, env=electron_env)
         print(
             "HUD launched. Keep this terminal open. Alt+Space toggles; Ctrl+Q quits.",

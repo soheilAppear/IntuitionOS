@@ -2,6 +2,8 @@
 
 from pathlib import Path
 from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 import pytest
 import yaml
@@ -75,6 +77,200 @@ def submit(ws, snapshot, index=0, **overrides):
     }
     message.update(overrides)
     ws.send_json(message)
+
+
+class StubGestures:
+    """Keep protocol tests independent of installed packages and camera access."""
+
+    def __init__(self, failure=None):
+        self.state = "off"
+        self.text = "Gestures are off."
+        self.failure = failure
+        self.starts = 0
+        self.stops = 0
+
+    def status(self):
+        return {"available": True, "running": self.state == "running",
+                "state": self.state, "text": self.text, "bindings": {}}
+
+    def start(self):
+        self.starts += 1
+        if self.failure:
+            self.state, self.text = "error", "The camera is busy."
+            if self.failure == "raise":
+                raise RuntimeError(self.text)
+            return {"error": self.text}
+        self.state, self.text = "starting", "Starting gesture recognition."
+        return {"ok": True}
+
+    def stop(self):
+        self.stops += 1
+        self.state, self.text = "off", "Gestures are off. The camera is released."
+        return {"ok": True}
+
+
+def test_gesture_button_shares_status_and_reconnect_reads_current_state(hud, monkeypatch):
+    client, _ = hud
+    gestures = StubGestures()
+    monkeypatch.setitem(server._state, "gestures", gestures)
+    with client.websocket_connect("/ws") as first:
+        assert receive(first, "status")["gestures"]["state"] == "off"
+        with client.websocket_connect("/ws") as other:
+            assert receive(other, "status")["gestures"]["running"] is False
+            first.send_json({"type": "set_gestures", "enabled": True})
+            for ws in (first, other):
+                status = receive(ws, "gesture_status")
+                assert status["state"] == "starting"
+                assert status["running"] is False
+            assert gestures.starts == 1
+
+            gestures.state, gestures.text = "running", "Watching for gestures."
+            client.portal.call(server._broadcast_gesture_status)
+            for ws in (first, other):
+                assert receive(ws, "gesture_status")["running"] is True
+            other.send_json({"type": "get_status"})
+            assert receive(other, "status")["gestures"]["running"] is True
+
+        with client.websocket_connect("/ws") as reconnected:
+            assert receive(reconnected, "status")["gestures"]["state"] == "running"
+            reconnected.send_json({"type": "set_gestures", "enabled": False})
+            for ws in (first, reconnected):
+                status = receive(ws, "gesture_status")
+                assert status["state"] == "off"
+                assert status["running"] is False
+            assert gestures.stops == 1
+
+
+@pytest.mark.parametrize("enabled", [None, "true", 1, {}, []])
+def test_gesture_button_rejects_non_boolean_requests(hud, monkeypatch, enabled):
+    client, _ = hud
+    gestures = StubGestures()
+    monkeypatch.setitem(server._state, "gestures", gestures)
+    with client.websocket_connect("/ws") as ws:
+        receive(ws, "status")
+        ws.send_json({"type": "set_gestures", "enabled": enabled})
+        error = receive(ws, "error")
+        assert error["source"] == "gestures"
+        assert "boolean" in error["text"]
+        assert receive(ws, "gesture_status")["state"] == "off"
+        assert gestures.starts == gestures.stops == 0
+
+
+@pytest.mark.parametrize("failure", ["return", "raise"])
+def test_gesture_start_failure_is_reported_to_requester_and_other_huds(hud, monkeypatch, failure):
+    client, _ = hud
+    gestures = StubGestures(failure)
+    monkeypatch.setitem(server._state, "gestures", gestures)
+    with client.websocket_connect("/ws") as first, client.websocket_connect("/ws") as other:
+        receive(first, "status")
+        receive(other, "status")
+        first.send_json({"type": "set_gestures", "enabled": True})
+        error = receive(first, "error")
+        assert error["source"] == "gestures"
+        assert "camera is busy" in error["text"]
+        for ws in (first, other):
+            status = receive(ws, "gesture_status")
+            assert status["state"] == "error"
+            assert status["running"] is False
+        first.send_json({"type": "set_gestures", "enabled": False})
+        assert receive(first, "gesture_status")["state"] == "off"
+
+
+def test_gesture_slash_commands_update_other_huds_and_report_starting_truthfully(hud, monkeypatch):
+    client, _ = hud
+    gestures = StubGestures()
+    monkeypatch.setitem(server._state, "gestures", gestures)
+    with client.websocket_connect("/ws") as first, client.websocket_connect("/ws") as other:
+        receive(first, "status")
+        receive(other, "status")
+        first.send_json({"type": "input", "text": "/gestures on"})
+        assert receive(first, "reply")["text"] == "Starting gesture recognition."
+        assert receive(other, "gesture_status")["state"] == "starting"
+        first.send_json({"type": "input", "text": "/gestures status"})
+        assert "state:     starting" in receive(first, "reply")["text"]
+        assert receive(other, "gesture_status")["state"] == "starting"
+        first.send_json({"type": "input", "text": "/gestures off"})
+        assert "camera is released" in receive(first, "reply")["text"]
+        assert receive(other, "gesture_status")["state"] == "off"
+        assert gestures.starts == gestures.stops == 1
+
+
+def test_http_camera_toggle_broadcasts_and_uses_the_shared_lifecycle(hud, monkeypatch):
+    client, _ = hud
+    gestures = StubGestures()
+    monkeypatch.setitem(server._state, "gestures", gestures)
+    with client.websocket_connect("/ws") as ws:
+        receive(ws, "status")
+        response = client.post("/gestures", json={"enabled": True})
+        assert response.status_code == 200
+        assert response.json()["gestures"]["state"] == "starting"
+        assert response.json()["gestures"]["running"] is False
+        assert receive(ws, "gesture_status")["state"] == "starting"
+        response = client.post("/gestures", json={"enabled": False})
+        assert response.status_code == 200
+        assert response.json()["gestures"]["state"] == "off"
+        assert receive(ws, "gesture_status")["state"] == "off"
+        assert gestures.starts == gestures.stops == 1
+
+
+@pytest.mark.parametrize("payload", [{}, {"enabled": "true"}, {"enabled": 1}, [], None])
+def test_http_camera_toggle_requires_a_boolean_json_setting(hud, monkeypatch, payload):
+    client, _ = hud
+    gestures = StubGestures()
+    monkeypatch.setitem(server._state, "gestures", gestures)
+    response = client.post("/gestures", json=payload)
+    assert response.status_code == 400
+    assert "boolean" in response.json()["error"]
+    assert response.json()["gestures"]["state"] == "off"
+    assert gestures.starts == gestures.stops == 0
+
+
+def test_http_camera_toggle_reports_invalid_json_and_start_failure(hud, monkeypatch):
+    client, _ = hud
+    gestures = StubGestures("return")
+    monkeypatch.setitem(server._state, "gestures", gestures)
+    malformed = client.post("/gestures", content="{broken", headers={"Content-Type": "application/json"})
+    assert malformed.status_code == 400
+    assert malformed.json()["gestures"]["state"] == "off"
+    assert gestures.starts == 0
+    failed = client.post("/gestures", json={"enabled": True})
+    assert failed.status_code == 503
+    assert failed.json()["gestures"]["state"] == "error"
+    assert failed.json()["error"] == "The camera is busy."
+
+
+def test_http_camera_stop_completes_while_socket_waits_for_ai_and_model_pool_is_busy(hud, monkeypatch):
+    client, _ = hud
+    gestures = StubGestures()
+    gestures.state, gestures.text = "running", "Watching for gestures."
+    monkeypatch.setitem(server._state, "gestures", gestures)
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def slow_step(*_args, **_kwargs):
+        entered.set()
+        release.wait(5)
+        finished.set()
+        return {"reply": "The lighthouse lit up the sea."}
+
+    monkeypatch.setattr(server._state["brain"], "step", slow_step)
+    with ThreadPoolExecutor(max_workers=1) as model_workers:
+        monkeypatch.setattr(server, "_executor", model_workers)
+        with client.websocket_connect("/ws") as ws:
+            assert receive(ws, "status")["gestures"]["running"] is True
+            try:
+                ws.send_json({"type": "input", "text": "Tell me a short story about a lighthouse."})
+                receive(ws, "thinking")
+                assert entered.wait(2)
+                response = client.post("/gestures", json={"enabled": False})
+                assert response.status_code == 200
+                assert response.json()["gestures"]["state"] == "off"
+                assert response.json()["gestures"]["running"] is False
+                assert gestures.stops == 1
+                assert not finished.is_set(), "Camera stop waited for the AI request."
+                assert receive(ws, "gesture_status")["state"] == "off"
+            finally:
+                release.set()
+            assert receive(ws, "reply")["text"] == "The lighthouse lit up the sea."
 
 
 def test_hud_displays_raw_preserving_correction_and_safe_mode_asks_permission(hud):

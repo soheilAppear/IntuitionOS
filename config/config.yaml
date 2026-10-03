@@ -16,12 +16,21 @@ voice:
 
 # Hand gestures through the webcam. Off until you ask for them with /gestures on,
 # because opening a camera is not something to do because a config file said so.
-# A gesture dispatches as the `gesture` actor, which the capability gate confines
-# to reversible actions: it can move a window, never close one.
+# In Desktop gestures, window close is a narrow, gated exception: pinch selects a window and a
+# separate thumbs-up confirms its normal close request. Other irreversible
+# actions stay denied. Camera loss/off cancels pending approvals and input.
+# Hand Mouse is direct pointer/click input, enabled with the camera button.
 gestures:
-  camera_index: 0    # first webcam; raise this if you have several
-  hold_frames: 4     # frames a pose must persist before it counts as deliberate
-  cooldown_s: 0.8    # minimum gap between two firings of the same gesture
+  input_mode: mouse  # mouse = point to activate, then relax; desktop = window/desktop gestures
+  bend_click: false  # pinch to click; optionally also click by bending the index fingertip
+  click_sound: true  # soft tick after a completed hand click; HUD can mute it live
+  camera_index: 0     # first webcam; raise this if you have several
+  desktop_mode: auto # smooth horizontal swipes when supported; Task View uses a Windows shortcut
+  travel_palms: 1.2  # 0.8–3.0; deliberate travel completes automatically, with no fist required
+  tracker_backend: wilor # Full WiLoR + AnyHand on NVIDIA GPU; install with setup_wilor.py on a new machine
+  model_complexity: 1 # MediaPipe only: 1 = full; 0 = lighter model for slower CPUs
+  # Poses use timed holds; legacy hold_frames/cooldown_s do not control them.
+  # HUD mode/travel changes last for this session. Edit here and restart to persist.
 
 # Bounds on one tool-loop turn. Leave room to locate, edit, verify, and reply.
 # The time budget is checked between model calls; an in-flight call can exceed it.

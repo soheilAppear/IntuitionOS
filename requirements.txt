@@ -21,7 +21,7 @@ nvidia-ml-py==13.610.43
 # Voice recognition — optional, guarded at import
 faster-whisper==1.2.1
 sounddevice==0.5.5
-numpy==2.2.6
+numpy==1.26.4
 
 # OS sandbox — optional, guarded at import
 PyAutoGUI==0.9.54
@@ -29,5 +29,11 @@ PyAutoGUI==0.9.54
 # Hand gestures through a webcam — optional, guarded at probe() rather than at
 # import, so a machine with neither camera nor these packages still starts and
 # explains why gestures are unavailable.
-mediapipe==1.0.1
-opencv-python==5.0.0.93
+# This Hands API requires NumPy <2; contrib must be the only cv2 distribution.
+mediapipe==0.10.21
+opencv-contrib-python==4.11.0.86
+# Optional RTMPose Hand5 on Windows GPU: run setup_hand_tracking.py.
+# Its isolated data/tracking-env keeps DirectML separate from the CPU ONNX
+# runtime used by voice; do not install overlapping ONNX packages in this venv.
+# Full WiLoR + AnyHand on NVIDIA GPU: run setup_wilor.py. CUDA dependencies
+# are isolated in data/wilor-env; research model assets live in data/wilor-models.

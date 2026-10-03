@@ -82,6 +82,75 @@ def test_startup_registers_the_os_capabilities_with_a_declared_cost(app_dir):
     assert capabilities.get("os_shutdown_computer").requires_confirmation
 
 
+@pytest.mark.parametrize("enabled", [None, False, True])
+def test_hand_bend_click_config_reaches_idle_recognizer_at_startup(app_dir, enabled):
+    from interface import server
+
+    path = app_dir / "config" / "config.yaml"
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if enabled is None:
+        cfg["gestures"].pop("bend_click", None)
+    else:
+        cfg["gestures"]["bend_click"] = enabled
+    path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+    async def boot():
+        async with server.lifespan(server.app):
+            recognizer = server._state["gestures"]
+            assert recognizer.bend_click is (enabled is True)
+            assert server._state["gesture_settings"]["bend_click"] is (enabled is True)
+            assert recognizer._mouse is None
+            assert recognizer.is_running() is False
+
+    asyncio.run(boot())
+
+
+def test_mouse_mode_authorizes_navigation_only_during_a_live_clutch(app_dir, monkeypatch):
+    from interface import server
+
+    async def boot():
+        async with server.lifespan(server.app):
+            recognizer = server._state["gestures"]
+            controls = server._state["hand_controls"]
+            recognizer.input_mode = "mouse"
+            monkeypatch.setattr(recognizer, "is_running", lambda: True)
+            assert not controls.active()
+            assert "error" in controls._authorize_desktop()
+            recognizer._navigation_active = True
+            assert controls.active()
+            assert controls._authorize_desktop()["ok"]
+            assert controls._authorize_overview()["ok"]
+            monkeypatch.setattr(recognizer, "is_running", lambda: False)
+            assert not controls.active()
+            assert "error" in controls._authorize_overview()
+            recognizer._navigation_active = False
+
+    asyncio.run(boot())
+
+
+@pytest.mark.parametrize("travel", [None, 2.4])
+def test_navigation_travel_default_and_user_setting_reach_both_modes(app_dir, travel):
+    from interface import server
+
+    path = app_dir / "config" / "config.yaml"
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if travel is None:
+        cfg["gestures"].pop("travel_palms", None)
+    else:
+        cfg["gestures"]["travel_palms"] = travel
+    path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    expected = 1.2 if travel is None else travel
+
+    async def boot():
+        async with server.lifespan(server.app):
+            recognizer = server._state["gestures"]
+            assert recognizer.measured.travel_palms == expected
+            assert recognizer._navigation.travel_palms == expected
+            assert server._state["gesture_settings"]["travel_palms"] == expected
+
+    asyncio.run(boot())
+
+
 def test_the_predictor_is_wired_to_the_rules_and_the_calibrator(app_dir):
     from interface import server
 
