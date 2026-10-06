@@ -157,3 +157,15 @@ def test_unavailable_service_is_reported_without_acquisition(api):
     server._state.pop("multimodal")
     assert client.get("/multimodal/status", headers=HEADERS).json()["state"] == "unavailable"
     assert client.post("/multimodal/start", headers=HEADERS, json={}).status_code == 503
+
+
+def test_connected_headset_alone_does_not_block_normal_camera(api):
+    from types import SimpleNamespace
+    preview, _ = api
+    started = []
+    server._state["brainbit"] = SimpleNamespace(status=lambda: {"state": "connected"})
+    server._state["gestures"] = SimpleNamespace(start=lambda: started.append(True) or {"ok": True})
+    result = asyncio.run(server._change_gestures(True))
+    assert result["status_code"] == 200
+    assert started == [True]
+    assert preview.calls == []

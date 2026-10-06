@@ -80,12 +80,15 @@ def setup():
     return service, clock, camera, eeg, actions
 
 
-def tick(setup, x=0.4, *, tracked=True, camera_age=0, eeg_age=0, gap=0, increment=True):
+def tick(setup, x=0.4, *, tracked=True, camera_age=0, eeg_age=0, gap=0, increment=True,
+         camera_state=None, camera_hint=None):
     service, clock, camera, eeg, _ = setup
     previous = clock.now
     clock.now += 0.125
     sequence = camera.frame.get("sequence", 0) + int(increment)
     camera.frame = {"running": camera.running, "tracked": tracked,
+                    "state": camera_state or ("running" if camera.running else "starting"),
+                    "hint": camera_hint,
                     "landmarks": [[x, 0.5, 0] for _ in range(21)] if tracked else [],
                     "sequence": sequence, "age_ms": camera_age,
                     "image": "data:image/jpeg;base64,ZmFrZQ==", "width": 480, "height": 360, "fps": 8}
@@ -329,6 +332,166 @@ def test_stale_device_stops_both_owned_resources_after_startup_grace(setup):
     assert result["state"] == "error"
     assert camera.stops == 1 and eeg.stops == 1
     assert not result["armed"]
+
+
+def test_slow_camera_startup_waits_for_first_fresh_frame_with_controls_disarmed(setup):
+    service, clock, camera, eeg, actions = setup
+    camera.running = False
+    for elapsed in (6, 30, 90, service.CAMERA_STARTUP_SECONDS - 1):
+        clock.now = service._camera_started_at + elapsed
+        tick(setup, tracked=False)
+        result = service.status()
+        assert result["state"] == "starting" and not result["armed"]
+        assert "first fresh frame" in result["reason"]
+        assert service.arm(True)["error"]
+        assert camera.stops == eeg.stops == 0
+    camera.running = True
+    tick(setup)
+    assert service.status()["state"] == "running"
+    assert not service.status()["armed"] and actions == []
+
+
+def test_camera_startup_deadline_expires_and_releases_both_devices(setup):
+    service, clock, camera, eeg, actions = setup
+    camera.running = False
+    clock.now = service._camera_started_at + service.CAMERA_STARTUP_SECONDS
+    tick(setup, tracked=False)
+    result = service.status()
+    assert result["state"] == "error" and "Camera startup timed out" in result["error"]
+    assert camera.stops == eeg.stops == 1
+    assert not result["armed"] and actions == []
+
+
+def test_stop_cancels_long_camera_startup_without_waiting_for_deadline(setup):
+    service, clock, camera, eeg, actions = setup
+    camera.running = False
+    clock.now += 6
+    tick(setup, tracked=False)
+    assert service.stop()["state"] == "stopped"
+    assert camera.stops == eeg.stops == 1
+    clock.now += service.CAMERA_STARTUP_SECONDS
+    service._tick()
+    assert service.status()["state"] == "stopped"
+    assert camera.stops == eeg.stops == 1 and actions == []
+
+
+def test_slow_eeg_start_does_not_consume_camera_startup_allowance():
+    clock, camera, eeg = Clock(), Camera(), EEG()
+    original_start = eeg.start_acquisition
+
+    def slow_eeg_start(mode):
+        clock.now += 20
+        return original_start(mode)
+
+    eeg.start_acquisition = slow_eeg_start
+    service = MultimodalPreview(camera, eeg, clock=clock)
+    service._launch_worker = lambda: None
+    assert service.start()["ok"]
+    camera.running = False
+    inputs = service, clock, camera, eeg, []
+    clock.now += 1
+    service._tick()  # No first EEG batch yet; SDK acknowledgement was one second ago.
+    assert service.status()["state"] == "starting"
+    assert camera.stops == eeg.stops == 0
+    clock.now += 3
+    tick(inputs, tracked=False)
+    assert service.status()["state"] == "starting"
+    clock.now = 120 + service.CAMERA_STARTUP_SECONDS - 0.25
+    tick(inputs, tracked=False)
+    assert service.status()["state"] == "starting"
+    tick(inputs, tracked=False)
+    assert "Camera startup timed out" in service.status()["error"]
+
+
+@pytest.mark.parametrize("state", ["error", "unavailable", "off"])
+def test_terminal_camera_reason_is_reported_immediately_during_startup(setup, state):
+    service, _, camera, eeg, actions = setup
+    camera.running = False
+    tick(setup, tracked=False, camera_state=state, camera_hint="WiLoR model could not load")
+    result = service.status()
+    assert result["state"] == "error"
+    assert result["error"] == "Camera stopped: WiLoR model could not load"
+    assert camera.stops == eeg.stops == 1 and actions == []
+
+
+def test_slow_first_inference_does_not_end_camera_startup_allowance(setup):
+    service, clock, camera, eeg, _ = setup
+    clock.now += 6
+    tick(setup, tracked=False, camera_age=1000)
+    assert service.status()["state"] == "starting"
+    assert service.arm(True)["error"]
+    assert camera.stops == eeg.stops == 0
+    tick(setup)
+    assert service.status()["can_arm"] and not service.status()["armed"]
+
+
+def test_brief_camera_pause_disarms_without_teardown_and_never_auto_rearms(setup):
+    service, clock, camera, eeg, actions = setup
+    clock.now += 6
+    tick(setup)
+    assert service.arm(True)["armed"]
+    generation, epoch = service._generation, service._arm_epoch
+    tick(setup, camera_age=600)
+    assert service.status()["state"] == "running"
+    assert not service.status()["can_arm"]
+    assert service.arm(True)["error"]
+    service._dispatch_direction("right", generation, epoch)
+    assert camera.stops == eeg.stops == 0 and actions == []
+    tick(setup)
+    assert service.status()["can_arm"] and not service.status()["armed"]
+
+
+def test_sustained_camera_loss_after_first_frame_does_not_get_startup_allowance(setup):
+    service, clock, camera, eeg, actions = setup
+    tick(setup, tracked=False)
+    clock.now += service.CAMERA_LOSS_SECONDS
+    tick(setup, tracked=False, camera_age=2500)
+    result = service.status()
+    assert result["state"] == "error" and "Camera frames stayed stale" in result["error"]
+    assert camera.stops == eeg.stops == 1 and actions == []
+
+
+def test_eeg_batch_jitter_disarms_but_live_receipt_does_not_stop_preview(setup):
+    service, clock, camera, eeg, actions = setup
+    clock.now += 6
+    tick(setup)
+    assert service.arm(True)["armed"]
+    # A cached poll between SDK batches sees identical counters but fresh data.
+    clock.now += 0.125
+    camera.frame["sequence"] += 1
+    eeg.acq["stats"]["age_seconds"] = 0.125
+    service._tick()
+    assert service.status()["state"] == "running"
+    assert not service.status()["can_arm"] and service.arm(True)["error"]
+    assert camera.stops == eeg.stops == 0 and actions == []
+    tick(setup)
+    assert service.status()["can_arm"] and not service.status()["armed"]
+    clock.now += service.EEG_LOSS_SECONDS
+    tick(setup, eeg_age=3)
+    assert "EEG stopped or samples stayed stale" in service.status()["error"]
+    assert camera.stops == eeg.stops == 1
+
+
+def test_camera_warmup_does_not_extend_eeg_startup_grace(setup):
+    service, clock, camera, eeg, _ = setup
+    camera.running = False
+    clock.now += service.STARTUP_GRACE_SECONDS
+    tick(setup, tracked=False, eeg_age=2)
+    assert "EEG stopped" in service.status()["error"]
+    assert camera.stops == eeg.stops == 1
+
+
+def test_restart_gets_a_new_camera_startup_deadline(setup):
+    service, clock, camera, eeg, _ = setup
+    tick(setup)
+    service.stop()
+    clock.now += service.CAMERA_STARTUP_SECONDS
+    service.start()
+    camera.running = False
+    clock.now += 6
+    tick(setup, tracked=False)
+    assert service.status()["state"] == "starting"
+    assert camera.stops == eeg.stops == 1
 
 
 def test_stop_discards_images_raw_and_pending_trial_but_not_feature_counts(setup):

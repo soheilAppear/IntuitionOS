@@ -15,6 +15,8 @@ import threading
 import time
 from collections import deque
 
+from .hand_tracking import FIRST_FRAME_TIMEOUT, STARTUP_TIMEOUT
+
 
 DISCLAIMER = ("Exploratory movement/artifact correlations, not intent decoding. "
               "EEG does not determine or blend into desktop directions. "
@@ -106,6 +108,11 @@ class MultimodalPreview:
     CAMERA_FRESH_SECONDS = 0.5
     EEG_FRESH_SECONDS = 0.75
     STARTUP_GRACE_SECONDS = 5.0
+    # The camera starts asynchronously and is not running until first inference.
+    # Allow its existing GPU startup/first-frame budgets plus capture setup time.
+    CAMERA_STARTUP_SECONDS = STARTUP_TIMEOUT + FIRST_FRAME_TIMEOUT + STARTUP_GRACE_SECONDS
+    CAMERA_LOSS_SECONDS = 2.0
+    EEG_LOSS_SECONDS = 2.0
     CONTACT_SECONDS = 5.0
     TRIAL_SECONDS = 3.0
     MAX_TRIALS = 64
@@ -134,6 +141,10 @@ class MultimodalPreview:
         self._owns_camera = False
         self._owns_eeg = False
         self._started_at = 0.0
+        self._camera_started_at = 0.0
+        self._camera_ready = False
+        self._last_camera_fresh_at = -math.inf
+        self._last_eeg_live_at = -math.inf
         self._observed_at = -math.inf
         self._camera_sequence = None
         self._camera_changed_at = -math.inf
@@ -200,7 +211,11 @@ class MultimodalPreview:
                 with self._lock:
                     cancelled = self._halt.is_set()
                     if not cancelled:
+                        # Neither stream's first-data budget includes time spent
+                        # waiting for the native start command acknowledgement.
+                        self._started_at = self.clock()
                         self._owns_camera = True
+                        self._camera_started_at = self._started_at
                 if cancelled:
                     return self._stop_owned("Preview startup cancelled.")
                 result = self.camera.start()
@@ -298,6 +313,9 @@ class MultimodalPreview:
         self._seen_order.clear()
         self._camera_sequence = None
         self._camera_changed_at = -math.inf
+        self._camera_ready = False
+        self._last_camera_fresh_at = -math.inf
+        self._last_eeg_live_at = -math.inf
         self._observed_at = -math.inf
         self._gap_count = 0
         self._last_valid_counter = None
@@ -417,6 +435,10 @@ class MultimodalPreview:
                 self._camera_changed_at = now
             camera_age = max(self._age(camera.get("age_ms")) / 1000, now - self._camera_changed_at)
             camera_fresh = bool(camera.get("running")) and camera_age <= self.CAMERA_FRESH_SECONDS
+            if camera_fresh:
+                # Seeing a hand is not required to finish camera startup.
+                self._camera_ready = True
+                self._last_camera_fresh_at = now - camera_age
             points = camera.get("landmarks") or []
             tracked = camera_fresh and bool(camera.get("tracked")) and len(points) >= 21
             stats = acquisition.get("stats") or {}
@@ -433,9 +455,15 @@ class MultimodalPreview:
                     self._last_valid_counter = counter
                     self._last_valid_eeg_at = now
                     advanced = True
-            eeg_fresh = (acquisition.get("state") == "running" and acquisition.get("mode") == "signal"
-                         and eeg_age <= self.EEG_FRESH_SECONDS and advanced and bool(rows)
-                         and self._valid_row(rows[-1], width))
+            valid_eeg_age = max(eeg_age, now - self._last_valid_eeg_at)
+            eeg_live = (acquisition.get("state") == "running" and acquisition.get("mode") == "signal"
+                        and valid_eeg_age <= self.EEG_FRESH_SECONDS and bool(rows)
+                        and self._valid_row(rows[-1], width))
+            if eeg_live:
+                self._last_eeg_live_at = now - valid_eeg_age
+            # A poll without a new batch must disarm controls, but is not itself
+            # evidence that acquisition stopped while the last batch is fresh.
+            eeg_fresh = eeg_live and advanced
             gaps = sum(max(0, int(stats.get(key) or 0)) for key in
                        ("gaps", "queue_drops", "channel_mismatches", "duplicates", "nonfinite"))
             gap = gaps > self._gap_count
@@ -466,6 +494,8 @@ class MultimodalPreview:
                 if gap:
                     self._raw.clear()
                 self._reason = ("Packet gap detected; controls disarmed." if gap else
+                                "Waiting for the camera's first fresh frame; controls disarmed."
+                                if not self._camera_ready else
                                 "Waiting for a fresh tracked hand and EEG; controls disarmed.")
             else:
                 self._state = "running"
@@ -488,11 +518,19 @@ class MultimodalPreview:
             elapsed = now - self._started_at
             if acquisition.get("state") == "error" or acquisition.get("error"):
                 failure = "EEG acquisition failed: " + str(acquisition.get("error") or "device error")
-            elif elapsed > self.STARTUP_GRACE_SECONDS:
-                if not camera_fresh:
-                    failure = "Camera stopped or frames became stale; preview stopped."
-                elif not eeg_fresh:
-                    failure = "EEG stopped or samples became stale; preview stopped."
+            elif not camera.get("running") and camera.get("state") in ("error", "unavailable", "off", "stopping"):
+                # preview() already exposes the capture worker's cached reason;
+                # do not replace model/startup failures with a generic timeout.
+                failure = "Camera stopped: " + str(camera.get("hint") or camera.get("error")
+                                                   or camera.get("state"))
+            elif not eeg_live and (
+                    (not math.isfinite(self._last_eeg_live_at) and elapsed >= self.STARTUP_GRACE_SECONDS)
+                    or (math.isfinite(self._last_eeg_live_at) and now - self._last_eeg_live_at >= self.EEG_LOSS_SECONDS)):
+                failure = "EEG stopped or samples stayed stale; preview stopped."
+            elif not self._camera_ready and now - self._camera_started_at >= self.CAMERA_STARTUP_SECONDS:
+                failure = "Camera startup timed out before the first fresh frame; preview stopped."
+            elif self._camera_ready and not camera_fresh and now - self._last_camera_fresh_at >= self.CAMERA_LOSS_SECONDS:
+                failure = "Camera frames stayed stale; preview stopped."
         if failure:
             self._fail(failure, generation)
         elif dispatch_direction:

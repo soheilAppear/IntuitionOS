@@ -103,6 +103,12 @@ supplies the direction of a desktop action.
    validated good/bad cutoff. The versioned Python SDK defines these values as
    ohms; its web documentation has conflicting units, noted in the panel.
 4. Choose **Start preview**. Opening the panel never starts either sensor.
+   This control starts both sensors; do not also enable the normal Hand camera.
+   A connected BrainBit alone does not prevent normal Hand camera use. GPU
+   trackers such as WiLoR can take time to load: the combined preview allows
+   up to 105 seconds for initial camera readiness and remains disarmed while
+   waiting. Short frame or packet pauses disarm immediately; sustained loss
+   stops acquisition. Stop remains available throughout startup.
    Keep one hand visible and still briefly, then move it horizontally left or
    right. Directions refer to the mirrored camera view. Return to a neutral
    position between movements. EEG is shown in microvolts with descriptive
