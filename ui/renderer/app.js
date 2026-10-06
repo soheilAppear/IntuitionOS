@@ -1725,6 +1725,9 @@ const multimodalPanel = createMultimodalPanel({ document, isConnected,
   isCameraRunning: () => gestureStatus?.running === true || requestedGestures === true
     || ['starting', 'stopping'].includes(gestureStatus?.state),
   isBrainbitConnected: () => brainbitReady && brainbitStatus?.state === 'connected',
+  startEegGuard: () => ipcRenderer.invoke('eeg-guard-start'),
+  stopEegGuard: token => ipcRenderer.invoke('eeg-guard-stop', token ? { token } : {}),
   imageFactory: () => new Image(), onResize: () => setTimeout(syncHeight, 16) });
+ipcRenderer.on('eeg-emergency-stop', (_event, details) => multimodalPanel.emergencyStop(details?.reason));
 connect();
 cmdInput.focus();

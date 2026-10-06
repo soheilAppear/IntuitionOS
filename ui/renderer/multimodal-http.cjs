@@ -1,13 +1,22 @@
 // Local native transport only. Raw camera/EEG previews never use browser CORS.
 const http = require('node:http');
-const ACTIONS = new Set(['status', 'preview', 'start', 'stop', 'contact', 'arm', 'calibrate', 'reset_calibration']);
+const ACTIONS = new Set(['status', 'preview', 'start', 'stop', 'contact', 'arm', 'calibrate', 'reset_calibration',
+  'eeg_trial', 'eeg_train', 'eeg_reset', 'eeg_arm', 'eeg_guard', 'control_mode']);
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 async function requestMultimodal(action = 'status', payload = {}) {
   if (!ACTIONS.has(action)) throw new Error('Invalid preview action');
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Invalid preview arguments');
   const keys = Object.keys(payload);
-  if (action === 'arm' ? keys.length !== 1 || typeof payload.enabled !== 'boolean'
+  if (action === 'eeg_arm' ? typeof payload.enabled !== 'boolean'
+      || (payload.enabled ? keys.length !== 2 || typeof payload.guard_token !== 'string' || !UUID.test(payload.guard_token)
+        : keys.length !== 1)
+    : action === 'eeg_guard' ? keys.length !== 1 || typeof payload.token !== 'string' || !UUID.test(payload.token)
+    : action === 'arm' ? keys.length !== 1 || typeof payload.enabled !== 'boolean'
     : action === 'calibrate' ? keys.length !== 1 || !['left', 'right'].includes(payload.label)
+    : action === 'eeg_trial' ? keys.length !== 2 || !['left', 'right', 'rest'].includes(payload.label)
+      || !['train', 'validate'].includes(payload.phase)
+    : action === 'control_mode' ? keys.length !== 1 || !['webcam', 'eeg'].includes(payload.mode)
     : keys.length !== 0) throw new Error('Invalid preview arguments');
   const method = ['status', 'preview'].includes(action) ? 'GET' : 'POST';
   const headers = { 'X-Intuition-Multimodal': '1' };

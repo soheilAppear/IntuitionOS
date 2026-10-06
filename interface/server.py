@@ -2313,26 +2313,51 @@ async def multimodal_operation(operation: str, request: Request):
     if not _multimodal_local_request(request):
         return JSONResponse({"error": "Combined preview controls require the local HUD."},
                             status_code=403, headers=headers)
-    if operation not in ("start", "stop", "contact", "arm", "calibrate", "reset_calibration"):
+    operations = {"start": "start", "stop": "stop", "contact": "check_contact",
+                  "arm": "arm", "calibrate": "mark_trial", "reset_calibration": "reset_calibration",
+                  "control_mode": "set_control_mode", "eeg_trial": "eeg_trial",
+                  "eeg_train": "eeg_train", "eeg_reset": "eeg_reset",
+                  "eeg_arm": "eeg_arm", "eeg_guard": "eeg_guard"}
+    if operation not in operations:
         return JSONResponse({"error": "Unknown combined preview operation."}, status_code=404, headers=headers)
     try:
         payload = await request.json()
     except (ValueError, UnicodeError):
         payload = None
-    expected = {"enabled"} if operation == "arm" else {"label"} if operation == "calibrate" else set()
-    if (not isinstance(payload, dict) or set(payload) != expected
-            or (operation == "arm" and type(payload["enabled"]) is not bool)
-            or (operation == "calibrate" and payload["label"] not in ("left", "right"))):
-        return JSONResponse({"error": "Expected an enabled boolean, a left/right trial label, or an empty object for this operation."},
+    expected = {"arm": {"enabled"}, "calibrate": {"label"}, "control_mode": {"mode"},
+                "eeg_trial": {"label", "phase"}, "eeg_arm": {"enabled"},
+                "eeg_guard": {"token"}}.get(operation, set())
+    if operation == "eeg_arm" and isinstance(payload, dict) and payload.get("enabled") is True:
+        expected = {"enabled", "guard_token"}
+    valid = isinstance(payload, dict) and set(payload) == expected
+    if valid and operation in ("arm", "eeg_arm"):
+        valid = type(payload["enabled"]) is bool
+    if valid and operation == "calibrate":
+        valid = payload["label"] in ("left", "right")
+    if valid and operation == "control_mode":
+        valid = payload["mode"] in ("webcam", "eeg")
+    if valid and operation == "eeg_trial":
+        valid = payload["label"] in ("left", "right", "rest") and payload["phase"] in ("train", "validate")
+    token = (payload.get("token") if operation == "eeg_guard" else payload.get("guard_token")) if valid else None
+    if valid and (operation == "eeg_guard" or operation == "eeg_arm" and payload["enabled"]):
+        # The token binds explicit arming to the desktop main process's live
+        # Escape shortcut lease. It is not authentication against local code.
+        valid = isinstance(token, str) and re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}", token) is not None
+    if not valid:
+        return JSONResponse({"error": "Invalid fields or values for this combined preview operation."},
                             status_code=400, headers=headers)
     preview = _state.get("multimodal")
     if preview is None:
         return JSONResponse({**_multimodal_info(), "error": "Restart the backend to enable the combined preview."},
                             status_code=503, headers=headers)
-    method = {"start": preview.start, "stop": preview.stop, "contact": preview.check_contact,
-              "arm": preview.arm, "calibrate": preview.mark_trial,
-              "reset_calibration": preview.reset_calibration}[operation]
-    args = (payload["enabled"],) if operation == "arm" else (payload["label"],) if operation == "calibrate" else ()
+    method = getattr(preview, operations[operation])
+    args = ((payload["enabled"], payload.get("guard_token")) if operation == "eeg_arm" else
+            (payload["enabled"],) if operation == "arm" else
+            (payload["label"],) if operation == "calibrate" else
+            (payload["mode"],) if operation == "control_mode" else
+            (payload["label"], payload["phase"]) if operation == "eeg_trial" else
+            (payload["token"],) if operation == "eeg_guard" else ())
     # Serialize acquisition starts against normal camera starts. Stop/disarm
     # bypass that lock so they remain available during blocked SDK startup.
     if operation in ("start", "contact"):

@@ -118,6 +118,57 @@ def test_five_second_bounded_cache_and_downsampling(connected):
     assert driver.acquisition_snapshot()["samples"]
 
 
+def test_signal_window_preserves_full_contiguous_counters_and_newest_packet(connected, monkeypatch):
+    driver, worker = connected
+    driver.start_acquisition()
+    monkeypatch.setattr(brainbit.time, "monotonic", lambda: 100.0)
+    for offset in range(0, 2000, 100):
+        worker.packet(counters=tuple(range(offset, offset + 100)))
+    calls = list(worker.calls)
+
+    window = driver.acquisition_signal_window()
+    preview = driver.acquisition_snapshot()
+
+    assert [packet["counter"] for packet in window["samples"]] == list(range(750, 2000))
+    assert window["samples"][-1]["counter"] == preview["samples"][-1]["counter"] == 1999
+    assert len(preview["samples"]) <= 250
+    assert {key: value for key, value in window.items() if key != "samples"} == {
+        key: value for key, value in preview.items() if key != "samples"}
+    assert worker.calls == calls
+    window["samples"][0]["samples"][0] = 123.0
+    window["channels"][0]["name"] = "changed"
+    again = driver.acquisition_signal_window()
+    assert again["samples"][0]["samples"][0] != 123.0
+    assert again["channels"][0]["name"] == "O1"
+
+
+def test_signal_window_expires_old_packets_and_keeps_finite_values(connected, monkeypatch):
+    driver, worker = connected
+    driver.start_acquisition()
+    monkeypatch.setattr(brainbit.time, "monotonic", lambda: 100.0)
+    worker.packet(counters=(0, 1, 2), values=(float("nan"), float("inf"), -.000001))
+    monkeypatch.setattr(brainbit.time, "monotonic", lambda: 104.99)
+    window = driver.acquisition_signal_window()
+    assert [packet["samples"] for packet in window["samples"]] == [[None], [None], [-.000001]]
+    json.dumps(window, allow_nan=False)
+    monkeypatch.setattr(brainbit.time, "monotonic", lambda: 105.001)
+    assert driver.acquisition_signal_window()["samples"] == []
+
+
+def test_signal_window_is_not_a_public_action_and_stop_clears_it(connected):
+    driver, worker = connected
+    driver.start_acquisition()
+    worker.packet(counters=(0, 1, 2))
+    assert driver.acquisition_signal_window()["samples"]
+    assert "acquisition_signal_window" not in [action["name"] for action in driver.schema()["actions"]]
+    assert "error" in driver.call("acquisition_signal_window")
+    public_status = json.dumps(driver.call("status"))
+    assert "samples" not in public_status and "packets" not in public_status
+    driver.stop_acquisition()
+    assert driver.acquisition_signal_window()["samples"] == []
+    assert driver.acquisition_snapshot()["samples"] == []
+
+
 @pytest.mark.parametrize("action", ["stop_acquisition", "start_acquisition"])
 def test_acquisition_failure_releases_worker_and_is_not_stopped(connected, action):
     driver, worker = connected

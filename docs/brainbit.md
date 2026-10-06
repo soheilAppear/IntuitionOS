@@ -90,20 +90,23 @@ Official references: [Python installation](https://sdk.brainbit.com/sdk2_python_
 
 This separate HUD panel is an exploratory movement experiment for **BrainBit2**.
 It displays mirrored webcam hand tracking next to four EEG channels, using
-approximate host arrival timing. It does not decode intentions: movement,
-muscle activity and electrode motion can all affect the signal. EEG never
-supplies the direction of a desktop action.
+approximate host arrival timing. **Webcam** mode uses camera direction;
+**EEG** mode predicts left, right, or rest exclusively from EEG features.
+Camera movement verifies training and validation labels, and never enters the
+EEG classifier or supplies its action direction. Muscle activity and electrode
+motion can explain successful classification: this is not thought reading or
+a medical measurement, and software tests do not demonstrate reliable control.
 
 1. Connect BrainBit in the connection panel. Wear it according to its manual;
    keep it powered on and disconnect the charger if the device manual requires it.
-2. Turn off the normal Hand controls camera. Expand **EEG + camera preview**.
+2. Turn off the normal Hand controls camera. Expand **Experimental hand + EEG**.
 3. Optionally choose **Check contacts** while preview is stopped. This acquires
    resistance for up to five seconds, then stops. Contact and signal acquisition
    are separate modes. Readings are historical and show their age, with no
    validated good/bad cutoff. The versioned Python SDK defines these values as
    ohms; its web documentation has conflicting units, noted in the panel.
 4. Choose **Start preview**. Opening the panel never starts either sensor.
-   This control starts both sensors; do not also enable the normal Hand camera.
+   In Webcam mode this starts both sensors; do not also enable the normal Hand camera.
    A connected BrainBit alone does not prevent normal Hand camera use. GPU
    trackers such as WiLoR can take time to load: the combined preview allows
    up to 105 seconds for initial camera readiness and remains disarmed while
@@ -113,30 +116,78 @@ supplies the direction of a desktop action.
    right. Directions refer to the mirrored camera view. Return to a neutral
    position between movements. EEG is shown in microvolts with descriptive
    age, rate, counter-discontinuity, nonfinite-value and queue-drop diagnostics.
-5. For an exploratory calibration, choose a left or right trial and perform
-   that movement within three seconds. Each accepted trial needs matching
-   camera movement and fresh EEG. Features stay in memory, up to 64 trials;
-   raw signal windows are not retained in calibration. Collect balanced trials
-   across both directions. Evaluation uses a chronological held-out set and
-   needs at least six training and three held-out trials per class. Accuracy
-   and the baseline are descriptive movement/artifact correlations, not proof
-   of neural intent or generalization. Calibration never enables control.
-6. Desktop control is **off by default**. Only if desired, explicitly enable
-   **Arm webcam swipes**. Fresh webcam data determines left/right, while fresh
-   EEG is a required availability gate. A neutral reset, debounce and cooldown
-   limit repeated actions. Lost tracking, stale data or device failure disarms
-   the session. Safe Mode and the existing desktop capability gate still apply.
-7. Choose **Stop & disarm** when finished. It cancels startup/contact checking,
+5. Keep Webcam mode selected for guided trials, with controls disarmed.
+   Collect at least **eight training trials each for left, right, and rest**.
+   Each trial lasts three seconds. Hold still for the first half-second, perform
+   the requested horizontal movement during the middle two seconds, and hold
+   still for the final half-second; remain still throughout rest trials. Each accepted trial needs
+   fresh tracked camera data and a valid complete EEG window. Alternate labels
+   and return to a neutral position between trials. No raw trial data is saved.
+6. Choose **Train & freeze**, then collect **eight new validation trials per
+   class**. These use the frozen model and separate, nonoverlapping EEG samples.
+   Training and validation cannot be mixed, and completed validation cannot be
+   extended until a favorable score appears. Read the class precision/recall,
+   confusion matrix, uncertain predictions, and rest false activations. The
+   fixed engineering gates are described below. Failing a gate keeps EEG arming
+   unavailable; reset starts a new experiment.
+7. Select **EEG** mode without stopping acquisition to retain the calibrated
+   session. Review prediction-only output first. If the gates passed and current
+   EEG is valid, **Arm EEG swipes** explicitly enables only left/right desktop
+   navigation. A working global **Escape** shortcut is required before arming.
+   Hold a confident rest prediction for one second, then sustain a confident
+   direction across three predictions. A two-second cooldown and another rest
+   period limit repeats. The camera is not required for EEG predictions or EEG
+   actions, even if its preview becomes unavailable. Starting in EEG mode skips
+   the camera, but a new acquisition requires new guided calibration.
+8. Webcam control remains available through **Arm webcam swipes** in Webcam
+   mode. Fresh camera data determines direction and fresh EEG gates availability.
+   Webcam and EEG controls cannot be armed together. Brief uncertain or
+   out-of-distribution predictions suppress actions and reset the direction
+   streak; three seconds of continuous uncertainty disarms. Mode changes,
+   stale/invalid EEG, packet gaps, disconnect, or failed actions disarm EEG
+   immediately; recovery never rearms it. Safe Mode and the desktop capability
+   gate apply.
+9. Press **Escape** from any application while EEG control is armed, or choose
+   **Stop & disarm** when finished. It cancels startup/contact checking,
    releases the preview camera and stops EEG. If native shutdown cannot be
    confirmed, the panel reports the error and the worker is terminated.
 
 Frames and waveform samples are transient in memory and pass only between the
-local backend and HUD. There is no recording, export, cloud upload, model input,
-or raw-signal action logging. The waveform cache is bounded to five seconds and
-at most 250 display points per response; it is unsuitable for spectral analysis.
+local backend and HUD. There is no recording, export, cloud upload, language-model
+input, or raw-signal action logging. The waveform cache is bounded to five seconds
+and at most 250 display points per response. The local EEG classifier separately
+reads the full-rate in-memory buffer (at most 1,250 packets) and uses complete
+two-second windows. Calibration retains only derived training features and
+validation predictions, with 120 total trials maximum, and has no save/load path.
 Hiding the panel clears its displayed frames and pauses raw-data HTTP polling;
 acquisition continues until Stop, a device failure, or backend shutdown. Stop
 before leaving the experiment. Restarting the backend clears calibration.
+Models are bound to the acquisition session, channel layout, and sample rate;
+after stopping/restarting acquisition, reset and repeat training/validation.
+The main process renews a three-second Escape guard lease while armed. Shortcut
+loss, renderer failure, or app exit stops renewal and disarms control; this is
+not an authentication boundary against other programs on the same machine.
+
+### Experimental EEG model and validation
+
+Each channel is linearly detrended. Features are log variance and log integrated
+Hann-periodogram power in 4–8, 8–13, and 13–30 Hz. NumPy implements a diagonal
+linear discriminant classifier with 20% variance shrinkage, equal class priors,
+training-only standardization, and training-only distance rejection. Camera
+coordinates, motion, and labels are absent from inference inputs. Checks reject
+incomplete windows, counter gaps, nonfinite values, flat channels, suspicious
+extreme plateaus, and very large amplitudes. These are engineering checks, not
+validated diagnoses of electrode contact or signal quality.
+
+The first eight accepted validation trials of each class are fixed. Abstentions
+count as incorrect. Arming eligibility requires balanced accuracy ≥75%, precision
+and recall ≥70% for every class, and ≤10% accepted left/right predictions on rest
+trials. With eight rest trials, any such false activation fails the gate. This
+metric is **per held-out rest trial before debounce**, not activations per hour.
+Live and validation predictions use the same fixed score ≥0.80, margin ≥0.25,
+and distance limits. Displayed scores are uncalibrated, not probabilities.
+These small-sample engineering gates do not establish future reliability or
+neural intent, especially when labels involve physical movement.
 
 The private `/multimodal/preview` route carries raw display data. Other preview
 status/actions contain metadata only, and acquisition methods are excluded from

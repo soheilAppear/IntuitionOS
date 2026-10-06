@@ -191,15 +191,36 @@ class BrainBit(HardwareDriver):
 
     def acquisition_snapshot(self):
         """Return a finite, bounded local-preview view; never journal this data."""
-        now = time.monotonic()
+        return self._acquisition_snapshot(sample_limit=250)
+
+    def acquisition_signal_window(self):
+        """Copy up to five seconds/1250 cached packets for local EEG features.
+
+        This internal service API preserves full resolution; it is not a
+        hardware action or a public status payload and never reads the SDK.
+        """
+        return self._acquisition_snapshot(sample_limit=None)
+
+    def _acquisition_snapshot(self, sample_limit):
         with self._lock:
+            now = time.monotonic()
             result = copy.deepcopy(self._acq)
-            packets = [packet for packet in self._samples
-                       if now - packet["host_received_monotonic"] <= 5]
+            packets = copy.deepcopy([packet for packet in self._samples
+                                     if now - packet["host_received_monotonic"] <= 5])
             contact = copy.deepcopy(self._contact_precheck)
             last_receipt = self._samples[-1]["host_received_monotonic"] if self._samples else None
-        stride = max(1, math.ceil(len(packets) / 250))
-        result["samples"] = copy.deepcopy(packets[::stride])
+        if sample_limit is not None and len(packets) > sample_limit:
+            stride = math.ceil(len(packets) / sample_limit)
+            display = packets[::stride]
+            # The display must include the newest packet, not end a stride early.
+            if display[-1] is not packets[-1]:
+                if len(display) == sample_limit:
+                    display[-1] = packets[-1]
+                else:
+                    display.append(packets[-1])
+            result["samples"] = display
+        else:
+            result["samples"] = packets
         result["stats"]["age_seconds"] = (max(0, now - last_receipt)
                                            if last_receipt is not None else None)
         duration = (packets[-1]["host_received_monotonic"] - packets[0]["host_received_monotonic"]

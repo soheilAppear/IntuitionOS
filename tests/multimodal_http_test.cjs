@@ -23,8 +23,12 @@ function transport(action, payload) {
     complete(data, status = 200) { res.statusCode = status; receive(res); res.emit('data', Buffer.from(JSON.stringify(data))); res.emit('end'); } };
 }
 
+const guardToken = '11111111-2222-4333-8444-555555555555';
 for (const [action, payload] of [['status', {}], ['preview', {}], ['start', {}], ['stop', {}],
-  ['contact', {}], ['arm', { enabled: true }], ['calibrate', { label: 'left' }], ['reset_calibration', {}]]) {
+  ['contact', {}], ['arm', { enabled: true }], ['calibrate', { label: 'left' }], ['reset_calibration', {}],
+  ['eeg_trial', { label: 'rest', phase: 'train' }], ['eeg_trial', { label: 'right', phase: 'validate' }],
+  ['eeg_train', {}], ['eeg_reset', {}], ['eeg_arm', { enabled: true, guard_token: guardToken }],
+  ['eeg_arm', { enabled: false }], ['eeg_guard', { token: guardToken }], ['control_mode', { mode: 'eeg' }]]) {
   test(`local ${action} request has constrained method, payload and native header`, async () => {
     const t = transport(action, payload), get = ['status', 'preview'].includes(action), options = t.calls[0];
     assert.equal(options.hostname, '127.0.0.1'); assert.equal(options.port, 7432);
@@ -41,7 +45,15 @@ for (const [action, payload] of [['status', {}], ['preview', {}], ['start', {}],
 test('arbitrary routes and extra action fields are rejected before network access', async () => {
   for (const [action, payload] of [['record', {}], ['../start', {}], ['http://host', {}], ['arm', {}],
     ['arm', { enabled: 'true' }], ['arm', { enabled: true, save: true }], ['calibrate', { label: 'up' }],
-    ['calibrate', { label: 'left', samples: [] }], ['status', { raw: true }], ['stop', { anything: 1 }]]) {
+    ['calibrate', { label: 'left', samples: [] }], ['status', { raw: true }], ['stop', { anything: 1 }],
+    ['eeg_trial', { label: 'rest' }], ['eeg_trial', { label: 'up', phase: 'train' }],
+    ['eeg_trial', { label: 'left', phase: 'test' }], ['eeg_trial', { label: 'rest', phase: 'train', raw: [] }],
+    ['eeg_train', { save: true }], ['eeg_reset', { record: true }],
+    ['eeg_arm', { enabled: true }], ['eeg_arm', { enabled: true, guard_token: 'not-a-uuid' }],
+    ['eeg_arm', { enabled: false, guard_token: guardToken }], ['eeg_guard', { token: guardToken, arm: true }],
+    ['eeg_guard', { token: 'bad' }], ['eeg_guard', { token: '11111111-2222-1333-8444-555555555555' }],
+    ['eeg_guard', { token: '11111111-2222-4333-7444-555555555555' }],
+    ['control_mode', { mode: 'both' }], ['control_mode', { mode: 'eeg', enabled: true }]]) {
     const t = transport(action, payload);
     await assert.rejects(t.promise, /Invalid preview/); assert.equal(t.calls.length, 0);
   }

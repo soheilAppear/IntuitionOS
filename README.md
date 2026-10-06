@@ -39,7 +39,8 @@ preserved in the [historical archive](archive/README.md).
 
 For optional BrainBit headset connection and the explicitly started, local EEG +
 webcam experiment, see the [BrainBit guide](docs/brainbit.md). The experimental
-preview is disarmed by default; EEG does not determine desktop direction.
+preview is disarmed by default. Its experimental EEG-only left/right/rest model
+requires separate training, held-out validation, and explicit desktop arming.
 
 ---
 

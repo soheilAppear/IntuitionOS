@@ -11,6 +11,7 @@ from interface import server
 
 
 HEADERS = {"host": "127.0.0.1:7432", "x-intuition-multimodal": "1"}
+GUARD_TOKEN = "bb215fc4-78fd-4ee5-b4f1-e35ca96f9416"
 
 
 class Preview:
@@ -58,6 +59,30 @@ class Preview:
 
     def reset_calibration(self):
         self.calls.append(("reset",))
+        return self.status()
+
+    def set_control_mode(self, mode):
+        self.calls.append(("control_mode", mode))
+        return self.status()
+
+    def eeg_trial(self, label, phase):
+        self.calls.append(("eeg_trial", label, phase))
+        return self.status()
+
+    def eeg_train(self):
+        self.calls.append(("eeg_train",))
+        return self.status()
+
+    def eeg_reset(self):
+        self.calls.append(("eeg_reset",))
+        return self.status()
+
+    def eeg_arm(self, enabled, guard_token=None):
+        self.calls.append(("eeg_arm", enabled, guard_token))
+        return self.status()
+
+    def eeg_guard(self, token):
+        self.calls.append(("eeg_guard", token))
         return self.status()
 
 
@@ -114,6 +139,60 @@ def test_explicit_actions_and_unknown_actions(api):
         assert client.post(f"/multimodal/{name}", headers=HEADERS, json=payload).status_code == 200
     assert [c[0] for c in preview.calls] == ["start", "arm", "calibrate", "arm", "stop", "contact", "reset"]
     assert client.post("/multimodal/record", headers=HEADERS, json={}).status_code == 404
+
+
+@pytest.mark.parametrize("operation,payload", [
+    ("control_mode", {"mode": "eeg"}),
+    ("eeg_trial", {"label": "rest", "phase": "train"}),
+    ("eeg_trial", {"label": "left", "phase": "validate"}),
+    ("eeg_train", {}), ("eeg_reset", {}),
+    ("eeg_guard", {"token": GUARD_TOKEN}),
+    ("eeg_arm", {"enabled": True, "guard_token": GUARD_TOKEN}),
+    ("eeg_arm", {"enabled": False}),
+])
+def test_eeg_actions_are_explicit_private_metadata_only(api, operation, payload):
+    preview, client = api
+    response = client.post(f"/multimodal/{operation}", headers=HEADERS, json=payload)
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    expected = {"control_mode": ("eeg",), "eeg_train": (), "eeg_reset": (),
+                "eeg_guard": (GUARD_TOKEN,)}.get(operation)
+    if operation == "eeg_trial":
+        expected = (payload["label"], payload["phase"])
+    if operation == "eeg_arm":
+        expected = (payload["enabled"], payload.get("guard_token"))
+    assert preview.calls == [(operation, *expected)]
+    assert GUARD_TOKEN not in response.text
+    assert "private-frame" not in response.text and "waveform" not in response.text
+
+
+@pytest.mark.parametrize("operation,payload", [
+    ("control_mode", {"mode": "thought"}), ("control_mode", {"mode": ["eeg"]}),
+    ("eeg_trial", {"label": "rest"}), ("eeg_trial", {"label": "up", "phase": "train"}),
+    ("eeg_trial", {"label": "rest", "phase": "test"}),
+    ("eeg_trial", {"label": {}, "phase": "train"}),
+    ("eeg_train", {"refit_validation": True}), ("eeg_reset", {"save": True}),
+    ("eeg_guard", {}), ("eeg_guard", {"token": "bad"}),
+    ("eeg_guard", {"token": GUARD_TOKEN, "enabled": True}),
+    ("eeg_guard", {"token": []}),
+    ("eeg_arm", {"enabled": True}), ("eeg_arm", {"enabled": 1}),
+    ("eeg_arm", {"enabled": True, "guard_token": "bad"}),
+    ("eeg_arm", {"enabled": True, "guard_token": GUARD_TOKEN, "force": True}),
+    ("eeg_arm", {"enabled": False, "guard_token": GUARD_TOKEN}),
+])
+def test_invalid_eeg_actions_have_no_side_effects(api, operation, payload):
+    preview, client = api
+    assert client.post(f"/multimodal/{operation}", headers=HEADERS, json=payload).status_code == 400
+    assert preview.calls == []
+
+
+def test_browser_cannot_renew_escape_lease_or_arm(api):
+    preview, client = api
+    for operation, payload in (("eeg_guard", {"token": GUARD_TOKEN}),
+                               ("eeg_arm", {"enabled": True, "guard_token": GUARD_TOKEN})):
+        assert client.post(f"/multimodal/{operation}", headers={**HEADERS, "origin": "null"},
+                           json=payload).status_code == 403
+    assert preview.calls == []
 
 
 def request(path="/multimodal/start", payload=None):

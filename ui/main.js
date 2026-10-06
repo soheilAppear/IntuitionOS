@@ -10,10 +10,15 @@
 const { app, BrowserWindow, globalShortcut, ipcMain, screen } = require('electron');
 const path = require('path');
 const { DesktopVisibility } = require('./desktop-visibility');
+const { EegGuard } = require('./eeg-guard.cjs');
+const { requestMultimodal } = require('./renderer/multimodal-http.cjs');
 
 const HUD_W = 680;
 let win = null;
 let desktopVisibility = null;
+let eegGuard = null;
+let quitting = false;
+let quitReady = false;
 
 /** Create the single HUD on the primary display and retain it when closed. */
 function createWindow() {
@@ -39,6 +44,17 @@ function createWindow() {
       contextIsolation: false,
     },
   });
+  eegGuard = new EegGuard({
+    globalShortcut,
+    request: requestMultimodal,
+    notify: reason => {
+      if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
+        win.webContents.send('eeg-emergency-stop', { reason });
+      }
+    },
+  });
+  win.webContents.on('render-process-gone', () => { void eegGuard.emergencyStop('renderer-crash'); });
+  win.webContents.on('destroyed', () => { void eegGuard.emergencyStop('renderer-destroyed'); });
 
   // Windows 11 acrylic blur — ignore if unavailable
   try {
@@ -56,11 +72,15 @@ function createWindow() {
     desktopVisibility.start();
     win.webContents.send('desktop-visibility', desktopVisibility.status);
   });
-  win.on('closed', () => desktopVisibility.stop());
+  win.on('closed', () => {
+    desktopVisibility.stop();
+    void eegGuard.emergencyStop('window-destroyed');
+  });
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 
   // Hide instead of destroy on close
   win.on('close', (e) => {
+    if (quitting) return;
     e.preventDefault();
     win.hide();
   });
@@ -81,7 +101,7 @@ function toggleWindow() {
 app.whenReady().then(() => {
   createWindow();
   globalShortcut.register('Alt+Space', toggleWindow);
-  globalShortcut.register('CommandOrControl+Q', () => app.exit(0));
+  globalShortcut.register('CommandOrControl+Q', () => app.quit());
   globalShortcut.register('Alt+V', () => {
     if (win) {
       if (!win.isVisible()) {
@@ -93,9 +113,42 @@ app.whenReady().then(() => {
   });
 });
 
+// Give the bounded emergency request a chance to reach the backend before the
+// process exits. Merely hiding the HUD leaves the global Escape lease intact.
+app.on('before-quit', event => {
+  if (quitReady) return;
+  event.preventDefault();
+  if (quitting) return;
+  quitting = true;
+  desktopVisibility?.stop();
+  Promise.resolve(eegGuard?.dispose()).finally(() => {
+    quitReady = true;
+    app.quit();
+  });
+});
+
 app.on('will-quit', () => {
   desktopVisibility?.stop();
   globalShortcut.unregisterAll();
+});
+
+ipcMain.handle('eeg-guard-start', async event => {
+  if (!win || win.isDestroyed() || event.sender !== win.webContents || quitting) {
+    return { ok: false, error: 'EEG guard is restricted to the active HUD' };
+  }
+  return eegGuard.start();
+});
+ipcMain.handle('eeg-guard-stop', async (event, payload = {}) => {
+  if (!win || win.isDestroyed() || event.sender !== win.webContents) {
+    return { ok: false, error: 'EEG guard is restricted to the active HUD' };
+  }
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
+      Object.keys(payload).some(key => key !== 'token') ||
+      ('token' in payload && (typeof payload.token !== 'string' ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(payload.token)))) {
+    return { ok: false, error: 'Invalid EEG guard cleanup token' };
+  }
+  return eegGuard.stop(payload.token);
 });
 
 // Keep process alive when the HUD window is hidden
