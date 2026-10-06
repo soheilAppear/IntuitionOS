@@ -74,6 +74,7 @@ function renderer({ connected = true } = {}) {
       : name === './brainbit-http.cjs' ? { requestBrainbit: (action, deviceId) => new Promise((resolve, reject) => {
         brainbitRequests.push({ action, deviceId, resolve, reject });
       }) }
+      : name === './multimodal-panel.cjs' ? { createMultimodalPanel: () => ({ connectionChanged() {}, acceptStatus() {}, refreshControls() {} }) }
       : require(name),
     setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
     clearTimeout: id => { if (timers[id - 1]) timers[id - 1].cancelled = true; }, console,

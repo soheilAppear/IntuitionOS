@@ -46,7 +46,8 @@ function renderer() {
       : name === './camera-preview.cjs' ? { readCameraPreview() { throw new Error('Unexpected camera access'); } }
       : name === './brainbit-http.cjs' ? { requestBrainbit: (action, deviceId) => new Promise((resolve, reject) => {
         requests.push({ action, deviceId, resolve, reject });
-      }) } : require(name),
+      }) } : name === './multimodal-panel.cjs' ? { createMultimodalPanel: () => ({ connectionChanged() {}, acceptStatus() {}, refreshControls() {} }) }
+      : require(name),
     fetch() { throw new Error('Unexpected browser fetch'); },
     setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
     clearTimeout: id => { if (timers[id - 1]) timers[id - 1].cancelled = true; },

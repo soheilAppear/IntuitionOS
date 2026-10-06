@@ -92,6 +92,9 @@ def test_brainbit_stays_idle_at_startup_and_closes_on_lifespan_exit(app_dir, mon
                 driver = server._state["brainbit"]
                 assert driver.status()["state"] == "disconnected"
                 assert driver._worker is None
+                assert server._state["multimodal"].status()["state"] == "stopped"
+                assert server._state["multimodal"].status()["armed"] is False
+                assert not server._state["preview_camera"].is_running()
                 if abort:
                     raise RuntimeError("test lifespan cancellation")
         except RuntimeError:

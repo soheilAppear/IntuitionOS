@@ -178,6 +178,41 @@
       </div>
     </details>
 
+    <details class="multimodal-panel" id="multimodal-panel">
+      <summary>Experimental hand + EEG <span id="multimodal-summary">Stopped / disarmed</span></summary>
+      <div class="multimodal-body">
+        <p class="multimodal-note">No recordings saved; stays on this desktop. EEG is experimental and does not indicate intention.</p>
+        <p class="multimodal-note">Only webcam motion chooses swipe direction. EEG is not used to choose or trigger desktop controls. Alignment uses approximate host timestamps, not native sensor timestamps.</p>
+        <div id="multimodal-status" role="status" aria-live="polite">Open to check preview status.</div>
+        <div id="multimodal-error" class="multimodal-error" role="alert" hidden></div>
+        <div class="multimodal-controls">
+          <button type="button" id="multimodal-start" disabled>Start preview</button>
+          <button type="button" id="multimodal-stop" disabled>Stop &amp; disarm</button>
+          <button type="button" id="multimodal-contact" disabled>Contact check (5 s)</button>
+          <label><input type="checkbox" id="multimodal-arm" disabled> Arm desktop swipes</label>
+        </div>
+        <p class="multimodal-note" id="multimodal-start-hint">Connect BrainBit and stop the normal hand camera before starting. Desktop swipes begin only after you explicitly arm them.</p>
+        <div class="multimodal-preview-grid">
+          <div><canvas id="multimodal-camera" width="480" height="360" aria-label="Mirrored local hand camera preview"></canvas><div id="multimodal-camera-status" class="multimodal-note">Camera preview is off.</div></div>
+          <div><canvas id="multimodal-eeg" width="480" height="360" aria-label="EEG channels in microvolts, latest 250 samples, independent automatic scales"></canvas><div id="multimodal-eeg-status" class="multimodal-note">EEG preview is off.</div></div>
+        </div>
+        <div id="multimodal-motion" class="multimodal-note"></div>
+        <div id="multimodal-diagnostics" class="multimodal-note"></div>
+        <div id="multimodal-contact-status" class="multimodal-note">No contact precheck yet.</div>
+        <div class="multimodal-calibration">
+          <b>In-memory calibration</b>
+          <p class="multimodal-note">Keep your hand visible. Choose a trial, then make the requested webcam swipe within 3 seconds. Trials automatically disarm desktop swipes. Labels describe the movement, not mental intention.</p>
+          <div class="multimodal-controls">
+            <button type="button" id="multimodal-left" disabled>Add left trial</button>
+            <button type="button" id="multimodal-right" disabled>Add right trial</button>
+            <button type="button" id="multimodal-reset" disabled>Reset calibration</button>
+          </div>
+          <div id="multimodal-trial" role="status" aria-live="polite"></div>
+          <div id="multimodal-calibration-status" class="multimodal-note"></div>
+        </div>
+      </div>
+    </details>
+
     <!-- Full command candidates are shown before submission. -->
     <div class="correction-bar" id="correction-bar" aria-live="polite">
       <div class="correction-label" id="correction-label"></div>

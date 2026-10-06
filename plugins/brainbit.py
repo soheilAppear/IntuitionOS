@@ -1,13 +1,16 @@
 """Optional BrainBit connection adapter with isolated, bounded SDK operations."""
 
 import copy
+from collections import deque
 import importlib.util
 import json
+import math
 from pathlib import Path
 import queue
 import subprocess
 import sys
 import threading
+import time
 import uuid
 
 from .hw_base import HardwareDriver
@@ -54,7 +57,9 @@ class _WorkerClient:
                 message = json.loads(line)
                 if not isinstance(message, dict):
                     break
-                if "event" in message:
+                if "acquisition" in message:
+                    self._on_event({"_acquisition": message["acquisition"]})
+                elif "event" in message:
                     self._on_event(message["event"])
                 else:
                     if message.get("error"):
@@ -120,7 +125,8 @@ class BrainBit(HardwareDriver):
 
     ``call`` is synchronous and belongs on an executor; ``status`` only copies
     cached data. Disconnect cancels an in-flight operation by killing its worker.
-    Closing permanently disables this instance. No samples are acquired.
+    Closing permanently disables this instance. Acquisition is a separate,
+    explicit local-preview API and is never advertised to hardware actions.
     """
 
     name = "brainbit"
@@ -132,6 +138,10 @@ class BrainBit(HardwareDriver):
         self._closed = not bool(enabled)
         self._epoch = 0
         self._revision = 0
+        self._samples = deque(maxlen=1250)
+        self._contact_precheck = None
+        self._acq = self._empty_acquisition()
+        self._last_counter = None
         self._scan_seconds = min(15.0, max(0.0, float(scan_seconds)))
         self._connect_timeout = max(0.05, min(60.0, float(connect_timeout)))
         self._request_timeout = max(0.05, min(60.0, float(request_timeout)))
@@ -162,6 +172,181 @@ class BrainBit(HardwareDriver):
         with self._lock:
             return copy.deepcopy(self._snapshot)
 
+    @staticmethod
+    def _empty_acquisition():
+        return {"state": "stopped", "mode": None, "session_id": None,
+                "channels": [], "nominal_hz": None, "units": None,
+                "timing": "Host monotonic callback receipt; packet times are estimates",
+                "stats": {"nonfinite": 0, "gaps": 0, "duplicates": 0,
+                          "channel_mismatches": 0, "queue_drops": 0}}
+
+    def _clear_acquisition(self, *, error=None, keep_contact=False):
+        self._samples.clear()
+        self._acq = self._empty_acquisition()
+        self._last_counter = None
+        if error:
+            self._acq.update(state="error", error=error)
+        if not keep_contact:
+            self._contact_precheck = None
+
+    def acquisition_snapshot(self):
+        """Return a finite, bounded local-preview view; never journal this data."""
+        now = time.monotonic()
+        with self._lock:
+            result = copy.deepcopy(self._acq)
+            packets = [packet for packet in self._samples
+                       if now - packet["host_received_monotonic"] <= 5]
+            contact = copy.deepcopy(self._contact_precheck)
+            last_receipt = self._samples[-1]["host_received_monotonic"] if self._samples else None
+        stride = max(1, math.ceil(len(packets) / 250))
+        result["samples"] = copy.deepcopy(packets[::stride])
+        result["stats"]["age_seconds"] = (max(0, now - last_receipt)
+                                           if last_receipt is not None else None)
+        duration = (packets[-1]["host_received_monotonic"] - packets[0]["host_received_monotonic"]
+                    if len(packets) > 1 else 0)
+        result["stats"]["received_rate_hz"] = ((len(packets) - 1) / duration
+                                                if duration > 0 else None)
+        channel_stats = []
+        if result["mode"] == "signal":
+            for index, channel in enumerate(result["channels"]):
+                values = [packet["samples"][index] for packet in packets
+                          if len(packet["samples"]) > index and packet["samples"][index] is not None]
+                mean = sum(values) / len(values) if values else 0
+                channel_stats.append({"name": channel["name"],
+                                      "rms_v": math.sqrt(sum((v - mean) ** 2 for v in values) / len(values))
+                                      if values else None,
+                                      "peak_to_peak_v": max(values) - min(values) if values else None})
+        result["stats"]["channels"] = channel_stats
+        if contact is not None:
+            contact["age_seconds"] = max(0, now - contact["host_received_monotonic"])
+        result["contact_precheck"] = contact
+        return result
+
+    def _acquisition_event(self, epoch, payload):
+        if not isinstance(payload, dict):
+            return
+        with self._lock:
+            if (epoch != self._epoch or self._closed or
+                    self._acq["state"] not in ("starting", "running") or
+                    payload.get("session_id") != self._acq["session_id"]):
+                return
+            channels = payload.get("channels", [])[:16]
+            if channels:
+                self._acq["channels"] = copy.deepcopy(channels)
+            for key in ("nominal_hz", "units", "timing"):
+                if key in payload:
+                    self._acq[key] = payload[key]
+            for key in ("nonfinite", "channel_mismatches", "queue_drops"):
+                if type(payload.get(key)) is int:
+                    self._acq["stats"][key] = max(self._acq["stats"][key], payload[key])
+            for packet in payload.get("packets", [])[:100]:
+                if not isinstance(packet, dict):
+                    continue
+                counter = packet.get("counter")
+                receipt = packet.get("host_received_monotonic")
+                if type(counter) is not int or not isinstance(receipt, (float, int)) or not math.isfinite(receipt):
+                    continue
+                counter &= 0xffffffff
+                values = [float(value) if isinstance(value, (int, float)) and math.isfinite(value)
+                          else None for value in packet.get("samples", [])[:16]]
+                if self._last_counter is not None:
+                    delta = (counter - self._last_counter) & 0xffffffff
+                    if delta == 0:
+                        self._acq["stats"]["duplicates"] += 1
+                    elif delta != 1:
+                        # A reset is not evidence of billions of lost samples.
+                        self._acq["stats"]["gaps"] += 1
+                self._last_counter = counter
+                estimated = packet.get("estimated_monotonic")
+                if not isinstance(estimated, (float, int)) or not math.isfinite(estimated):
+                    estimated = None
+                safe = {"counter": counter, "marker": packet.get("marker"), "samples": values,
+                        "host_received_monotonic": float(receipt), "estimated_monotonic": estimated}
+                self._samples.append(safe)
+                if self._acq["mode"] == "contact":
+                    self._contact_precheck = {
+                        "values": list(values), "channels": copy.deepcopy(self._acq["channels"]),
+                        "host_received_monotonic": float(receipt), "units": "ohm",
+                        "unit_note": "Python SDK 1.0.15 specifies ohms; the SDK website conflicts. No contact threshold is assumed.",
+                    }
+
+    def start_acquisition(self, mode="signal"):
+        """Start an explicitly requested local preview; not a HardwareDriver action."""
+        if mode not in ("signal", "contact"):
+            result = self.acquisition_snapshot()
+            result["error"] = "Acquisition mode must be signal or contact"
+            return result
+        return self._acquisition_call("start_acquisition", mode)
+
+    def stop_acquisition(self):
+        """Stop acquisition with a bounded SDK request and release on failure."""
+        return self._acquisition_call("stop_acquisition")
+
+    def _acquisition_call(self, action, mode=None):
+        cancelled = False
+        with self._lock:
+            if action == "stop_acquisition" and self._acq["state"] == "stopped":
+                return self.acquisition_snapshot()
+            if self._snapshot["busy"]:
+                if action == "stop_acquisition":
+                    message = "Pending SDK operation cancelled; device stop is unconfirmed. Reconnect before retrying."
+                    self._clear_acquisition(error=message)
+                    self._epoch += 1
+                    cancelled, self._worker = self._worker, None
+                    self._update(state="error", busy=False, devices=[], device=None,
+                                 text=message, error=message)
+                else:
+                    result = self.acquisition_snapshot()
+                    result["error"] = "BrainBit is busy; retry after the current operation"
+                    return result
+            elif self._closed or self._worker is None or self._snapshot["state"] != "connected":
+                result = self.acquisition_snapshot()
+                result.setdefault("error", "Connect a BrainBit before starting acquisition")
+                return result
+            elif action == "start_acquisition" and self._acq["state"] == "running" and self._acq["mode"] == mode:
+                return self.acquisition_snapshot()
+            else:
+                epoch, worker = self._epoch, self._worker
+                self._clear_acquisition(keep_contact=True)
+                session_id = str(uuid.uuid4()) if action == "start_acquisition" else None
+                self._acq.update(state="starting" if session_id else "stopping", mode=mode,
+                                 session_id=session_id,
+                                 units="V" if mode == "signal" else "ohm" if mode == "contact" else None)
+                self._update(busy=True)
+        if cancelled is not False:
+            if cancelled is not None:
+                cancelled.close()
+            return self.acquisition_snapshot()
+        try:
+            args = {"mode": mode, "session_id": session_id} if session_id else {}
+            response = worker.request(action, args, timeout=min(5, self._request_timeout),
+                                      scan_seconds=self._scan_seconds)
+            if response.get("error"):
+                raise OSError("Acquisition command failed")
+            payload = response.get("result", {})
+            if payload.get("state") not in ("running", "stopped"):
+                raise OSError("Invalid acquisition response")
+            with self._lock:
+                if epoch != self._epoch or self._closed:
+                    return self.acquisition_snapshot()
+                for key in ("state", "mode", "session_id", "channels", "nominal_hz", "units", "timing"):
+                    if key in payload:
+                        self._acq[key] = copy.deepcopy(payload[key])
+                self._update(busy=False)
+            return self.acquisition_snapshot()
+        except (OSError, ValueError, TimeoutError):
+            with self._lock:
+                if epoch != self._epoch or self._closed:
+                    return self.acquisition_snapshot()
+                message = "Acquisition command failed; device stop is unconfirmed. Worker released; reconnect before retrying."
+                self._clear_acquisition(error=message)
+                self._epoch += 1
+                self._worker = None
+                self._update(state="error", busy=False, devices=[], device=None,
+                             text=message, error=message)
+            worker.close()
+            return self.acquisition_snapshot()
+
     def _update(self, **values):
         self._snapshot.pop("error", None)
         self._snapshot.update(values)
@@ -176,6 +361,9 @@ class BrainBit(HardwareDriver):
     def _event(self, epoch, payload):
         if not isinstance(payload, dict):
             return
+        if "_acquisition" in payload:
+            self._acquisition_event(epoch, payload["_acquisition"])
+            return
         stopped = None
         with self._lock:
             if epoch != self._epoch or self._closed:
@@ -185,6 +373,8 @@ class BrainBit(HardwareDriver):
             values = {key: payload[key] for key in
                       ("state", "text", "device", "devices") if key in payload}
             if values.get("state") == "disconnected":
+                active = self._acq["state"] in ("starting", "running", "stopping")
+                self._clear_acquisition(error="Connection lost; device stop is unconfirmed" if active else None)
                 self._epoch += 1
                 stopped, self._worker = self._worker, None
                 values.update(devices=[], device=None, busy=False,
@@ -200,6 +390,8 @@ class BrainBit(HardwareDriver):
                 return
             self._epoch += 1
             stopped, self._worker = self._worker, None
+            active = self._acq["state"] in ("starting", "running", "stopping")
+            self._clear_acquisition(error="Worker stopped; device stop is unconfirmed" if active else None)
             self._update(state="error", device=None, devices=[], busy=False,
                          text="BrainBit worker stopped; discover again",
                          error="BrainBit worker stopped unexpectedly")
@@ -229,11 +421,14 @@ class BrainBit(HardwareDriver):
                     return self.status()
                 self._epoch += 1
                 cancelled, self._worker = self._worker, None
+                active = self._acq["state"] in ("starting", "running", "stopping")
+                self._clear_acquisition(error="Operation cancelled; device stop is unconfirmed" if active else None)
                 self._update(state="disconnected", busy=False, devices=[], device=None,
                              text="BrainBit operation cancelled; discover again")
             elif action == "status" and self._worker is None:
                 return self.status()
             elif action == "disconnect" and self._worker is None:
+                self._clear_acquisition()
                 self._update(state="disconnected", busy=False, devices=[], device=None,
                              text="BrainBit disconnected")
                 return self.status()
@@ -245,6 +440,11 @@ class BrainBit(HardwareDriver):
                     item["id"] for item in self._snapshot["devices"]}:
                 return self._reject("Device selection expired; discover again")
             else:
+                if action == "disconnect":
+                    active = self._acq["state"] in ("starting", "running", "stopping")
+                    self._clear_acquisition()
+                    if active:
+                        self._acq["state"] = "stopping"
                 state = {"discover": "scanning", "connect": "connecting",
                          "disconnect": "disconnecting"}.get(action, self._snapshot["state"])
                 self._update(state=state, busy=True,
@@ -285,6 +485,9 @@ class BrainBit(HardwareDriver):
                     return self.status()
                 if action == "disconnect" or (action in ("status", "connect")
                                               and payload["state"] == "disconnected"):
+                    lost_active = action != "disconnect" and self._acq["state"] in ("starting", "running", "stopping")
+                    self._clear_acquisition(error="Connection lost; device stop is unconfirmed"
+                                            if lost_active else None)
                     self._epoch += 1
                     stopped, self._worker = self._worker, None
                     payload.update(devices=[], device=None)
@@ -303,6 +506,10 @@ class BrainBit(HardwareDriver):
                            if unavailable else "BrainBit operation timed out; discover again"
                            if isinstance(exc, TimeoutError) else
                            "BrainBit operation failed; check the device, then discover again")
+                active = self._acq["state"] in ("starting", "running", "stopping")
+                if active:
+                    message = "BrainBit operation failed; device stop is unconfirmed. Reconnect before retrying."
+                self._clear_acquisition(error="SDK operation failed; device stop is unconfirmed" if active else None)
                 self._update(state="unavailable" if unavailable else "error", busy=False,
                              available=not unavailable, device=None, devices=[],
                              text=message, error=message)
@@ -314,23 +521,34 @@ class BrainBit(HardwareDriver):
 
     def close(self):
         with self._lock:
+            if self._closed:
+                return
             was_busy = self._snapshot["busy"]
+            was_acquiring = self._acq["state"] in ("starting", "running", "stopping")
+            self._clear_acquisition(error=self._acq.get("error"))
+            if was_acquiring:
+                self._acq["state"] = "stopping"
             self._closed = True
             self._epoch += 1
             worker, self._worker = self._worker, None
             self._update(state="disabled", available=False, busy=False, device=None,
                          devices=[], text="BrainBit integration stopped")
         if worker is not None:
+            confirmed = not was_acquiring
             try:
                 # An idle worker gets a bounded graceful disconnect. Busy native
                 # operations are cancelled immediately; do not queue behind them.
                 if not was_busy:
-                    worker.request("disconnect", {}, timeout=min(2, self._request_timeout),
-                                   scan_seconds=self._scan_seconds)
+                    response = worker.request("disconnect", {}, timeout=min(2, self._request_timeout),
+                                              scan_seconds=self._scan_seconds)
+                    confirmed = not bool(response.get("error"))
             except (OSError, ValueError, TimeoutError):
                 pass
             finally:
                 worker.close()
+                with self._lock:
+                    self._clear_acquisition(error=None if confirmed else
+                                            "Shutdown released worker; device stop is unconfirmed")
 
 
 class _WorkerFailure(Exception):

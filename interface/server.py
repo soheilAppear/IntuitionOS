@@ -60,6 +60,7 @@ from core.scheduler import Scheduler
 from core.gestures import GestureRecognizer
 from core.hand_control import HandControls
 from core.hand_feedback import HandClickSound
+from core.multimodal import MultimodalPreview
 from core.voice import VoiceRecognizer
 from plugins.brainbit import BrainBit
 
@@ -122,6 +123,23 @@ def _brainbit_info():
         return {"state": "disabled", "available": False, "busy": False,
                 "devices": [], "device": None, "text": "BrainBit is disabled."}
     return driver.status()
+
+
+def _multimodal_info():
+    preview = _state.get("multimodal")
+    return preview.status() if preview else {
+        "state": "unavailable", "running": False, "armed": False,
+        "reason": "Restart the backend to enable the combined preview."}
+
+
+def _multimodal_busy():
+    info = _multimodal_info()
+    camera = _state.get("preview_camera")
+    return (info.get("state") in ("starting", "running", "contact", "stopping")
+            or bool(info.get("cleanup_pending"))
+            or (camera is not None and (camera.is_running()
+                or camera.status().get("state") in ("starting", "stopping")
+                or camera.status().get("tracker_cleanup_pending"))))
 
 
 async def _poll_brainbit(driver):
@@ -264,6 +282,9 @@ async def _change_gestures(enabled) -> dict:
     # Capture startup and shutdown can block on a camera driver. Serialize them
     # across HUDs while keeping the event loop free to send lifecycle events.
     async with _state["gesture_lock"]:
+        if enabled and _multimodal_busy():
+            return {"error": "Stop the combined EEG + camera preview before turning on Hand controls.",
+                    "status_code": 409}
         gestures = _state.get("gestures")
         if gestures is None:
             outcome = {"error": "Gesture recognition is unavailable."}
@@ -592,6 +613,22 @@ async def lifespan(app: FastAPI):
         on_click=lambda event: _queue_mouse_click(loop, event),
     )
 
+    # Independent preview ownership: this camera has no input callbacks and
+    # empty gesture bindings. Only the explicitly armed service can dispatch.
+    preview_camera = GestureRecognizer(
+        camera_index=int(gesture_cfg.get("camera_index", 0)), bindings={},
+        input_mode="desktop", model_complexity=gesture_settings["model_complexity"],
+        tracker_backend=gesture_settings["tracker_backend"],
+    )
+    multimodal = MultimodalPreview(
+        preview_camera, brainbit,
+        gesture_busy=lambda: (gestures.is_running()
+            or gestures.status().get("state") in ("starting", "stopping")
+            or gestures.status().get("tracker_cleanup_pending", False)
+            or hand_controls.status().get("desktop", {}).get("cleanup_pending", False)),
+        dispatch=actions.dispatch,
+    )
+
     _state.update(
         {
             "cfg": cfg,
@@ -608,6 +645,8 @@ async def lifespan(app: FastAPI):
             "voice_status": voice_status,
             "voice_owner": None,
             "brainbit": brainbit,
+            "multimodal": multimodal,
+            "preview_camera": preview_camera,
             "episodes": episodes,
             "sensor": sensor,
             "predictor": predictor,
@@ -646,6 +685,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         brainbit_task.cancel()
+        await asyncio.to_thread(multimodal.stop)
         # close() also cancels a blocked connect/refresh; do not await an
         # abandoned native operation before terminating its owned worker.
         await asyncio.to_thread(brainbit.close)
@@ -2160,6 +2200,8 @@ async def gesture_settings(request: Request):
             or ("bend_click" in payload and type(payload["bend_click"]) is not bool)):
         return JSONResponse({"error": "Choose desktop or mouse controls, auto or shortcut desktop movement, hand travel from 0.8 to 3.0 palms, tracker mediapipe, rtmpose or wilor, MediaPipe model 0 (light) or 1 (full), and bend_click true or false."}, status_code=400)
     async with _state["gesture_lock"]:
+        if _multimodal_busy():
+            return JSONResponse({"error": "Stop the combined preview before changing hand controls."}, status_code=409)
         gestures = _state["gestures"]
         if gestures.status()["state"] not in ("off", "error", "unavailable"):
             return JSONResponse({"error": "Stop the camera before changing hand controls."}, status_code=409)
@@ -2241,6 +2283,64 @@ async def brainbit_operation(operation: str, request: Request):
     await _broadcast({"type": "brainbit_status", **info})
     return JSONResponse({**info, **({"error": error} if error else {})},
                         status_code=503 if error else 200, headers=headers)
+
+
+def _multimodal_local_request(request):
+    return ("origin" not in request.headers
+            and request.headers.get("x-intuition-multimodal") == "1"
+            and request.headers.get("host", "").split(":", 1)[0]
+            in ("127.0.0.1", "localhost"))
+
+
+@app.get("/multimodal/status")
+@app.get("/multimodal/preview")
+async def multimodal_status(request: Request):
+    headers = {"Cache-Control": "no-store"}
+    if not _multimodal_local_request(request):
+        return JSONResponse({"error": "Combined preview is only available through the local HUD."},
+                            status_code=403, headers=headers)
+    preview = _state.get("multimodal")
+    # Raw frames and samples have exactly one private, non-caching path. They
+    # never enter the action dispatcher, WebSocket broadcasts, or journal.
+    info = (preview.snapshot() if preview and request.url.path.endswith("/preview")
+            else _multimodal_info())
+    return JSONResponse(info, headers=headers)
+
+
+@app.post("/multimodal/{operation}")
+async def multimodal_operation(operation: str, request: Request):
+    headers = {"Cache-Control": "no-store"}
+    if not _multimodal_local_request(request):
+        return JSONResponse({"error": "Combined preview controls require the local HUD."},
+                            status_code=403, headers=headers)
+    if operation not in ("start", "stop", "contact", "arm", "calibrate", "reset_calibration"):
+        return JSONResponse({"error": "Unknown combined preview operation."}, status_code=404, headers=headers)
+    try:
+        payload = await request.json()
+    except (ValueError, UnicodeError):
+        payload = None
+    expected = {"enabled"} if operation == "arm" else {"label"} if operation == "calibrate" else set()
+    if (not isinstance(payload, dict) or set(payload) != expected
+            or (operation == "arm" and type(payload["enabled"]) is not bool)
+            or (operation == "calibrate" and payload["label"] not in ("left", "right"))):
+        return JSONResponse({"error": "Expected an enabled boolean, a left/right trial label, or an empty object for this operation."},
+                            status_code=400, headers=headers)
+    preview = _state.get("multimodal")
+    if preview is None:
+        return JSONResponse({**_multimodal_info(), "error": "Restart the backend to enable the combined preview."},
+                            status_code=503, headers=headers)
+    method = {"start": preview.start, "stop": preview.stop, "contact": preview.check_contact,
+              "arm": preview.arm, "calibrate": preview.mark_trial,
+              "reset_calibration": preview.reset_calibration}[operation]
+    args = (payload["enabled"],) if operation == "arm" else (payload["label"],) if operation == "calibrate" else ()
+    # Serialize acquisition starts against normal camera starts. Stop/disarm
+    # bypass that lock so they remain available during blocked SDK startup.
+    if operation in ("start", "contact"):
+        async with _state["gesture_lock"]:
+            outcome = await asyncio.to_thread(method, *args)
+    else:
+        outcome = await asyncio.to_thread(method, *args)
+    return JSONResponse(outcome, status_code=409 if outcome.get("error") else 200, headers=headers)
 
 
 @app.get("/health")

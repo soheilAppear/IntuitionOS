@@ -38,8 +38,8 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Test HUD and BrainBit interactions
-        run: node --test tests/hud_renderer_test.cjs tests/brainbit_renderer_test.cjs tests/brainbit_http_test.cjs
+      - name: Test HUD and BrainBit preview interactions
+        run: node --test tests/hud_renderer_test.cjs tests/brainbit_renderer_test.cjs tests/brainbit_http_test.cjs tests/multimodal_renderer_test.cjs tests/multimodal_http_test.cjs
 
       - name: Check the generated manifest is current
         # config/planner_schema.json is generated from the capability manifest.

@@ -2,7 +2,8 @@
 
 The HUD's **BrainBit** panel can discover nearby devices, connect to a selected
 headset, display its battery and firmware, and disconnect. It does not start EEG
-streams, record signals, update firmware, or control the desktop.
+streams. The separate, explicitly started [experimental combined preview](#experimental-eeg--camera-preview)
+can display live EEG and webcam frames. Neither panel records signals or updates firmware.
 
 ## Setup
 
@@ -55,7 +56,7 @@ Closing or restarting the backend closes its owned worker and connection.
 
 `plugins/brainbit.py` implements `HardwareDriver` and owns bounded JSON IPC,
 cached status, cancellation, and a revision counter. `brainbit_worker.py` alone
-loads the SDK and owns native scanner/sensor handles. SDK calls are limited to
+loads the SDK and owns native scanner/sensor handles. Public hardware actions are limited to
 discovery, connection, metadata, and disconnect. Device addresses and serial
 numbers are not returned to the HUD or action journal; selection IDs are opaque
 and expire when the worker closes.
@@ -84,3 +85,59 @@ Official references: [Python installation](https://sdk.brainbit.com/sdk2_python_
 [package](https://pypi.org/project/pyneurosdk2/),
 [connection API](https://sdk.brainbit.com/sdk2_sensor/),
 [BrainBit2](https://sdk.brainbit.com/brainbit-2-devices/).
+
+## Experimental EEG + camera preview
+
+This separate HUD panel is an exploratory movement experiment for **BrainBit2**.
+It displays mirrored webcam hand tracking next to four EEG channels, using
+approximate host arrival timing. It does not decode intentions: movement,
+muscle activity and electrode motion can all affect the signal. EEG never
+supplies the direction of a desktop action.
+
+1. Connect BrainBit in the connection panel. Wear it according to its manual;
+   keep it powered on and disconnect the charger if the device manual requires it.
+2. Turn off the normal Hand controls camera. Expand **EEG + camera preview**.
+3. Optionally choose **Check contacts** while preview is stopped. This acquires
+   resistance for up to five seconds, then stops. Contact and signal acquisition
+   are separate modes. Readings are historical and show their age, with no
+   validated good/bad cutoff. The versioned Python SDK defines these values as
+   ohms; its web documentation has conflicting units, noted in the panel.
+4. Choose **Start preview**. Opening the panel never starts either sensor.
+   Keep one hand visible and still briefly, then move it horizontally left or
+   right. Directions refer to the mirrored camera view. Return to a neutral
+   position between movements. EEG is shown in microvolts with descriptive
+   age, rate, counter-discontinuity, nonfinite-value and queue-drop diagnostics.
+5. For an exploratory calibration, choose a left or right trial and perform
+   that movement within three seconds. Each accepted trial needs matching
+   camera movement and fresh EEG. Features stay in memory, up to 64 trials;
+   raw signal windows are not retained in calibration. Collect balanced trials
+   across both directions. Evaluation uses a chronological held-out set and
+   needs at least six training and three held-out trials per class. Accuracy
+   and the baseline are descriptive movement/artifact correlations, not proof
+   of neural intent or generalization. Calibration never enables control.
+6. Desktop control is **off by default**. Only if desired, explicitly enable
+   **Arm webcam swipes**. Fresh webcam data determines left/right, while fresh
+   EEG is a required availability gate. A neutral reset, debounce and cooldown
+   limit repeated actions. Lost tracking, stale data or device failure disarms
+   the session. Safe Mode and the existing desktop capability gate still apply.
+7. Choose **Stop & disarm** when finished. It cancels startup/contact checking,
+   releases the preview camera and stops EEG. If native shutdown cannot be
+   confirmed, the panel reports the error and the worker is terminated.
+
+Frames and waveform samples are transient in memory and pass only between the
+local backend and HUD. There is no recording, export, cloud upload, model input,
+or raw-signal action logging. The waveform cache is bounded to five seconds and
+at most 250 display points per response; it is unsuitable for spectral analysis.
+Hiding the panel clears its displayed frames and pauses raw-data HTTP polling;
+acquisition continues until Stop, a device failure, or backend shutdown. Stop
+before leaving the experiment. Restarting the backend clears calibration.
+
+The private `/multimodal/preview` route carries raw display data. Other preview
+status/actions contain metadata only, and acquisition methods are excluded from
+the public hardware action schema. Browser-origin and non-loopback requests are
+rejected; this is not an authentication boundary against other local processes.
+
+Automated verification uses synthetic signals, fake sensors and fake camera
+frames. Live EEG acquisition, contact measurement and user-specific calibration
+require an explicit user-started hardware trial; passing the software tests does
+not establish working hardware synchronization or EEG intention decoding.

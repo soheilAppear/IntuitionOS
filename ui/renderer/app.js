@@ -32,6 +32,7 @@
 const { ipcRenderer } = require('electron');
 const { readCameraPreview } = require('./camera-preview.cjs');
 const { requestBrainbit } = require('./brainbit-http.cjs');
+const { createMultimodalPanel } = require('./multimodal-panel.cjs');
 
 const WS_URL = 'ws://127.0.0.1:7432/ws';
 const GESTURE_CONTROL_URL = 'http://127.0.0.1:7432/gestures';
@@ -287,6 +288,7 @@ function updateConnectionUI() {
   updateGestureUI();
   renderBrainbitUI();
   syncBrainbitPolling();
+  multimodalPanel.connectionChanged();
 }
 
 /** Change only the mode; a pending action still needs its own explicit answer. */
@@ -396,6 +398,9 @@ function handleMessage(msg) {
     case 'brainbit_status':
       onBrainbitStatus(msg);
       break;
+    case 'multimodal_status':
+      multimodalPanel.acceptStatus(msg);
+      break;
     case 'gesture':
       onGesture(msg);
       break;
@@ -448,6 +453,7 @@ function onStatus(msg) {
   if (msg.voice) onVoiceStatus(msg.voice);
   if (msg.gestures) onGestureStatus(msg.gestures);
   if (msg.brainbit) onBrainbitStatus(msg.brainbit);
+  if (msg.multimodal) multimodalPanel.acceptStatus(msg.multimodal);
   if (typeof msg.safe_mode === 'boolean') {
     safeMode = msg.safe_mode;
     if (safeMode === requestedSafeMode) requestedSafeMode = null;
@@ -832,6 +838,7 @@ function updateGestureUI() {
   }
   updateClickSoundUI();
   syncGesturePreview();
+  multimodalPanel.refreshControls();
   setTimeout(syncHeight, 16);
 }
 
@@ -1081,6 +1088,7 @@ function onBrainbitStatus(status) {
   brainbitReady = true;
   brainbitError = brainbitText(status.error);
   renderBrainbitUI();
+  multimodalPanel.refreshControls();
   return true;
 }
 
@@ -1713,5 +1721,10 @@ function esc(str) {
 }
 
 // ── Boot ──
+const multimodalPanel = createMultimodalPanel({ document, isConnected,
+  isCameraRunning: () => gestureStatus?.running === true || requestedGestures === true
+    || ['starting', 'stopping'].includes(gestureStatus?.state),
+  isBrainbitConnected: () => brainbitReady && brainbitStatus?.state === 'connected',
+  imageFactory: () => new Image(), onResize: () => setTimeout(syncHeight, 16) });
 connect();
 cmdInput.focus();

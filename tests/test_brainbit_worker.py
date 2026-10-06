@@ -142,6 +142,7 @@ def harness(worker_module):
             family_enum=FakeSensorFamily,
             state_enum=FakeSensorState,
             scan_seconds=0,
+            start_pump=False,
             **kwargs,
         )
         sessions.append(session)
@@ -285,6 +286,7 @@ def test_battery_and_connection_callbacks_update_public_status(harness):
     emitted.clear()
 
     sensor.batteryChanged(sensor, 29)
+    session._pump_once()
 
     assert session.snapshot()["device"]["battery"] == 29
     assert emitted
@@ -292,6 +294,7 @@ def test_battery_and_connection_callbacks_update_public_status(harness):
 
     sensor.state = FakeSensorState.StateOutOfRange
     sensor.sensorStateChanged(sensor, sensor.state)
+    session._pump_once()
 
     assert session.snapshot()["state"] != "connected"
     assert emitted[-1]["state"] != "connected"

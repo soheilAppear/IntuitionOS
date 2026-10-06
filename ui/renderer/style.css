@@ -276,6 +276,24 @@ html, body {
 .brainbit-device-info dt { color: #94a3b8; font-size: 10px; margin-bottom: 3px; }
 .brainbit-device-info dd { overflow-wrap: anywhere; user-select: text; }
 .brainbit-error[hidden], .brainbit-device-info[hidden] { display: none; }
+.multimodal-panel { border-top: 1px solid var(--border); color: #cbd5e1; font-size: 11px; -webkit-app-region: no-drag; }
+.multimodal-panel summary { padding: 7px 14px; color: #c4b5fd; cursor: pointer; }
+.multimodal-panel summary span { margin-left: 8px; color: #94a3b8; font-size: 10px; }
+.multimodal-body { padding: 2px 14px 12px; max-height: 490px; overflow-y: auto; }
+.multimodal-note, #multimodal-status, #multimodal-trial, .multimodal-error { font-size: 10px; line-height: 1.5; margin: 5px 0; overflow-wrap: anywhere; white-space: pre-line; }
+.multimodal-note { color: #94a3b8; }
+.multimodal-error, #multimodal-trial { color: #fde68a; }
+.multimodal-error[hidden] { display: none; }
+.multimodal-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 9px 0; }
+.multimodal-controls button { min-height: 28px; padding: 5px 8px; border: 1px solid rgba(148,163,184,.3); border-radius: 4px; background: #15212f; color: #e2e8f0; font: inherit; font-size: 10px; cursor: pointer; }
+.multimodal-controls label { display: flex; align-items: center; gap: 5px; color: #fde68a; font-size: 10px; }
+.multimodal-controls input { accent-color: #a78bfa; }
+.multimodal-controls :disabled { opacity: .5; cursor: default; }
+#multimodal-stop { border-color: rgba(251,191,36,.5); color: #fde68a; }
+.multimodal-panel summary:focus-visible, .multimodal-controls :focus-visible { outline: 2px solid #c4b5fd; outline-offset: 2px; }
+.multimodal-preview-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; margin-top: 10px; }
+.multimodal-preview-grid canvas { display: block; width: 100%; height: auto; background: #070e15; border: 1px solid rgba(148,163,184,.2); border-radius: 5px; }
+.multimodal-calibration { margin-top: 10px; padding-top: 9px; border-top: 1px solid rgba(148,163,184,.2); }
 .desktop-visibility-warning { display: flex; align-items: center; gap: 10px; padding: 8px 14px; color: #fde68a; background: rgba(251,191,36,.06); font-size: 10px; line-height: 1.5; }
 .desktop-visibility-warning[hidden] { display: none; }
 .desktop-visibility-warning button { flex-shrink: 0; padding: 4px 8px; color: #fde68a; border: 1px solid rgba(251,191,36,.4); border-radius: 4px; background: transparent; cursor: pointer; font: inherit; }
