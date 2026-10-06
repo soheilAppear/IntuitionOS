@@ -256,6 +256,26 @@ html, body {
 .gesture-preview-info small { margin-top: auto; color: #94a3b8; font-size: 9px; }
 #gesture-preview-model { color: #94a3b8; }
 #gesture-preview-reason { color: #fde68a; }
+.brainbit-panel { border-top: 1px solid var(--border); color: #cbd5e1; font-size: 11px; -webkit-app-region: no-drag; }
+.brainbit-panel summary { padding: 7px 14px; color: #a5f3fc; cursor: pointer; }
+.brainbit-panel summary span { margin-left: 8px; font-size: 10px; color: #94a3b8; }
+.brainbit-panel.connected summary span { color: #99f6e4; }
+.brainbit-panel.busy summary span { color: #fde68a; }
+.brainbit-body { padding: 2px 14px 12px; max-height: 260px; overflow-y: auto; }
+.brainbit-note { color: #94a3b8; font-size: 10px; line-height: 1.5; margin-bottom: 8px; overflow-wrap: anywhere; }
+.brainbit-status, .brainbit-error { line-height: 1.5; overflow-wrap: anywhere; }
+.brainbit-error { margin-top: 6px; color: #fde68a; }
+.brainbit-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 7px; margin-top: 10px; }
+.brainbit-controls label { display: flex; flex-direction: column; flex: 1 1 180px; gap: 4px; min-width: 0; font-size: 10px; }
+.brainbit-controls button, .brainbit-controls select { min-height: 28px; padding: 5px 8px; background: #15212f; border: 1px solid rgba(148,163,184,.3); border-radius: 4px; color: #e2e8f0; font: inherit; font-size: 10px; }
+.brainbit-controls select { width: 100%; min-width: 0; }
+.brainbit-controls button { cursor: pointer; }
+.brainbit-controls :disabled { opacity: .5; cursor: default; }
+.brainbit-panel summary:focus-visible, .brainbit-controls :focus-visible { outline: 2px solid #67e8f9; outline-offset: 2px; }
+.brainbit-device-info { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 14px; padding: 10px; margin-top: 10px; background: rgba(148,163,184,.055); border: 1px solid rgba(148,163,184,.12); border-radius: 5px; }
+.brainbit-device-info dt { color: #94a3b8; font-size: 10px; margin-bottom: 3px; }
+.brainbit-device-info dd { overflow-wrap: anywhere; user-select: text; }
+.brainbit-error[hidden], .brainbit-device-info[hidden] { display: none; }
 .desktop-visibility-warning { display: flex; align-items: center; gap: 10px; padding: 8px 14px; color: #fde68a; background: rgba(251,191,36,.06); font-size: 10px; line-height: 1.5; }
 .desktop-visibility-warning[hidden] { display: none; }
 .desktop-visibility-warning button { flex-shrink: 0; padding: 4px 8px; color: #fde68a; border: 1px solid rgba(251,191,36,.4); border-radius: 4px; background: transparent; cursor: pointer; font: inherit; }

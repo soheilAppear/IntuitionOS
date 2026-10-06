@@ -31,6 +31,7 @@
 
 const { ipcRenderer } = require('electron');
 const { readCameraPreview } = require('./camera-preview.cjs');
+const { requestBrainbit } = require('./brainbit-http.cjs');
 
 const WS_URL = 'ws://127.0.0.1:7432/ws';
 const GESTURE_CONTROL_URL = 'http://127.0.0.1:7432/gestures';
@@ -101,6 +102,16 @@ const confirmDeny = document.getElementById('confirm-deny');
 const correctionBar = document.getElementById('correction-bar');
 const correctionLabel = document.getElementById('correction-label');
 const correctionChoices = document.getElementById('correction-choices');
+const brainbitPanel = document.getElementById('brainbit-panel');
+const brainbitSummary = document.getElementById('brainbit-summary');
+const brainbitStatusText = document.getElementById('brainbit-status');
+const brainbitErrorText = document.getElementById('brainbit-error');
+const brainbitDevices = document.getElementById('brainbit-devices');
+const brainbitDiscover = document.getElementById('brainbit-discover');
+const brainbitConnect = document.getElementById('brainbit-connect');
+const brainbitDisconnect = document.getElementById('brainbit-disconnect');
+const brainbitRefresh = document.getElementById('brainbit-refresh');
+const brainbitDeviceInfo = document.getElementById('brainbit-device-info');
 
 // ── State ──
 let ws = null;
@@ -145,6 +156,18 @@ let inputRevision = 0;
 /** @type {ResolutionMessage|null} */
 let resolution = null;
 let selectedCorrection = null; // null explicitly keeps the original
+let brainbitStatus = null;
+let brainbitReady = false;
+let brainbitError = '';
+let brainbitAction = null;
+let brainbitActionId = 0;
+let brainbitGeneration = 0;
+let brainbitRevision = -1;
+let brainbitDeviceList = '';
+let brainbitPolling = false;
+let brainbitPollTimer = null;
+let brainbitReadId = 0;
+let brainbitReadInFlight = false;
 
 // ── IPC ──
 ipcRenderer.on('focus-input', () => cmdInput.focus());
@@ -211,6 +234,7 @@ function connect() {
     ++clickSoundRequestId;
     requestedGestures = null;
     gestureRequestId += 1;
+    resetBrainbitConnection();
     cmdInput.placeholder = 'Ask or command…';
     updateConnectionUI();
     if (connectionErrorVisible) {
@@ -261,6 +285,8 @@ function updateConnectionUI() {
   micBtn.title = !connected ? 'Voice unavailable: backend disconnected'
     : voiceStatusText || 'Voice input (Alt+V)';
   updateGestureUI();
+  renderBrainbitUI();
+  syncBrainbitPolling();
 }
 
 /** Change only the mode; a pending action still needs its own explicit answer. */
@@ -276,6 +302,7 @@ safeToggle.addEventListener('click', () => {
 
 function disconnected(socket) {
   if (socket !== ws) return;
+  resetBrainbitConnection();
   safeMode = null;
   requestedSafeMode = null;
   cameraMayBeRunning = cameraMayBeRunning || requestedGestures === true;
@@ -366,6 +393,9 @@ function handleMessage(msg) {
     case 'gesture_status':
       onGestureStatus(msg);
       break;
+    case 'brainbit_status':
+      onBrainbitStatus(msg);
+      break;
     case 'gesture':
       onGesture(msg);
       break;
@@ -417,6 +447,7 @@ function handleMessage(msg) {
 function onStatus(msg) {
   if (msg.voice) onVoiceStatus(msg.voice);
   if (msg.gestures) onGestureStatus(msg.gestures);
+  if (msg.brainbit) onBrainbitStatus(msg.brainbit);
   if (typeof msg.safe_mode === 'boolean') {
     safeMode = msg.safe_mode;
     if (safeMode === requestedSafeMode) requestedSafeMode = null;
@@ -1004,6 +1035,234 @@ async function applyGestureSettings(inputMode) {
 gestureSaveSettings.addEventListener('click', () => applyGestureSettings());
 handModeMouse.addEventListener('click', () => applyGestureSettings('mouse'));
 handModeDesktop.addEventListener('click', () => applyGestureSettings('desktop'));
+
+// BrainBit controls have their own status and request lifetime. Opening the
+// panel reads cached metadata; only these explicit buttons mutate a connection.
+const BRAINBIT_STATES = ['disabled', 'unavailable', 'disconnected', 'scanning',
+  'connecting', 'connected', 'disconnecting', 'error'];
+const BRAINBIT_LABELS = { disabled: 'Disabled', unavailable: 'Unavailable',
+  disconnected: 'Disconnected', scanning: 'Discovering devices', connecting: 'Connecting',
+  connected: 'Connected', disconnecting: 'Disconnecting', error: 'Needs attention' };
+const BRAINBIT_ACTION_LABELS = { discover: 'Discovering devices', connect: 'Connecting',
+  disconnect: 'Disconnecting', refresh: 'Refreshing status' };
+
+function brainbitText(value, fallback = '') {
+  return typeof value === 'string' && value.trim() ? value.slice(0, 400) : fallback;
+}
+
+function validBrainbitStatus(status) {
+  return status && BRAINBIT_STATES.includes(status.state)
+    && typeof status.available === 'boolean' && typeof status.busy === 'boolean'
+    && Array.isArray(status.devices)
+    && (status.device === null || (typeof status.device === 'object' && !Array.isArray(status.device)));
+}
+
+function resetBrainbitConnection() {
+  ++brainbitActionId;
+  ++brainbitGeneration;
+  ++brainbitReadId;
+  brainbitRevision = -1;
+  brainbitStatus = null;
+  brainbitReady = false;
+  brainbitAction = null;
+  brainbitError = '';
+  brainbitReadInFlight = false;
+  brainbitPolling = false;
+  clearTimeout(brainbitPollTimer);
+  brainbitPollTimer = null;
+}
+
+function onBrainbitStatus(status) {
+  if (!isConnected() || !validBrainbitStatus(status)) return false;
+  if (Number.isInteger(status.revision) && status.revision < brainbitRevision) return false;
+  if (Number.isInteger(status.revision)) brainbitRevision = status.revision;
+  ++brainbitGeneration;
+  brainbitStatus = status;
+  brainbitReady = true;
+  brainbitError = brainbitText(status.error);
+  renderBrainbitUI();
+  return true;
+}
+
+function renderBrainbitUI() {
+  const online = isConnected();
+  const known = online && brainbitReady && brainbitStatus !== null;
+  const state = known ? brainbitStatus.state : null;
+  const connected = state === 'connected';
+  const busy = known && (!!brainbitAction || brainbitStatus.busy
+    || ['scanning', 'connecting', 'disconnecting'].includes(state));
+  const usable = known && brainbitStatus.available && !['disabled', 'unavailable'].includes(state);
+  const label = !online ? 'Backend offline' : !known ? 'Status unavailable'
+    : BRAINBIT_ACTION_LABELS[brainbitAction] || BRAINBIT_LABELS[state];
+  brainbitSummary.textContent = label;
+  const statusText = !online
+    ? 'Backend offline. Device connection is unconfirmed; waiting for reconnection.'
+    : !known ? 'Waiting for current device status. Controls will return when the backend responds.'
+    : brainbitAction ? `${label}...`
+    : brainbitText(brainbitStatus.text, BRAINBIT_LABELS[state]);
+  // Repeated cached polls should not repeat identical live announcements.
+  if (brainbitStatusText.textContent !== statusText) brainbitStatusText.textContent = statusText;
+  brainbitStatusText.setAttribute('aria-busy', String(!!busy));
+  brainbitPanel.classList.toggle('connected', connected);
+  brainbitPanel.classList.toggle('busy', !!busy);
+  brainbitPanel.classList.toggle('unavailable', !known || ['disabled', 'unavailable', 'error'].includes(state));
+  if (brainbitErrorText.textContent !== brainbitError) brainbitErrorText.textContent = brainbitError;
+  brainbitErrorText.hidden = !brainbitError || !online;
+
+  const devices = (brainbitStatus?.devices || []).filter(device => device
+    && typeof device.id === 'string' && device.id).slice(0, 50);
+  const signature = JSON.stringify(devices.map(device => [device.id, device.name, device.family]));
+  // Do not rebuild identical options on every poll: keep selection and focus.
+  if (signature !== brainbitDeviceList) {
+    brainbitDeviceList = signature;
+    const selected = brainbitDevices.value;
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = devices.length ? 'Select a discovered device' : 'Discover devices first';
+    const options = devices.map((device, index) => {
+      const option = document.createElement('option');
+      option.value = device.id;
+      option.textContent = `${index + 1}. ${brainbitText(device.name, 'BrainBit')}`
+        + (brainbitText(device.family) ? ` (${brainbitText(device.family)})` : '');
+      return option;
+    });
+    brainbitDevices.replaceChildren(placeholder, ...options);
+    brainbitDevices.value = devices.some(device => device.id === selected) ? selected : '';
+  }
+  brainbitDiscover.disabled = !usable || busy || connected;
+  brainbitDevices.disabled = !usable || busy || connected || !devices.length;
+  brainbitConnect.disabled = !usable || busy || connected
+    || !devices.some(device => device.id === brainbitDevices.value);
+  brainbitDisconnect.disabled = !usable || brainbitAction === 'disconnect' || state === 'disconnecting'
+    || (!connected && !busy && !brainbitStatus?.device);
+  brainbitDisconnect.textContent = busy && !connected && brainbitAction !== 'disconnect'
+    && state !== 'disconnecting' ? 'Cancel / disconnect' : 'Disconnect';
+  brainbitRefresh.disabled = !usable || busy;
+  brainbitDeviceInfo.hidden = !connected;
+  const device = connected ? brainbitStatus.device : null;
+  document.getElementById('brainbit-name').textContent = device ? brainbitText(device.name, 'BrainBit') : '';
+  document.getElementById('brainbit-family').textContent = device ? brainbitText(device.family, 'Unknown') : '';
+  document.getElementById('brainbit-battery').textContent = device
+    ? Number.isFinite(device.battery) && device.battery >= 0 && device.battery <= 100
+      ? `${Math.round(device.battery)}%` : 'Unknown' : '';
+  document.getElementById('brainbit-firmware').textContent = device
+    ? brainbitText(device.firmware, 'Unknown') : '';
+  setTimeout(syncHeight, 16);
+}
+
+function failBrainbitRequest(message) {
+  ++brainbitGeneration;
+  brainbitReady = false;
+  brainbitAction = null;
+  brainbitError = message;
+  // Do not claim a device disconnected when only its status request failed.
+  // Selection can survive recovery, but device metadata and busy state cannot.
+  if (brainbitStatus) brainbitStatus = { ...brainbitStatus, device: null, busy: false };
+  renderBrainbitUI();
+}
+
+function failBrainbitAction(message, generation) {
+  const newerTerminalStatus = brainbitReady && generation !== brainbitGeneration
+    && !brainbitStatus.busy && !['scanning', 'connecting', 'disconnecting'].includes(brainbitStatus.state);
+  if (newerTerminalStatus) {
+    // A completed WS update is newer evidence than this older request's
+    // transport failure. Keep its connection state and report the uncertainty.
+    brainbitAction = null;
+    brainbitError = message;
+    renderBrainbitUI();
+  } else {
+    failBrainbitRequest(message);
+  }
+}
+
+function syncBrainbitPolling() {
+  const active = !!(brainbitPanel.open && document.hidden !== true && isConnected());
+  if (!active) {
+    if (brainbitPolling) {
+      ++brainbitReadId;
+      brainbitReadInFlight = false;
+    }
+    brainbitPolling = false;
+    clearTimeout(brainbitPollTimer);
+    brainbitPollTimer = null;
+    return;
+  }
+  if (!brainbitPolling) {
+    brainbitPolling = true;
+    pollBrainbitStatus();
+  }
+}
+
+async function pollBrainbitStatus() {
+  if (!brainbitPolling || brainbitReadInFlight) return;
+  brainbitPollTimer = null;
+  brainbitReadInFlight = true;
+  const readId = ++brainbitReadId;
+  const generation = brainbitGeneration;
+  try {
+    const response = await requestBrainbit('status');
+    if (readId !== brainbitReadId || generation !== brainbitGeneration || !isConnected()) return;
+    if (!response.ok || !validBrainbitStatus(response.data)) {
+      failBrainbitRequest(brainbitText(response.data?.error,
+        'Device status could not be confirmed. Waiting for the backend to recover.'));
+      return;
+    }
+    onBrainbitStatus(response.data);
+  } catch (_) {
+    if (readId === brainbitReadId && generation === brainbitGeneration && isConnected())
+      failBrainbitRequest('Device status could not be confirmed. Waiting for the backend to recover.');
+  } finally {
+    if (readId === brainbitReadId) {
+      brainbitReadInFlight = false;
+      if (brainbitPolling) brainbitPollTimer = setTimeout(pollBrainbitStatus, 1000);
+    }
+  }
+}
+
+async function runBrainbitAction(action) {
+  const button = { discover: brainbitDiscover, connect: brainbitConnect,
+    disconnect: brainbitDisconnect, refresh: brainbitRefresh }[action];
+  if (!button || button.disabled || !isConnected() || !brainbitReady) return;
+  // Disconnect is also cancellation. Supersede the old action's eventual reply.
+  const actionId = ++brainbitActionId;
+  const generation = ++brainbitGeneration;
+  brainbitAction = action;
+  brainbitError = '';
+  renderBrainbitUI();
+  try {
+    const response = await requestBrainbit(action, action === 'connect' ? brainbitDevices.value : undefined);
+    if (actionId !== brainbitActionId || !isConnected()) return;
+    if (!response.ok || !validBrainbitStatus(response.data)) {
+      failBrainbitAction(brainbitText(response.data?.error,
+        'Connection change could not be confirmed. Waiting for current device status.'), generation);
+      return;
+    }
+    brainbitAction = null;
+    // A newer WS snapshot wins over an unversioned HTTP snapshot. The next
+    // cached GET reconciles the final state if an intermediate event won.
+    if (Number.isInteger(response.data.revision) || generation === brainbitGeneration || !brainbitReady)
+      onBrainbitStatus(response.data);
+    renderBrainbitUI();
+  } catch (_) {
+    if (actionId === brainbitActionId && isConnected())
+      failBrainbitAction('Connection change could not be confirmed. Waiting for current device status.', generation);
+  } finally {
+    if (actionId === brainbitActionId && brainbitPolling && !brainbitReadInFlight) {
+      clearTimeout(brainbitPollTimer);
+      pollBrainbitStatus();
+    }
+  }
+}
+
+brainbitPanel.addEventListener('toggle', () => { syncBrainbitPolling(); setTimeout(syncHeight, 16); });
+// Native select type-ahead must not trigger the HUD's M/T command shortcuts.
+brainbitPanel.addEventListener('keydown', event => event.stopPropagation());
+document.addEventListener('visibilitychange', syncBrainbitPolling);
+brainbitDevices.addEventListener('change', renderBrainbitUI);
+brainbitDiscover.addEventListener('click', () => runBrainbitAction('discover'));
+brainbitConnect.addEventListener('click', () => runBrainbitAction('connect'));
+brainbitDisconnect.addEventListener('click', () => runBrainbitAction('disconnect'));
+brainbitRefresh.addEventListener('click', () => runBrainbitAction('refresh'));
 
 // Preview pulls reuse the recognizer's camera. Opening this panel never starts it.
 const HAND_CONNECTIONS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],

@@ -17,7 +17,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import yaml
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -61,6 +61,7 @@ from core.gestures import GestureRecognizer
 from core.hand_control import HandControls
 from core.hand_feedback import HandClickSound
 from core.voice import VoiceRecognizer
+from plugins.brainbit import BrainBit
 
 # Shared services are created during lifespan, rather than per HUD connection.
 _state: dict = {}
@@ -111,7 +112,33 @@ async def _broadcast_status():
         "safe_mode": is_safe_mode(),
         "tasks_count": len(_state["mem"].list_open()),
         "gestures": _gesture_info(),
+        "brainbit": _brainbit_info(),
     })
+
+
+def _brainbit_info():
+    driver = _state.get("brainbit")
+    if driver is None:
+        return {"state": "disabled", "available": False, "busy": False,
+                "devices": [], "device": None, "text": "BrainBit is disabled."}
+    return driver.status()
+
+
+async def _poll_brainbit(driver):
+    """Refresh connected-device metadata off the event loop; never reconnect."""
+    previous = None
+    next_refresh = 0.0
+    while True:
+        info = driver.status()
+        if (info.get("state") == "connected" and not info.get("busy")
+                and time.monotonic() >= next_refresh):
+            await asyncio.to_thread(driver.call, "status", refresh=True)
+            next_refresh = time.monotonic() + 3.0
+            info = driver.status()
+        if info != previous:
+            await _broadcast({"type": "brainbit_status", **info})
+            previous = info
+        await asyncio.sleep(1)
 
 
 def _safe_mode_sink(loop):
@@ -390,6 +417,14 @@ async def lifespan(app: FastAPI):
 
             register_driver(CPUInfo())
 
+    # Construction only probes package availability. Discovery and connection
+    # remain explicit, and each native session belongs to an isolated worker.
+    brainbit_cfg = next((d for d in cfg.get("hardware", {}).get("drivers", [])
+                        if d.get("name") == "brainbit"), {})
+    brainbit = BrainBit(enabled=brainbit_cfg.get("enabled", False))
+    from core.actions import register_driver
+    register_driver(brainbit)
+
     # ── Prediction ───────────────────────────────────────────────────────
     # The four literals that used to live here (0.9, 0.9, 0.85, 0.65) were never
     # compared to anything, so they could not be wrong. The predictor learns from
@@ -572,6 +607,7 @@ async def lifespan(app: FastAPI):
             "voice": voice,
             "voice_status": voice_status,
             "voice_owner": None,
+            "brainbit": brainbit,
             "episodes": episodes,
             "sensor": sensor,
             "predictor": predictor,
@@ -605,7 +641,16 @@ async def lifespan(app: FastAPI):
 
         threading.Thread(target=_preload, daemon=True, name="whisper-preload").start()
 
-    yield
+    brainbit_task = asyncio.create_task(_poll_brainbit(brainbit))
+    try:
+        yield
+    finally:
+        brainbit_task.cancel()
+        # close() also cancels a blocked connect/refresh; do not await an
+        # abandoned native operation before terminating its owned worker.
+        await asyncio.to_thread(brainbit.close)
+        with suppress(asyncio.CancelledError):
+            await brainbit_task
 
     # Read replaceable services from _state: /forget may have replaced the
     # initial predictor/anticipator while this lifespan was active.
@@ -1867,6 +1912,7 @@ async def ws_endpoint(ws: WebSocket):
             "version": "1.0",
             "voice": _voice_info(),
             "gestures": _gesture_info(),
+            "brainbit": _brainbit_info(),
         }
     )
 
@@ -2139,6 +2185,62 @@ async def gesture_settings(request: Request):
             return JSONResponse(result, status_code=409)
         _state["gesture_settings"] = {**_state.get("gesture_settings", {}), **payload}
     return {"gestures": await _broadcast_gesture_status()}
+
+
+def _brainbit_local_request(request):
+    # Native HUD HTTP omits Origin. A web page cannot forge that omission plus
+    # this header, including through the existing permissive CORS middleware.
+    return ("origin" not in request.headers
+            and request.headers.get("x-intuition-brainbit") == "1"
+            and request.headers.get("host", "").split(":", 1)[0]
+            in ("127.0.0.1", "localhost"))
+
+
+@app.get("/brainbit/status")
+async def brainbit_status(request: Request):
+    if not _brainbit_local_request(request):
+        return JSONResponse({"error": "BrainBit status is only available through the local HUD."},
+                            status_code=403, headers={"Cache-Control": "no-store"})
+    return JSONResponse(_brainbit_info(), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/brainbit/{operation}")
+async def brainbit_operation(operation: str, request: Request):
+    """Keep manual connection controls responsive during model or SDK work."""
+    headers = {"Cache-Control": "no-store"}
+    if not _brainbit_local_request(request):
+        return JSONResponse({"error": "BrainBit controls are only available through the local HUD."},
+                            status_code=403, headers=headers)
+    if operation not in ("discover", "connect", "disconnect", "refresh"):
+        return JSONResponse({"error": "Unknown BrainBit operation."}, status_code=404, headers=headers)
+    try:
+        payload = await request.json()
+    except (ValueError, UnicodeError):
+        payload = None
+    expected = {"device_id"} if operation == "connect" else set()
+    if (not isinstance(payload, dict) or set(payload) != expected
+            or (operation == "connect" and (not isinstance(payload["device_id"], str)
+                or not 1 <= len(payload["device_id"]) <= 128))):
+        return JSONResponse({**_brainbit_info(), "error": "Select a discovered device." if
+                             operation == "connect" else "Expected an empty JSON object."},
+                            status_code=400, headers=headers)
+    driver = _state.get("brainbit")
+    if driver is None or _brainbit_info().get("state") == "disabled":
+        return JSONResponse({**_brainbit_info(), "error": "BrainBit is disabled in config.yaml."},
+                            status_code=503, headers=headers)
+    action = "status" if operation == "refresh" else operation
+    args = {"refresh": True} if operation == "refresh" else payload
+    # All user operations retain the shared schema, gate and journal boundary.
+    outcome = await asyncio.to_thread(actions.dispatch, "hw_call",
+                                     {"device": "brainbit", "action": action, "args": args},
+                                     actor="user")
+    info = driver.status()
+    error = outcome.get("error") or (outcome.get("result") or {}).get("error")
+    if outcome.get("needs_confirmation"):
+        error = "BrainBit operation requires confirmation through the command interface."
+    await _broadcast({"type": "brainbit_status", **info})
+    return JSONResponse({**info, **({"error": error} if error else {})},
+                        status_code=503 if error else 200, headers=headers)
 
 
 @app.get("/health")

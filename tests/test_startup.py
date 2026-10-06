@@ -70,6 +70,41 @@ def test_the_server_starts_and_stops_cleanly(app_dir):
         assert state.get(key) is not None, f"startup did not provide {key!r}"
 
 
+@pytest.mark.parametrize("abort", [False, True])
+def test_brainbit_stays_idle_at_startup_and_closes_on_lifespan_exit(app_dir, monkeypatch, abort):
+    from interface import server
+    from plugins import brainbit
+
+    path = app_dir / "config" / "config.yaml"
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+    cfg["hardware"] = {"drivers": [{"name": "brainbit", "enabled": True}]}
+    path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    monkeypatch.setattr(brainbit.importlib.util, "find_spec", lambda name: object())
+
+    def unexpected_worker(*args, **kwargs):
+        pytest.fail("Booting the app must not open a native BrainBit worker")
+
+    monkeypatch.setattr(brainbit, "_WorkerClient", unexpected_worker)
+
+    async def boot():
+        try:
+            async with server.lifespan(server.app):
+                driver = server._state["brainbit"]
+                assert driver.status()["state"] == "disconnected"
+                assert driver._worker is None
+                if abort:
+                    raise RuntimeError("test lifespan cancellation")
+        except RuntimeError:
+            assert abort
+        finally:
+            # Older unrelated services do not have exceptional-exit cleanup.
+            server._state["ant"].stop()
+            server._state["sched"].stop()
+        assert driver.status()["state"] == "disabled"
+
+    asyncio.run(boot())
+
+
 def test_startup_registers_the_os_capabilities_with_a_declared_cost(app_dir):
     from core.capabilities import capabilities
     from interface import server

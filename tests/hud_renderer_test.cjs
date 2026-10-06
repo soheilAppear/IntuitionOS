@@ -46,6 +46,7 @@ function renderer({ connected = true } = {}) {
   document.createTextNode = text => Object.assign(new Element('#text'), { textContent: text });
   const sent = [];
   const cameraRequests = [];
+  const brainbitRequests = [];
   const sockets = [];
   const timers = [];
   const ipcHandlers = {};
@@ -69,6 +70,9 @@ function renderer({ connected = true } = {}) {
       : name === './camera-preview.cjs' ? { readCameraPreview: () => new Promise((resolve, reject) => {
         cameraRequests.push({ url: 'http://127.0.0.1:7432/gestures/preview', method: 'GET',
           resolve: async response => response.ok ? resolve(await response.json()) : reject(new Error('Unavailable')), reject });
+      }) }
+      : name === './brainbit-http.cjs' ? { requestBrainbit: (action, deviceId) => new Promise((resolve, reject) => {
+        brainbitRequests.push({ action, deviceId, resolve, reject });
       }) }
       : require(name),
     setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
@@ -99,7 +103,7 @@ function renderer({ connected = true } = {}) {
     sockets.at(-1).open();
   };
   return {
-    elements, sent, context, input, change, key, message, show, reconnect, sockets, cameraRequests, images, drawing, timers,
+    elements, sent, context, input, change, key, message, show, reconnect, sockets, cameraRequests, brainbitRequests, images, drawing, timers,
     voiceToggle: () => ipcHandlers['voice-toggle'](),
     nativeMessage: (name, value) => ipcHandlers[name]({}, value), ipcSent,
     get socket() { return sockets.at(-1); },

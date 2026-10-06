@@ -37,6 +37,9 @@ The [branch consolidation report](docs/2026-09-07-main-consolidation.md) records
 the merge into `main` and subsequent bug fixes. The original 2025 prototype is
 preserved in the [historical archive](archive/README.md).
 
+For optional BrainBit headset discovery, connection, battery and firmware status,
+see the [BrainBit setup and connection guide](docs/brainbit.md).
+
 ---
 
 ## Two interfaces

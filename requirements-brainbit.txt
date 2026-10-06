@@ -1,0 +1,2 @@
+# Optional connection/status support in the project virtual environment.
+pyneurosdk2==1.0.15

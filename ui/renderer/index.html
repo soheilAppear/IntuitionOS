@@ -151,6 +151,33 @@
       </div>
     </details>
 
+    <details class="brainbit-panel" id="brainbit-panel">
+      <summary>BrainBit <span id="brainbit-summary">Waiting for backend</span></summary>
+      <div class="brainbit-body">
+        <p class="brainbit-note">Connection and device status only</p>
+        <p class="brainbit-note">Windows Bluetooth LE. The SDK does not identify the radio or dongle.</p>
+        <div class="brainbit-status" id="brainbit-status" role="status" aria-live="polite">Waiting for backend.</div>
+        <div class="brainbit-error" id="brainbit-error" role="alert" hidden></div>
+        <div class="brainbit-controls">
+          <button id="brainbit-discover" type="button" disabled>Discover devices</button>
+          <label for="brainbit-devices">Device
+            <select id="brainbit-devices" disabled>
+              <option value="">Discover devices first</option>
+            </select>
+          </label>
+          <button id="brainbit-connect" type="button" disabled>Connect</button>
+          <button id="brainbit-disconnect" type="button" disabled>Disconnect</button>
+          <button id="brainbit-refresh" type="button" disabled>Refresh status</button>
+        </div>
+        <dl class="brainbit-device-info" id="brainbit-device-info" hidden>
+          <div><dt>Name</dt><dd id="brainbit-name"></dd></div>
+          <div><dt>Family</dt><dd id="brainbit-family"></dd></div>
+          <div><dt>Battery</dt><dd id="brainbit-battery"></dd></div>
+          <div><dt>Firmware</dt><dd id="brainbit-firmware"></dd></div>
+        </dl>
+      </div>
+    </details>
+
     <!-- Full command candidates are shown before submission. -->
     <div class="correction-bar" id="correction-bar" aria-live="polite">
       <div class="correction-label" id="correction-label"></div>
