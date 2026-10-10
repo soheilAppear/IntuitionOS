@@ -941,6 +941,90 @@ def test_navigation_reset_requires_fresh_pointing_before_real_mouse_movement_res
     assert all(event[0] == "move" for event in events)
 
 
+@pytest.mark.parametrize("phase", ["click", "drag", "too_short"])
+def test_open_hand_pinch_release_finishes_before_four_finger_navigation(phase):
+    from core.hand_mouse import HandMouseController
+
+    events, clicks, motions, progress = [], [], [], []
+    device = SimpleNamespace(
+        position=lambda: (0.5, 0.5), blocked=lambda **_: None,
+        move=lambda x, y: events.append(("move", x, y)),
+        left_down=lambda: events.append(("down",)),
+        left_up=lambda: events.append(("up",)))
+    mouse = HandMouseController(device_factory=lambda: device)
+    recognizer = g.GestureRecognizer(input_mode="mouse", mouse_factory=lambda: mouse,
+                                     on_click=clicks.append, on_motion=motions.append,
+                                     on_progress=progress.append)
+    point = _hand(True, False, False, False)
+    point[7] = (point[6][0], (point[6][1] + point[8][1]) / 2, 0)
+    for at in (0.0, 0.1, 0.21):
+        recognizer._handle(point, at)
+    assert progress[-1]["state"] == "mouse_pointer"
+    pinch = _hand(pinch=True)
+    recognizer._handle(pinch, 0.25)
+    assert progress[-1]["state"] == "mouse_pinch"
+    release_at = 0.28 if phase == "too_short" else 0.38
+    if phase != "too_short":
+        if phase == "drag":
+            recognizer._handle(pinch, 0.5)
+            recognizer._handle(pinch, 0.61)
+            assert progress[-1]["state"] == "mouse_dragging"
+            release_at = 0.75
+        # This separation is already a navigation pose, but remains inside
+        # the mouse pinch's release hysteresis. It must keep mouse ownership.
+        opening = list(pinch)
+        opening[4] = (opening[8][0] + g.hand_scale(opening) * 0.5,
+                      opening[8][1], 0)
+        assert g.is_navigation_pose(opening)
+        recognizer._handle(opening, release_at - 0.05)
+        assert not recognizer.navigation_active
+        assert clicks == []
+    released = _hand()
+    assert g.is_navigation_pose(released)
+    recognizer._handle(released, release_at)
+    assert not recognizer.navigation_active
+    assert [event[0] for event in events if event[0] != "move"] == (
+        [] if phase == "too_short" else ["down", "up"])
+    assert [event["source"] for event in clicks] == (["pinch"] if phase == "click" else [])
+    assert motions == []
+    # Four fingers can begin their normal fresh hold on the next frame.
+    before = list(events)
+    recognizer._handle(released, release_at + 0.04)
+    assert recognizer.navigation_active
+    assert progress[-1]["state"] == "arming"
+    assert events == before
+
+
+def test_open_hand_pinch_release_failure_blocks_navigation():
+    from core.hand_mouse import HandMouseController
+
+    events, clicks, motions = [], [], []
+
+    def failed_release():
+        events.append("up")
+        raise OSError("left button still held")
+
+    device = SimpleNamespace(
+        position=lambda: (0.5, 0.5), blocked=lambda **_: None,
+        move=lambda *_: None, left_down=lambda: events.append("down"),
+        left_up=failed_release)
+    mouse = HandMouseController(device_factory=lambda: device)
+    recognizer = g.GestureRecognizer(input_mode="mouse", mouse_factory=lambda: mouse,
+                                     on_click=clicks.append, on_motion=motions.append)
+    point = _hand(True, False, False, False)
+    point[7] = (point[6][0], (point[6][1] + point[8][1]) / 2, 0)
+    for at in (0.0, 0.1, 0.21):
+        recognizer._handle(point, at)
+    recognizer._handle(_hand(pinch=True), 0.25)
+    for at in (0.35, 0.40, 0.65):
+        recognizer._handle(_hand(), at)
+        assert not recognizer.navigation_active
+    assert events[0] == "down"
+    assert events.count("down") == 1
+    assert "left button still held" in recognizer._mouse_error
+    assert clicks == motions == []
+
+
 def test_successful_mouse_click_feedback_is_discrete_deduplicated_and_not_progress_throttled():
     mouse = _FakeMouseController()
     result = {"state": "mouse_clicked", "progress": 1.0, "hint": "Clicked",

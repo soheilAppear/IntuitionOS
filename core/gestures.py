@@ -1193,7 +1193,10 @@ class GestureRecognizer:
             self._report_mouse_progress({"state": "error", "progress": 0.0,
                                          "hint": self._mouse_error}, now)
             return
-        if is_navigation_pose(points):
+        # An open hand can be the release frame of a mouse pinch. Let its
+        # controller finish that click/drag before four fingers take over on a
+        # later frame; otherwise navigation discards the release every time.
+        if is_navigation_pose(points) and not getattr(self._mouse, "pinching", False):
             self._handle_mouse_navigation(points, now)
             return
         try:
@@ -1222,8 +1225,8 @@ class GestureRecognizer:
     def _handle_mouse_navigation(self, points, now: float) -> None:
         """Four fingers temporarily own the hand; no mouse or window actions mix in."""
         if not self._navigation_active:
-            # Even a pending pinch must be cancelled before native navigation
-            # starts. Releasing four fingers later requires fresh pointing.
+            # Release any pointer input before native navigation starts.
+            # Releasing four fingers later requires fresh pointing.
             self._reset_controls(now, "navigation_started")
             if self._mouse_error:
                 return

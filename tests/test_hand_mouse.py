@@ -99,6 +99,15 @@ def pinch_distance(distance):
     return points
 
 
+def relaxed_pinch(distance=0.05):
+    # Thumb meets a curled fingertip near the palm while the proximal index
+    # stays raised. Opening the thumb does not straighten the index.
+    points = hand("hook")
+    points[7], points[8] = [0.47, 0.51, 0], [0.48, 0.61, 0]
+    points[4] = [points[8][0] - distance * 0.2, points[8][1], 0]
+    return points
+
+
 def test_constructor_reset_and_unarmed_poses_create_no_device():
     created = []
     controller = HandMouseController(device_factory=lambda: created.append(True))
@@ -160,6 +169,79 @@ def test_pinch_hysteresis_prevents_chattering(mouse):
     assert buttons(device) == []
     controller.update(hand(), 0.38)
     assert buttons(device) == ["down", "up"]
+
+
+def test_curled_index_pinch_clicks_on_thumb_release_without_pointer_jump(mouse):
+    controller, device = mouse
+    arm(controller)
+    before = list(device.events)
+    assert controller.update(relaxed_pinch(), 0.25)["state"] == "mouse_pinch"
+    assert controller.update(relaxed_pinch(0.45), 0.30)["state"] == "mouse_pinch"
+    result = controller.update(relaxed_pinch(0.7), 0.35)
+    assert result["click_source"] == "pinch"
+    assert device.events == before + [("down",), ("up",)]
+
+
+def test_pinch_release_does_not_require_a_pointing_pose(mouse):
+    controller, device = mouse
+    arm(controller)
+    controller.update(hand("pinch"), 0.25)
+    result = controller.update(hand("hook"), 0.35)
+    assert result["click_source"] == "pinch"
+    assert buttons(device) == ["down", "up"]
+
+
+def test_separated_relaxed_fingers_rearm_pinch_without_bend_click(mouse):
+    controller, device = mouse
+    arm(controller)
+    controller.update(hand("pinch"), 0.25)
+    assert controller.update(hand(), 0.35)["click_id"] == 1
+    for at in (0.40, 0.48, 0.57):
+        result = controller.update(hand("hook"), at)
+        assert "click_id" not in result
+        assert "straighten" not in result["hint"].lower()
+    controller.update(hand("pinch"), 0.61)
+    assert controller.update(hand("hook"), 0.71)["click_id"] == 2
+    assert buttons(device) == ["down", "up", "down", "up"]
+
+
+def test_brief_separation_does_not_rearm_a_relaxed_pinch(mouse):
+    controller, device = mouse
+    arm(controller)
+    controller.update(relaxed_pinch(), 0.25)
+    assert controller.update(relaxed_pinch(0.7), 0.35)["click_id"] == 1
+    for at, distance in ((0.39, 0.7), (0.44, 0.05), (0.50, 0.7),
+                         (0.58, 0.05), (0.68, 0.7)):
+        assert "click_id" not in controller.update(relaxed_pinch(distance), at)
+    assert buttons(device) == ["down", "up"]
+
+
+def test_curled_pinch_drag_releases_without_a_point_or_extra_click(mouse):
+    controller, device = mouse
+    arm(controller)
+    controller.update(relaxed_pinch(), 0.25)
+    controller.update(relaxed_pinch(), 0.45)
+    assert controller.update(relaxed_pinch(), 0.61)["state"] == "mouse_dragging"
+    result = controller.update(relaxed_pinch(0.7), 0.70)
+    assert result["state"] == "mouse_pointer"
+    assert "click_id" not in result
+    assert buttons(device) == ["down", "up"]
+
+
+@pytest.mark.parametrize("held", [False, True])
+@pytest.mark.parametrize("thumb_separated", [False, True])
+def test_curled_pinch_to_fist_cancels_without_click(mouse, held, thumb_separated):
+    controller, device = mouse
+    arm(controller)
+    controller.update(relaxed_pinch(), 0.25)
+    controller.update(relaxed_pinch(), 0.45)
+    if held:
+        controller.update(relaxed_pinch(), 0.61)
+    fist = hand("fist")
+    if thumb_separated:
+        fist[4] = [0.25, 0.61, 0]
+    assert controller.update(fist, 0.70)["state"] == "mouse_paused"
+    assert buttons(device) == (["down", "up"] if held else [])
 
 
 def test_gradual_pinch_keeps_arming_and_clicks_once_after_release(mouse):

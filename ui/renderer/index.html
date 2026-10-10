@@ -151,6 +151,92 @@
       </div>
     </details>
 
+    <details class="brainbit-panel" id="brainbit-panel">
+      <summary>BrainBit <span id="brainbit-summary">Waiting for backend</span></summary>
+      <div class="brainbit-body">
+        <p class="brainbit-note">Connection and device status only</p>
+        <p class="brainbit-note">Windows Bluetooth LE. The SDK does not identify the radio or dongle.</p>
+        <div class="brainbit-status" id="brainbit-status" role="status" aria-live="polite">Waiting for backend.</div>
+        <div class="brainbit-error" id="brainbit-error" role="alert" hidden></div>
+        <div class="brainbit-controls">
+          <button id="brainbit-discover" type="button" disabled>Discover devices</button>
+          <label for="brainbit-devices">Device
+            <select id="brainbit-devices" disabled>
+              <option value="">Discover devices first</option>
+            </select>
+          </label>
+          <button id="brainbit-connect" type="button" disabled>Connect</button>
+          <button id="brainbit-disconnect" type="button" disabled>Disconnect</button>
+          <button id="brainbit-refresh" type="button" disabled>Refresh status</button>
+        </div>
+        <dl class="brainbit-device-info" id="brainbit-device-info" hidden>
+          <div><dt>Name</dt><dd id="brainbit-name"></dd></div>
+          <div><dt>Family</dt><dd id="brainbit-family"></dd></div>
+          <div><dt>Battery</dt><dd id="brainbit-battery"></dd></div>
+          <div><dt>Firmware</dt><dd id="brainbit-firmware"></dd></div>
+        </dl>
+      </div>
+    </details>
+
+    <details class="multimodal-panel" id="multimodal-panel">
+      <summary>Experimental hand + EEG <span id="multimodal-summary">Stopped / disarmed</span></summary>
+      <div class="multimodal-body">
+        <p class="multimodal-note">No recordings saved; stays on this desktop. EEG classification is experimental, may learn movement or muscle artifacts, and is not thought reading.</p>
+        <p class="multimodal-note">The camera labels and checks guided trials; the EEG classifier uses EEG-only features and inference. Prediction alone does not control the desktop. Alignment uses approximate host timestamps, not native sensor timestamps.</p>
+        <div id="multimodal-status" role="status" aria-live="polite">Open to check preview status.</div>
+        <div id="multimodal-error" class="multimodal-error" role="alert" hidden></div>
+        <div class="multimodal-controls">
+          <button type="button" id="multimodal-start" disabled>Start preview</button>
+          <button type="button" id="multimodal-stop" disabled title="Emergency stop while the HUD has focus (Escape)">Stop &amp; disarm (Esc)</button>
+          <button type="button" id="multimodal-contact" disabled>Contact check (5 s)</button>
+          <label for="multimodal-control-mode">Control source <select id="multimodal-control-mode" disabled><option value="webcam">Webcam direction</option><option value="eeg">EEG classifier</option></select></label>
+          <label><input type="checkbox" id="multimodal-arm" disabled> Arm webcam swipes</label>
+          <label><input type="checkbox" id="multimodal-eeg-arm" disabled> Arm EEG swipes</label>
+        </div>
+        <div id="multimodal-control-status" class="multimodal-note" role="status" aria-live="polite">Prediction only. Both desktop controls are disarmed.</div>
+        <div id="multimodal-prediction" class="multimodal-prediction">EEG prediction unavailable.</div>
+        <p class="multimodal-note" id="multimodal-start-hint">Connect BrainBit and stop the normal hand camera before starting. Desktop swipes begin only after you explicitly arm them.</p>
+        <div class="multimodal-preview-grid">
+          <div><canvas id="multimodal-camera" width="480" height="360" aria-label="Mirrored local hand camera preview"></canvas><div id="multimodal-camera-status" class="multimodal-note">Camera preview is off.</div></div>
+          <div><canvas id="multimodal-eeg" width="480" height="360" aria-label="EEG channels in microvolts, latest 250 samples, independent automatic scales"></canvas><div id="multimodal-eeg-status" class="multimodal-note">EEG preview is off.</div></div>
+        </div>
+        <div id="multimodal-motion" class="multimodal-note"></div>
+        <div id="multimodal-diagnostics" class="multimodal-note"></div>
+        <div id="multimodal-contact-status" class="multimodal-note">No contact precheck yet.</div>
+        <div class="multimodal-calibration" id="multimodal-eeg-calibration">
+          <b>Three-class EEG calibration</b>
+          <p class="multimodal-note">1. In Webcam direction mode, collect at least 8 training trials each for left, right, and rest. Then train and freeze the model. 2. Collect 8 new validation trials per class without retraining. Each trial is 3 seconds: hold still for the first half-second, move once during the middle 2 seconds for left/right, then hold still for the final half-second. For rest, stay still throughout. The camera checks labels only.</p>
+          <table class="multimodal-count-table" aria-label="EEG trial counts"><thead><tr><th scope="col">Phase</th><th scope="col">Left</th><th scope="col">Right</th><th scope="col">Rest</th></tr></thead><tbody><tr><th scope="row">Training</th><td id="multimodal-train-left">0 / 8</td><td id="multimodal-train-right">0 / 8</td><td id="multimodal-train-rest">0 / 8</td></tr><tr><th scope="row">Validation</th><td id="multimodal-validate-left">0 / 8</td><td id="multimodal-validate-right">0 / 8</td><td id="multimodal-validate-rest">0 / 8</td></tr></tbody></table>
+          <div class="multimodal-controls">
+            <label for="multimodal-eeg-phase">Trial phase <select id="multimodal-eeg-phase" disabled><option value="train">Training</option><option value="validate">Validation</option></select></label>
+            <button type="button" id="multimodal-eeg-left" disabled>Collect left trial</button>
+            <button type="button" id="multimodal-eeg-right" disabled>Collect right trial</button>
+            <button type="button" id="multimodal-eeg-rest" disabled>Collect rest trial</button>
+            <button type="button" id="multimodal-eeg-train" disabled>Train &amp; freeze model</button>
+            <button type="button" id="multimodal-eeg-reset" disabled>Reset EEG model &amp; trials</button>
+          </div>
+          <div id="multimodal-eeg-trial" role="status" aria-live="polite"></div>
+          <div id="multimodal-eeg-model-status" class="multimodal-note"></div>
+          <div id="multimodal-eeg-errors" class="multimodal-error" role="alert" hidden></div>
+          <div id="multimodal-eeg-evaluation" class="multimodal-note"></div>
+          <div id="multimodal-eeg-gates" class="multimodal-note"></div>
+          <p class="multimodal-note">Keep acquisition running after training and validation: switch from Webcam direction to EEG classifier without stopping or restarting. Restarting acquisition requires resetting and repeating calibration. Switching control source disarms both modes.</p>
+          <p class="multimodal-note">Validation uses new trials against the frozen model. Scores are uncalibrated model scores, not probabilities or intention measurements. Performance gates are engineering checks, not a safety guarantee. EEG swipes require passing validation in the current acquisition session and a separate explicit arm. While EEG controls are armed, Escape stops and disarms from any app; arming is blocked if that shortcut is unavailable.</p>
+        </div>
+        <div class="multimodal-calibration" hidden>
+          <b>Legacy two-class camera-correlated calibration</b>
+          <p class="multimodal-note">Keep your hand visible. Choose a trial, then make the requested webcam swipe within 3 seconds. Trials automatically disarm desktop swipes. Labels describe the movement, not mental intention.</p>
+          <div class="multimodal-controls">
+            <button type="button" id="multimodal-left" disabled>Add left trial</button>
+            <button type="button" id="multimodal-right" disabled>Add right trial</button>
+            <button type="button" id="multimodal-reset" disabled>Reset calibration</button>
+          </div>
+          <div id="multimodal-trial" role="status" aria-live="polite"></div>
+          <div id="multimodal-calibration-status" class="multimodal-note"></div>
+        </div>
+      </div>
+    </details>
+
     <!-- Full command candidates are shown before submission. -->
     <div class="correction-bar" id="correction-bar" aria-live="polite">
       <div class="correction-label" id="correction-label"></div>

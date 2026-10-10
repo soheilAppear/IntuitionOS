@@ -17,7 +17,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import yaml
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -60,7 +60,9 @@ from core.scheduler import Scheduler
 from core.gestures import GestureRecognizer
 from core.hand_control import HandControls
 from core.hand_feedback import HandClickSound
+from core.multimodal import MultimodalPreview
 from core.voice import VoiceRecognizer
+from plugins.brainbit import BrainBit
 
 # Shared services are created during lifespan, rather than per HUD connection.
 _state: dict = {}
@@ -111,7 +113,50 @@ async def _broadcast_status():
         "safe_mode": is_safe_mode(),
         "tasks_count": len(_state["mem"].list_open()),
         "gestures": _gesture_info(),
+        "brainbit": _brainbit_info(),
     })
+
+
+def _brainbit_info():
+    driver = _state.get("brainbit")
+    if driver is None:
+        return {"state": "disabled", "available": False, "busy": False,
+                "devices": [], "device": None, "text": "BrainBit is disabled."}
+    return driver.status()
+
+
+def _multimodal_info():
+    preview = _state.get("multimodal")
+    return preview.status() if preview else {
+        "state": "unavailable", "running": False, "armed": False,
+        "reason": "Restart the backend to enable the combined preview."}
+
+
+def _multimodal_busy():
+    info = _multimodal_info()
+    camera = _state.get("preview_camera")
+    return (info.get("state") in ("starting", "running", "contact", "stopping")
+            or bool(info.get("cleanup_pending"))
+            or (camera is not None and (camera.is_running()
+                or camera.status().get("state") in ("starting", "stopping")
+                or camera.status().get("tracker_cleanup_pending"))))
+
+
+async def _poll_brainbit(driver):
+    """Refresh connected-device metadata off the event loop; never reconnect."""
+    previous = None
+    next_refresh = 0.0
+    while True:
+        info = driver.status()
+        if (info.get("state") == "connected" and not info.get("busy")
+                and time.monotonic() >= next_refresh):
+            await asyncio.to_thread(driver.call, "status", refresh=True)
+            next_refresh = time.monotonic() + 3.0
+            info = driver.status()
+        if info != previous:
+            await _broadcast({"type": "brainbit_status", **info})
+            previous = info
+        await asyncio.sleep(1)
 
 
 def _safe_mode_sink(loop):
@@ -237,6 +282,9 @@ async def _change_gestures(enabled) -> dict:
     # Capture startup and shutdown can block on a camera driver. Serialize them
     # across HUDs while keeping the event loop free to send lifecycle events.
     async with _state["gesture_lock"]:
+        if enabled and _multimodal_busy():
+            return {"error": "Stop the combined EEG + camera preview before turning on Hand controls.",
+                    "status_code": 409}
         gestures = _state.get("gestures")
         if gestures is None:
             outcome = {"error": "Gesture recognition is unavailable."}
@@ -389,6 +437,14 @@ async def lifespan(app: FastAPI):
             from core.actions import register_driver
 
             register_driver(CPUInfo())
+
+    # Construction only probes package availability. Discovery and connection
+    # remain explicit, and each native session belongs to an isolated worker.
+    brainbit_cfg = next((d for d in cfg.get("hardware", {}).get("drivers", [])
+                        if d.get("name") == "brainbit"), {})
+    brainbit = BrainBit(enabled=brainbit_cfg.get("enabled", False))
+    from core.actions import register_driver
+    register_driver(brainbit)
 
     # ── Prediction ───────────────────────────────────────────────────────
     # The four literals that used to live here (0.9, 0.9, 0.85, 0.65) were never
@@ -557,6 +613,22 @@ async def lifespan(app: FastAPI):
         on_click=lambda event: _queue_mouse_click(loop, event),
     )
 
+    # Independent preview ownership: this camera has no input callbacks and
+    # empty gesture bindings. Only the explicitly armed service can dispatch.
+    preview_camera = GestureRecognizer(
+        camera_index=int(gesture_cfg.get("camera_index", 0)), bindings={},
+        input_mode="desktop", model_complexity=gesture_settings["model_complexity"],
+        tracker_backend=gesture_settings["tracker_backend"],
+    )
+    multimodal = MultimodalPreview(
+        preview_camera, brainbit,
+        gesture_busy=lambda: (gestures.is_running()
+            or gestures.status().get("state") in ("starting", "stopping")
+            or gestures.status().get("tracker_cleanup_pending", False)
+            or hand_controls.status().get("desktop", {}).get("cleanup_pending", False)),
+        dispatch=actions.dispatch,
+    )
+
     _state.update(
         {
             "cfg": cfg,
@@ -572,6 +644,9 @@ async def lifespan(app: FastAPI):
             "voice": voice,
             "voice_status": voice_status,
             "voice_owner": None,
+            "brainbit": brainbit,
+            "multimodal": multimodal,
+            "preview_camera": preview_camera,
             "episodes": episodes,
             "sensor": sensor,
             "predictor": predictor,
@@ -605,7 +680,17 @@ async def lifespan(app: FastAPI):
 
         threading.Thread(target=_preload, daemon=True, name="whisper-preload").start()
 
-    yield
+    brainbit_task = asyncio.create_task(_poll_brainbit(brainbit))
+    try:
+        yield
+    finally:
+        brainbit_task.cancel()
+        await asyncio.to_thread(multimodal.stop)
+        # close() also cancels a blocked connect/refresh; do not await an
+        # abandoned native operation before terminating its owned worker.
+        await asyncio.to_thread(brainbit.close)
+        with suppress(asyncio.CancelledError):
+            await brainbit_task
 
     # Read replaceable services from _state: /forget may have replaced the
     # initial predictor/anticipator while this lifespan was active.
@@ -1867,6 +1952,7 @@ async def ws_endpoint(ws: WebSocket):
             "version": "1.0",
             "voice": _voice_info(),
             "gestures": _gesture_info(),
+            "brainbit": _brainbit_info(),
         }
     )
 
@@ -2114,6 +2200,8 @@ async def gesture_settings(request: Request):
             or ("bend_click" in payload and type(payload["bend_click"]) is not bool)):
         return JSONResponse({"error": "Choose desktop or mouse controls, auto or shortcut desktop movement, hand travel from 0.8 to 3.0 palms, tracker mediapipe, rtmpose or wilor, MediaPipe model 0 (light) or 1 (full), and bend_click true or false."}, status_code=400)
     async with _state["gesture_lock"]:
+        if _multimodal_busy():
+            return JSONResponse({"error": "Stop the combined preview before changing hand controls."}, status_code=409)
         gestures = _state["gestures"]
         if gestures.status()["state"] not in ("off", "error", "unavailable"):
             return JSONResponse({"error": "Stop the camera before changing hand controls."}, status_code=409)
@@ -2139,6 +2227,145 @@ async def gesture_settings(request: Request):
             return JSONResponse(result, status_code=409)
         _state["gesture_settings"] = {**_state.get("gesture_settings", {}), **payload}
     return {"gestures": await _broadcast_gesture_status()}
+
+
+def _brainbit_local_request(request):
+    # Native HUD HTTP omits Origin. A web page cannot forge that omission plus
+    # this header, including through the existing permissive CORS middleware.
+    return ("origin" not in request.headers
+            and request.headers.get("x-intuition-brainbit") == "1"
+            and request.headers.get("host", "").split(":", 1)[0]
+            in ("127.0.0.1", "localhost"))
+
+
+@app.get("/brainbit/status")
+async def brainbit_status(request: Request):
+    if not _brainbit_local_request(request):
+        return JSONResponse({"error": "BrainBit status is only available through the local HUD."},
+                            status_code=403, headers={"Cache-Control": "no-store"})
+    return JSONResponse(_brainbit_info(), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/brainbit/{operation}")
+async def brainbit_operation(operation: str, request: Request):
+    """Keep manual connection controls responsive during model or SDK work."""
+    headers = {"Cache-Control": "no-store"}
+    if not _brainbit_local_request(request):
+        return JSONResponse({"error": "BrainBit controls are only available through the local HUD."},
+                            status_code=403, headers=headers)
+    if operation not in ("discover", "connect", "disconnect", "refresh"):
+        return JSONResponse({"error": "Unknown BrainBit operation."}, status_code=404, headers=headers)
+    try:
+        payload = await request.json()
+    except (ValueError, UnicodeError):
+        payload = None
+    expected = {"device_id"} if operation == "connect" else set()
+    if (not isinstance(payload, dict) or set(payload) != expected
+            or (operation == "connect" and (not isinstance(payload["device_id"], str)
+                or not 1 <= len(payload["device_id"]) <= 128))):
+        return JSONResponse({**_brainbit_info(), "error": "Select a discovered device." if
+                             operation == "connect" else "Expected an empty JSON object."},
+                            status_code=400, headers=headers)
+    driver = _state.get("brainbit")
+    if driver is None or _brainbit_info().get("state") == "disabled":
+        return JSONResponse({**_brainbit_info(), "error": "BrainBit is disabled in config.yaml."},
+                            status_code=503, headers=headers)
+    action = "status" if operation == "refresh" else operation
+    args = {"refresh": True} if operation == "refresh" else payload
+    # All user operations retain the shared schema, gate and journal boundary.
+    outcome = await asyncio.to_thread(actions.dispatch, "hw_call",
+                                     {"device": "brainbit", "action": action, "args": args},
+                                     actor="user")
+    info = driver.status()
+    error = outcome.get("error") or (outcome.get("result") or {}).get("error")
+    if outcome.get("needs_confirmation"):
+        error = "BrainBit operation requires confirmation through the command interface."
+    await _broadcast({"type": "brainbit_status", **info})
+    return JSONResponse({**info, **({"error": error} if error else {})},
+                        status_code=503 if error else 200, headers=headers)
+
+
+def _multimodal_local_request(request):
+    return ("origin" not in request.headers
+            and request.headers.get("x-intuition-multimodal") == "1"
+            and request.headers.get("host", "").split(":", 1)[0]
+            in ("127.0.0.1", "localhost"))
+
+
+@app.get("/multimodal/status")
+@app.get("/multimodal/preview")
+async def multimodal_status(request: Request):
+    headers = {"Cache-Control": "no-store"}
+    if not _multimodal_local_request(request):
+        return JSONResponse({"error": "Combined preview is only available through the local HUD."},
+                            status_code=403, headers=headers)
+    preview = _state.get("multimodal")
+    # Raw frames and samples have exactly one private, non-caching path. They
+    # never enter the action dispatcher, WebSocket broadcasts, or journal.
+    info = (preview.snapshot() if preview and request.url.path.endswith("/preview")
+            else _multimodal_info())
+    return JSONResponse(info, headers=headers)
+
+
+@app.post("/multimodal/{operation}")
+async def multimodal_operation(operation: str, request: Request):
+    headers = {"Cache-Control": "no-store"}
+    if not _multimodal_local_request(request):
+        return JSONResponse({"error": "Combined preview controls require the local HUD."},
+                            status_code=403, headers=headers)
+    operations = {"start": "start", "stop": "stop", "contact": "check_contact",
+                  "arm": "arm", "calibrate": "mark_trial", "reset_calibration": "reset_calibration",
+                  "control_mode": "set_control_mode", "eeg_trial": "eeg_trial",
+                  "eeg_train": "eeg_train", "eeg_reset": "eeg_reset",
+                  "eeg_arm": "eeg_arm", "eeg_guard": "eeg_guard"}
+    if operation not in operations:
+        return JSONResponse({"error": "Unknown combined preview operation."}, status_code=404, headers=headers)
+    try:
+        payload = await request.json()
+    except (ValueError, UnicodeError):
+        payload = None
+    expected = {"arm": {"enabled"}, "calibrate": {"label"}, "control_mode": {"mode"},
+                "eeg_trial": {"label", "phase"}, "eeg_arm": {"enabled"},
+                "eeg_guard": {"token"}}.get(operation, set())
+    if operation == "eeg_arm" and isinstance(payload, dict) and payload.get("enabled") is True:
+        expected = {"enabled", "guard_token"}
+    valid = isinstance(payload, dict) and set(payload) == expected
+    if valid and operation in ("arm", "eeg_arm"):
+        valid = type(payload["enabled"]) is bool
+    if valid and operation == "calibrate":
+        valid = payload["label"] in ("left", "right")
+    if valid and operation == "control_mode":
+        valid = payload["mode"] in ("webcam", "eeg")
+    if valid and operation == "eeg_trial":
+        valid = payload["label"] in ("left", "right", "rest") and payload["phase"] in ("train", "validate")
+    token = (payload.get("token") if operation == "eeg_guard" else payload.get("guard_token")) if valid else None
+    if valid and (operation == "eeg_guard" or operation == "eeg_arm" and payload["enabled"]):
+        # The token binds explicit arming to the desktop main process's live
+        # Escape shortcut lease. It is not authentication against local code.
+        valid = isinstance(token, str) and re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}", token) is not None
+    if not valid:
+        return JSONResponse({"error": "Invalid fields or values for this combined preview operation."},
+                            status_code=400, headers=headers)
+    preview = _state.get("multimodal")
+    if preview is None:
+        return JSONResponse({**_multimodal_info(), "error": "Restart the backend to enable the combined preview."},
+                            status_code=503, headers=headers)
+    method = getattr(preview, operations[operation])
+    args = ((payload["enabled"], payload.get("guard_token")) if operation == "eeg_arm" else
+            (payload["enabled"],) if operation == "arm" else
+            (payload["label"],) if operation == "calibrate" else
+            (payload["mode"],) if operation == "control_mode" else
+            (payload["label"], payload["phase"]) if operation == "eeg_trial" else
+            (payload["token"],) if operation == "eeg_guard" else ())
+    # Serialize acquisition starts against normal camera starts. Stop/disarm
+    # bypass that lock so they remain available during blocked SDK startup.
+    if operation in ("start", "contact"):
+        async with _state["gesture_lock"]:
+            outcome = await asyncio.to_thread(method, *args)
+    else:
+        outcome = await asyncio.to_thread(method, *args)
+    return JSONResponse(outcome, status_code=409 if outcome.get("error") else 200, headers=headers)
 
 
 @app.get("/health")

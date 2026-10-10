@@ -220,6 +220,12 @@ class HandMouseController:
     def close(self):
         return self.reset("Hand Mouse stopped")
 
+    @property
+    def pinching(self):
+        """Keep an active pinch/drag in mouse control through its release frame."""
+        with self._lock:
+            return self._pinch_since is not None
+
     def set_bend_click(self, enabled):
         if type(enabled) is not bool:
             raise ValueError("bend_click must be a boolean")
@@ -407,9 +413,11 @@ class HandMouseController:
         hook = (raised and distal_alignment is not None
                 and (extension <= 0.08 or distal_alignment <= self.DISTAL_BEND_ALIGNMENT))
         pinch_distance = math.dist(landmarks[4], tip) / scale
-        # A pinch can bend the index, but its tip must remain beyond the palm.
-        # A closed fist with thumb resting on index cannot begin/finish a click.
-        pinch_shape = (index_raised and math.dist(tip, wrist) > scale * 1.15
+        # Thumb contact naturally curls the fingertip back toward the palm.
+        # Keep the proximal index raised and the tip away from the wrist;
+        # requiring the tip beyond the palm rejects ordinary relaxed pinches.
+        # The full-fist check below still cancels instead of clicking.
+        pinch_shape = (index_raised and math.dist(tip, wrist) > scale * 0.80
                        and math.dist(landmarks[6], wrist) > scale * 1.10)
         fist = (others_curled and not point
                 and math.dist(tip, wrist) <= scale * 1.25
@@ -455,20 +463,18 @@ class HandMouseController:
             if not pinch_shape:
                 return self._freeze(now, "Pinch interrupted")
             if pinch_distance > 0.55:
-                if not point:
-                    return self._cancel("Point again to resume Hand Mouse")
                 click = {}
                 if self._owned_left:
                     self._release()
-                    message, state = "Drag released; point to move", "mouse_pointer"
+                    message, state = "Drag released; move your hand", "mouse_pointer"
                 elif duration >= self.CLICK_MIN_SECONDS:
                     # If release is the first frame beyond the drag threshold,
                     # no held frame ever began a drag. Complete one click rather
                     # than dropping it because of camera sampling cadence.
                     click = self._complete_click("pinch")
-                    message, state = "Clicked; point to move", "mouse_clicked"
+                    message, state = "Clicked; move your hand", "mouse_clicked"
                 else:
-                    message, state = "Pinch released; point to move", "mouse_pointer"
+                    message, state = "Pinch released; move your hand", "mouse_pointer"
                 self._pinch_since = None
                 self._bend_latched = True
                 self._rearm_since = None
@@ -488,8 +494,12 @@ class HandMouseController:
             return self._feedback("mouse_pinch", "Release to click; keep pinching to drag",
                                   duration / self.DRAG_SECONDS)
 
+        rearm_action = "straighten your index" if self.bend_click else "separate thumb and index"
         if self._bend_latched:
-            if straight and pinch_distance > 0.55:
+            # Pinch-only control rearms on a stable opening, even if the index
+            # stays curled. Straightening is needed only when a bend can click,
+            # so releasing a pinch cannot immediately trigger that second input.
+            if (straight or not self.bend_click) and pinch_distance > 0.55:
                 if self._rearm_since is None:
                     self._rearm_since = now
                 if now - self._rearm_since >= self.REARM_SECONDS:
@@ -512,7 +522,7 @@ class HandMouseController:
             # timer until the fingers actually cross the pinch threshold.
             self._bend_since = None
             self._pinch_approaching = True
-            hint = ("Straighten your index before another click" if self._bend_latched
+            hint = (f"{rearm_action.capitalize()} before another click" if self._bend_latched
                     else "Bring thumb and index together to click")
             return self._feedback("mouse_pointer", hint)
 
@@ -552,6 +562,6 @@ class HandMouseController:
             self._bend_since = None
             self._reanchor(landmarks)
         self._move(self._pointer_target(landmarks), dt)
-        hint = ("Move your hand; straighten your index before another click" if self._bend_latched
+        hint = (f"Move your hand; {rearm_action} before another click" if self._bend_latched
                 else "Move your hand; pinch to click or hold to drag")
         return self._feedback("mouse_pointer", hint, 1.0)

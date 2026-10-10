@@ -95,3 +95,6 @@ hardware:
       enabled: true
     - name: cpu_info
       enabled: true
+    # Idle until Discover/Connect is requested in the BrainBit HUD panel.
+    - name: brainbit
+      enabled: true

@@ -78,12 +78,17 @@ index fingertip. Fully opening all four fingers enters navigation. A full fist
 pauses immediately. Lowering your hand out of view
 also stops movement; point again to resume after a longer interruption.
 
-Pinch thumb and index, then release for a click. Hold the pinch for about 0.35
-seconds to drag, and separate them to drop. Index bend clicking is off by default
-so ordinary finger flexing does not compete with pointing. To enable it, stop the
-camera, select **Index bend click (optional)** in Hand controls, and click **Apply**.
-The option lasts until the backend restarts. Its guide appears only when the
-backend confirms it is enabled.
+Pinch thumb and index, then separate them for a click; the index fingertip can
+stay curled as long as its proximal joint stays raised. Keep the fingers apart
+briefly before the next pinch. Hold the pinch for about 0.35 seconds to drag, and
+separate them to drop. Opening all four fingers finishes an active pinch or drag
+before navigation can take over on a following frame. Index bend clicking is off
+by default so ordinary finger flexing does not compete with pointing. To enable
+it, stop the camera, select **Index bend click (optional)** in Hand controls, and
+click **Apply**.
+With bend clicking enabled, straighten the index briefly between clicks to avoid
+triggering both click gestures. The option lasts until the backend restarts. Its
+guide appears only when the backend confirms it is enabled.
 
 Brief tracking uncertainty freezes the pointer for up to 150 ms, allowing the
 same hand to recover without repeating the activation pose. Missing or unreliable

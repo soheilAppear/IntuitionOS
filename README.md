@@ -37,6 +37,11 @@ The [branch consolidation report](docs/2026-09-07-main-consolidation.md) records
 the merge into `main` and subsequent bug fixes. The original 2025 prototype is
 preserved in the [historical archive](archive/README.md).
 
+For optional BrainBit headset connection and the explicitly started, local EEG +
+webcam experiment, see the [BrainBit guide](docs/brainbit.md). The experimental
+preview is disarmed by default. Its experimental EEG-only left/right/rest model
+requires separate training, held-out validation, and explicit desktop arming.
+
 ---
 
 ## Two interfaces

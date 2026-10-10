@@ -54,6 +54,15 @@ from core.command_resolver import (
     learning_text,
     legacy_fuzzy_slash,
 )
+from plugins.brainbit import BrainBit
+
+
+_brainbit_driver = None
+
+
+def _close_brainbit():
+    if _brainbit_driver is not None:
+        _brainbit_driver.close()
 
 
 def load_config():
@@ -369,6 +378,7 @@ def run_action(name, /, **kwargs):
 
 def bootstrap():
     """Initialize the existing terminal services and return their stable tuple."""
+    global _brainbit_driver
     cfg = load_config()
     sys_prompt = read_text(cfg.get("system_prompt_path", "config/system_prompt.txt"))
     schema = read_json(cfg.get("planner_schema_path", "config/planner_schema.json"))
@@ -455,6 +465,12 @@ def bootstrap():
             from core.actions import register_driver
 
             register_driver(CPUInfo())
+
+    _close_brainbit()
+    brainbit_cfg = next((d for d in drivers if d.get("name") == "brainbit"), {})
+    _brainbit_driver = BrainBit(enabled=brainbit_cfg.get("enabled", False))
+    from core.actions import register_driver
+    register_driver(_brainbit_driver)
 
     # Every submitted input is recorded whether or not the user asks. That is
     # the involuntary encoding /save lacks; it is disclosed in the README and can
@@ -543,6 +559,7 @@ def _run_terminal(cleanup):
     )
     # Closures read the current services after /reload and /forget replacements.
     cleanup.callback(lambda: sched.stop())
+    cleanup.callback(_close_brainbit)
     window = PredictionWindow()
     # Print banner
     rprint(
