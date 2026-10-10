@@ -11,6 +11,27 @@ from core import shell_environment
 from core.capabilities import set_safe_mode
 
 
+@pytest.fixture
+def builtin_powershell_modules(monkeypatch):
+    # Exercise the real shell and metadata query without scanning unrelated
+    # host-installed modules. PowerShell rebuilds PSModulePath at startup, so
+    # isolate it inside the child before running the unchanged setup script.
+    real_argv = shell_environment._ps_argv
+
+    def isolated_argv(script, shell):
+        return real_argv(
+            "$env:PSModulePath = [IO.Path]::Combine($PSHOME, 'Modules')\n" + script,
+            shell,
+        )
+
+    monkeypatch.setattr(shell_environment, "_ps_argv", isolated_argv)
+    with shell_environment._lock:
+        shell_environment._cache.clear()
+    yield
+    with shell_environment._lock:
+        shell_environment._cache.clear()
+
+
 def test_corrected_command_keeps_gate_and_exact_arguments(project, wired, monkeypatch):
     acts, journal, _ = wired
     calls = []
@@ -86,7 +107,8 @@ def test_real_shell_preserves_quoted_python_arguments(shell, project, monkeypatc
 
 
 @pytest.mark.parametrize("shell", ["powershell", "pwsh"])
-def test_discovery_and_execution_share_alias_function_snapshot(shell, project, monkeypatch):
+def test_discovery_and_execution_share_alias_function_snapshot(
+        shell, project, monkeypatch, builtin_powershell_modules):
     if not shutil.which(shell):
         pytest.skip(f"{shell} not installed")
     marker = project / "must-not-be-created.txt"
@@ -118,7 +140,8 @@ def test_catalog_cannot_claim_another_execution_environment(project, monkeypatch
 
 
 @pytest.mark.parametrize("shell", ["powershell", "pwsh"])
-def test_discovery_never_calls_shadowed_metadata_functions(shell, project, monkeypatch):
+def test_discovery_never_calls_shadowed_metadata_functions(
+        shell, project, monkeypatch, builtin_powershell_modules):
     if not shutil.which(shell):
         pytest.skip(f"{shell} not installed")
     marker = project / "candidate-was-executed.txt"
@@ -134,5 +157,7 @@ def test_discovery_never_calls_shadowed_metadata_functions(shell, project, monke
     monkeypatch.setenv("INTUITION_SHELL", shell)
     monkeypatch.setenv("INTUITION_SHELL_CATALOG", str(catalog))
     discovered = shell_environment.discover_powershell_commands()
-    assert 'Get-Command' in {item['name'] for item in discovered}
+    metadata = {(item["name"], item["kind"]) for item in discovered}
+    assert {(name, "Function") for name in names} <= metadata
+    assert {("%", "Alias"), ("cd~", "Function")} <= metadata
     assert not marker.exists(), "Metadata discovery executed a candidate function"
