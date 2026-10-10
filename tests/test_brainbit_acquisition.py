@@ -245,3 +245,80 @@ def test_ipc_acquisition_events_do_not_consume_request_response():
         assert events == [{"_acquisition": {"session_id": "test", "packets": []}}]
     finally:
         worker.close()
+
+
+def test_signal_status_is_cached_private_and_tracks_stream_freshness(connected, monkeypatch):
+    from core.multimodal import MultimodalPreview
+
+    driver, worker = connected
+    monkeypatch.setattr(brainbit.time, "monotonic", lambda: 100.0)
+    assert driver.status()["signal"]["state"] == "stopped"
+    driver.start_acquisition()
+    assert driver.status()["signal"]["state"] == "starting"
+    worker.packet(counters=(0, 1, 2), values=(1e-6, 2e-6, 3e-6))
+    calls = list(worker.calls)
+    signal = driver.call("status")["signal"]
+    assert signal["state"] == "running"
+    assert signal["channel_count"] == 1 and signal["sample_count"] == 3
+    assert signal["nominal_hz"] == 250
+    assert signal["received_rate_hz"] == pytest.approx(250)
+    assert signal["freshness_seconds"] == MultimodalPreview.EEG_FRESH_SECONDS
+    assert signal["age_seconds"] == 0
+    assert set(signal).isdisjoint({"samples", "packets", "channels", "session_id", "contact_precheck"})
+    assert signal["contact"] == {"available": False, "age_seconds": None}
+    signal["issue_counts"]["gaps"] = 999
+    assert driver.status()["signal"]["issue_counts"]["gaps"] == 0
+    monkeypatch.setattr(brainbit.time, "monotonic", lambda: 100.76)
+    assert driver.status()["signal"]["state"] == "stale"
+    assert worker.calls == calls
+    worker.packet(counters=(3,))
+    assert driver.status()["signal"]["state"] == "running"
+    driver.stop_acquisition()
+    signal = driver.status()["signal"]
+    assert signal["state"] == "stopped" and signal["sample_count"] == 0
+    assert signal["age_seconds"] is None
+    json.dumps(signal, allow_nan=False)
+
+
+def test_signal_status_distinguishes_contact_and_invalid_data(connected, monkeypatch):
+    driver, worker = connected
+    monkeypatch.setattr(brainbit.time, "monotonic", lambda: 100.0)
+    driver.start_acquisition("contact")
+    worker.packet(values=[5000])
+    signal = driver.status()["signal"]
+    assert signal["state"] == "contact"
+    assert signal["contact"] == {"available": True, "age_seconds": 0.0}
+    assert "5000" not in json.dumps(signal)
+    driver.start_acquisition("signal")
+    worker.packet(values=[float("nan")], nonfinite=1)
+    signal = driver.status()["signal"]
+    assert signal["state"] == "error"
+    assert signal["issue_counts"]["nonfinite"] == 1
+    assert signal["contact"]["available"]
+    worker.packet(counters=(1,), values=[1e-6])
+    assert driver.status()["signal"]["state"] == "running"
+    worker.on_event({"state": "disconnected"})
+    signal = driver.status()["signal"]
+    assert signal["state"] == "error" and "unconfirmed" in signal["text"]
+    assert signal["sample_count"] == 0 and not signal["contact"]["available"]
+
+
+def test_signal_status_handles_idle_connection_states(monkeypatch):
+    monkeypatch.setattr(brainbit.importlib.util, "find_spec", lambda _name: None)
+    assert brainbit.BrainBit(enabled=False).status()["signal"]["state"] == "disabled"
+    assert brainbit.BrainBit().status()["signal"]["state"] == "unavailable"
+    monkeypatch.setattr(brainbit.importlib.util, "find_spec", lambda _name: object())
+    driver = brainbit.BrainBit()
+    assert driver.status()["signal"]["state"] == "disconnected"
+    driver.close()
+    assert driver.status()["signal"]["state"] == "disabled"
+
+
+def test_finite_extreme_values_cannot_overflow_preview_statistics(connected):
+    driver, worker = connected
+    driver.start_acquisition()
+    worker.packet(counters=(0, 1), values=(1e308, -1e308))
+    result = driver.acquisition_snapshot()
+    assert result["stats"]["channels"][0]["rms_v"] == pytest.approx(1e308)
+    assert result["stats"]["channels"][0]["peak_to_peak_v"] is None
+    json.dumps(result, allow_nan=False)

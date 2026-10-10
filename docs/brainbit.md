@@ -42,6 +42,22 @@ Starting IntuitionOS and opening the panel do not scan or connect automatically.
    same control can cancel the pending operation. Discover again before a new
    connection because selections belong to one worker session.
 
+### EEG signal status
+
+The panel reports EEG signal status separately from the Bluetooth connection.
+A connected headset with acquisition stopped is not a live signal. Start the
+experimental preview explicitly to acquire samples; opening the BrainBit panel
+only reads cached status.
+
+The signal display distinguishes waiting for samples, receiving samples, stale
+data, stopped acquisition, contact checking, and errors. It shows the channel
+count, nominal and observed sample rates, last-sample age, and packet diagnostics
+when available. Data older than 0.75 seconds is stale. A missed response also
+expires the live indicator locally, so an old reading cannot remain live.
+Contact-check age refers to the last separate contact measurement. These are
+acquisition diagnostics, not a validated assessment of electrode contact or
+medical signal quality.
+
 The SDK uses Windows Bluetooth LE. It does not expose which Bluetooth radio or
 USB dongle carries the connection, so a connected dongle alone does not establish
 that it was used. Device family `LEBrainBit2` is supported, along with the other

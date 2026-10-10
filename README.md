@@ -42,6 +42,12 @@ webcam experiment, see the [BrainBit guide](docs/brainbit.md). The experimental
 preview is disarmed by default. Its experimental EEG-only left/right/rest model
 requires separate training, held-out validation, and explicit desktop arming.
 
+The latest combined camera and EEG work is on
+[`update_10_10_2026_eeg_signal_status`](https://github.com/soheilAppear/IntuitionOS/tree/update_10_10_2026_eeg_signal_status).
+It includes the camera branch, both former Codex BrainBit branches, and live EEG
+signal status in the BrainBit panel. `main` and
+`update_9_20_2026_camera_mode_added` remain the earlier milestones.
+
 ---
 
 ## Two interfaces

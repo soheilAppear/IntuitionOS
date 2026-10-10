@@ -265,6 +265,13 @@ html, body {
 .brainbit-note { color: #94a3b8; font-size: 10px; line-height: 1.5; margin-bottom: 8px; overflow-wrap: anywhere; }
 .brainbit-status, .brainbit-error { line-height: 1.5; overflow-wrap: anywhere; }
 .brainbit-error { margin-top: 6px; color: #fde68a; }
+.brainbit-panel summary .brainbit-signal-badge { display: inline-block; padding: 1px 6px; border: 1px solid currentColor; border-radius: 8px; color: #94a3b8; }
+.brainbit-panel summary .brainbit-signal-badge[data-state="running"] { color: #99f6e4; }
+.brainbit-panel summary .brainbit-signal-badge[data-state="stale"], .brainbit-panel summary .brainbit-signal-badge[data-state="error"] { color: #fde68a; }
+.brainbit-signal-card { margin-top: 9px; padding: 8px 10px; border-left: 3px solid #64748b; background: rgba(148,163,184,.055); line-height: 1.5; overflow-wrap: anywhere; }
+.brainbit-signal-card[data-state="running"] { border-left-color: #5eead4; }
+.brainbit-signal-card[data-state="stale"], .brainbit-signal-card[data-state="error"] { border-left-color: #fbbf24; }
+.brainbit-signal-card .brainbit-note { margin: 5px 0 0; }
 .brainbit-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 7px; margin-top: 10px; }
 .brainbit-controls label { display: flex; flex-direction: column; flex: 1 1 180px; gap: 4px; min-width: 0; font-size: 10px; }
 .brainbit-controls button, .brainbit-controls select { min-height: 28px; padding: 5px 8px; background: #15212f; border: 1px solid rgba(148,163,184,.3); border-radius: 4px; color: #e2e8f0; font: inherit; font-size: 10px; }

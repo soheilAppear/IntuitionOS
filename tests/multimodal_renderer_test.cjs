@@ -143,6 +143,20 @@ test('stale frame deadline clears displays and disables arming without posting',
   assert.ok(r.requests.every(q => ['status', 'preview'].includes(q.action)));
 });
 
+test('camera expiry retains fresh EEG then independently expires its status and waveform', async () => {
+  const r = harness(); r.panel.acceptStatus(running()); r.open(true);
+  await respond(r.requests[0], running());
+  const eegClears = () => r.drawing.filter(row => row[0] === 'multimodal-eeg' && row[1] === 'clearRect').length;
+  const before = eegClears();
+  r.tick(501);
+  assert.match(r.el('camera-status').textContent, /stale/);
+  assert.match(r.el('eeg-status').textContent, /250 Hz received/);
+  assert.equal(eegClears(), before, 'fresh EEG waveform survives camera expiry');
+  r.tick(250);
+  assert.match(r.el('eeg-status').textContent, /Waiting for fresh EEG/);
+  assert.ok(eegClears() > before);
+});
+
 test('offline discards delayed replies and never replays a sensor or arm operation', async () => {
   const r = harness(); r.panel.acceptStatus(stopped()); r.el('start').dispatch('click');
   r.online(false); assert.equal(r.el('arm').checked, false); assert.equal(r.el('stop').disabled, true);

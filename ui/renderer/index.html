@@ -152,12 +152,17 @@
     </details>
 
     <details class="brainbit-panel" id="brainbit-panel">
-      <summary>BrainBit <span id="brainbit-summary">Waiting for backend</span></summary>
+      <summary>BrainBit <span id="brainbit-summary">Waiting for backend</span><span id="brainbit-signal-summary" class="brainbit-signal-badge" data-state="unavailable">EEG unavailable</span></summary>
       <div class="brainbit-body">
-        <p class="brainbit-note">Connection and device status only</p>
+        <p class="brainbit-note">Connection, device and EEG signal status. Viewing status never starts acquisition; use Start preview in Experimental hand + EEG below.</p>
         <p class="brainbit-note">Windows Bluetooth LE. The SDK does not identify the radio or dongle.</p>
         <div class="brainbit-status" id="brainbit-status" role="status" aria-live="polite">Waiting for backend.</div>
         <div class="brainbit-error" id="brainbit-error" role="alert" hidden></div>
+        <div class="brainbit-signal-card" id="brainbit-signal-card" data-state="unavailable">
+          <div id="brainbit-signal-status" role="status" aria-live="polite">Waiting for current EEG signal status.</div>
+          <div class="brainbit-note" id="brainbit-signal-metrics" hidden></div>
+          <div class="brainbit-note" id="brainbit-signal-issues" hidden></div>
+        </div>
         <div class="brainbit-controls">
           <button id="brainbit-discover" type="button" disabled>Discover devices</button>
           <label for="brainbit-devices">Device

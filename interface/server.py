@@ -146,17 +146,40 @@ async def _poll_brainbit(driver):
     """Refresh connected-device metadata off the event loop; never reconnect."""
     previous = None
     next_refresh = 0.0
-    while True:
-        info = driver.status()
-        if (info.get("state") == "connected" and not info.get("busy")
-                and time.monotonic() >= next_refresh):
+    refresh_task = None
+
+    async def refresh_metadata():
+        nonlocal next_refresh
+        try:
             await asyncio.to_thread(driver.call, "status", refresh=True)
+        finally:
             next_refresh = time.monotonic() + 3.0
+
+    try:
+        while True:
+            if refresh_task is not None and refresh_task.done():
+                # Retrieve failures without losing cached signal broadcasts;
+                # the driver exposes expected SDK failures in its status.
+                with suppress(Exception):
+                    refresh_task.result()
+                refresh_task = None
             info = driver.status()
-        if info != previous:
-            await _broadcast({"type": "brainbit_status", **info})
-            previous = info
-        await asyncio.sleep(1)
+            if (refresh_task is None and info.get("state") == "connected"
+                    and not info.get("busy") and time.monotonic() >= next_refresh):
+                refresh_task = asyncio.create_task(refresh_metadata())
+            active_signal = (info.get("signal") or {}).get("state") in (
+                "starting", "running", "stale", "contact", "stopping")
+            # The collapsed HUD still displays signal freshness. Renew its
+            # cached evidence before expiry, even if summary values repeat.
+            if active_signal or info != previous:
+                await _broadcast({"type": "brainbit_status", **info})
+                previous = info
+            await asyncio.sleep(0.25 if active_signal else 1)
+    finally:
+        if refresh_task is not None:
+            refresh_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await refresh_task
 
 
 def _safe_mode_sink(loop):

@@ -105,6 +105,11 @@ const correctionLabel = document.getElementById('correction-label');
 const correctionChoices = document.getElementById('correction-choices');
 const brainbitPanel = document.getElementById('brainbit-panel');
 const brainbitSummary = document.getElementById('brainbit-summary');
+const brainbitSignalSummary = document.getElementById('brainbit-signal-summary');
+const brainbitSignalCard = document.getElementById('brainbit-signal-card');
+const brainbitSignalText = document.getElementById('brainbit-signal-status');
+const brainbitSignalMetrics = document.getElementById('brainbit-signal-metrics');
+const brainbitSignalIssues = document.getElementById('brainbit-signal-issues');
 const brainbitStatusText = document.getElementById('brainbit-status');
 const brainbitErrorText = document.getElementById('brainbit-error');
 const brainbitDevices = document.getElementById('brainbit-devices');
@@ -169,6 +174,8 @@ let brainbitPolling = false;
 let brainbitPollTimer = null;
 let brainbitReadId = 0;
 let brainbitReadInFlight = false;
+let brainbitReceivedAt = 0;
+let brainbitSignalTimer = null;
 
 // ── IPC ──
 ipcRenderer.on('focus-input', () => cmdInput.focus());
@@ -1077,19 +1084,85 @@ function resetBrainbitConnection() {
   brainbitPolling = false;
   clearTimeout(brainbitPollTimer);
   brainbitPollTimer = null;
+  clearTimeout(brainbitSignalTimer);
+  brainbitSignalTimer = null;
 }
 
-function onBrainbitStatus(status) {
+function onBrainbitStatus(status, receivedAt = Date.now()) {
   if (!isConnected() || !validBrainbitStatus(status)) return false;
   if (Number.isInteger(status.revision) && status.revision < brainbitRevision) return false;
   if (Number.isInteger(status.revision)) brainbitRevision = status.revision;
   ++brainbitGeneration;
   brainbitStatus = status;
+  brainbitReceivedAt = receivedAt;
   brainbitReady = true;
   brainbitError = brainbitText(status.error);
   renderBrainbitUI();
+  scheduleBrainbitSignalExpiry();
   multimodalPanel.refreshControls();
   return true;
+}
+
+const BRAINBIT_SIGNAL_LABELS = { disabled: 'EEG disabled', unavailable: 'EEG unavailable',
+  disconnected: 'EEG disconnected', stopped: 'EEG stopped', starting: 'EEG starting',
+  stopping: 'EEG stopping', running: 'EEG live', stale: 'EEG stale',
+  contact: 'Contact check', error: 'EEG error' };
+
+function brainbitSignalAge(signal) {
+  return Number.isFinite(signal?.age_seconds) && signal.age_seconds >= 0
+    ? signal.age_seconds + Math.max(0, Date.now() - brainbitReceivedAt) / 1000 : Infinity;
+}
+
+function brainbitSignalFreshness(signal) {
+  return Number.isFinite(signal?.freshness_seconds) && signal.freshness_seconds > 0
+    ? signal.freshness_seconds : 0.75;
+}
+
+function scheduleBrainbitSignalExpiry() {
+  clearTimeout(brainbitSignalTimer);
+  brainbitSignalTimer = null;
+  const signal = brainbitStatus?.signal;
+  if (!brainbitReady || !isConnected() || !['running', 'contact'].includes(signal?.state)) return;
+  const remaining = brainbitSignalFreshness(signal) - brainbitSignalAge(signal);
+  if (remaining >= 0) brainbitSignalTimer = setTimeout(() => {
+    brainbitSignalTimer = null;
+    renderBrainbitUI();
+  }, Math.ceil(remaining * 1000) + 1);
+}
+
+function renderBrainbitSignal(online, known, connected) {
+  const signal = known ? brainbitStatus.signal : null;
+  let state = signal && Object.hasOwn(BRAINBIT_SIGNAL_LABELS, signal.state) ? signal.state : 'unavailable';
+  let message = brainbitText(signal?.text, 'EEG signal status is unavailable.');
+  const age = brainbitSignalAge(signal);
+  if (!online || !known) {
+    state = 'unavailable';
+    message = !online ? 'EEG signal is unconfirmed while the backend is offline.' : 'Waiting for current EEG signal status.';
+  } else if (!connected && ['running', 'contact', 'stale'].includes(state)) {
+    state = 'unavailable';
+    message = 'EEG signal is unconfirmed while the device is not connected.';
+  } else if (['running', 'contact'].includes(state) && age > brainbitSignalFreshness(signal)) {
+    state = 'stale';
+    message = 'No fresh samples confirmed. Waiting for the next EEG signal update.';
+  }
+  brainbitSignalSummary.textContent = BRAINBIT_SIGNAL_LABELS[state];
+  brainbitSignalSummary.setAttribute('data-state', state);
+  brainbitSignalCard.setAttribute('data-state', state);
+  if (brainbitSignalText.textContent !== message) brainbitSignalText.textContent = message;
+  const number = (value, digits = 0) => Number.isFinite(value) && value >= 0 ? value.toFixed(digits) : 'unknown';
+  const hasMetrics = known && connected && signal && !['unavailable', 'disabled', 'disconnected'].includes(state);
+  const rate = Number.isFinite(signal?.received_rate_hz) && signal.received_rate_hz >= 0
+    ? `${number(signal.received_rate_hz)} Hz received` : 'Received rate unavailable';
+  const contactAge = brainbitSignalAge(signal?.contact);
+  const contact = signal?.contact?.available === true
+    ? ` · Contact precheck: ${Number.isFinite(contactAge) ? `${number(contactAge, 1)} s ago` : 'age unconfirmed'} (historical)` : '';
+  brainbitSignalMetrics.textContent = hasMetrics
+    ? `${number(signal.channel_count)} channels · ${rate} / ${number(signal.nominal_hz)} Hz nominal · last sample ${Number.isFinite(age) ? `${number(age, 1)} s ago` : 'unavailable'}${contact}` : '';
+  brainbitSignalMetrics.hidden = !hasMetrics;
+  const issues = hasMetrics ? signal.issue_counts : null;
+  brainbitSignalIssues.textContent = issues
+    ? `Acquisition counters: gaps ${number(issues.gaps)} · duplicates ${number(issues.duplicates)} · nonfinite ${number(issues.nonfinite)} · channel mismatches ${number(issues.channel_mismatches)} · queue drops ${number(issues.queue_drops)}` : '';
+  brainbitSignalIssues.hidden = !issues;
 }
 
 function renderBrainbitUI() {
@@ -1103,6 +1176,7 @@ function renderBrainbitUI() {
   const label = !online ? 'Backend offline' : !known ? 'Status unavailable'
     : BRAINBIT_ACTION_LABELS[brainbitAction] || BRAINBIT_LABELS[state];
   brainbitSummary.textContent = label;
+  renderBrainbitSignal(online, known, connected);
   const statusText = !online
     ? 'Backend offline. Device connection is unconfirmed; waiting for reconnection.'
     : !known ? 'Waiting for current device status. Controls will return when the backend responds.'
@@ -1163,6 +1237,8 @@ function failBrainbitRequest(message) {
   brainbitReady = false;
   brainbitAction = null;
   brainbitError = message;
+  clearTimeout(brainbitSignalTimer);
+  brainbitSignalTimer = null;
   // Do not claim a device disconnected when only its status request failed.
   // Selection can survive recovery, but device metadata and busy state cannot.
   if (brainbitStatus) brainbitStatus = { ...brainbitStatus, device: null, busy: false };
@@ -1207,6 +1283,7 @@ async function pollBrainbitStatus() {
   brainbitReadInFlight = true;
   const readId = ++brainbitReadId;
   const generation = brainbitGeneration;
+  const requestedAt = Date.now();
   try {
     const response = await requestBrainbit('status');
     if (readId !== brainbitReadId || generation !== brainbitGeneration || !isConnected()) return;
@@ -1215,14 +1292,17 @@ async function pollBrainbitStatus() {
         'Device status could not be confirmed. Waiting for the backend to recover.'));
       return;
     }
-    onBrainbitStatus(response.data);
+    // A delayed cached read must not renew the age of an old packet. Count
+    // its full round trip conservatively when displaying signal freshness.
+    onBrainbitStatus(response.data, requestedAt);
   } catch (_) {
     if (readId === brainbitReadId && generation === brainbitGeneration && isConnected())
       failBrainbitRequest('Device status could not be confirmed. Waiting for the backend to recover.');
   } finally {
     if (readId === brainbitReadId) {
       brainbitReadInFlight = false;
-      if (brainbitPolling) brainbitPollTimer = setTimeout(pollBrainbitStatus, 1000);
+      if (brainbitPolling) brainbitPollTimer = setTimeout(pollBrainbitStatus,
+        ['starting', 'running', 'stale', 'contact', 'stopping'].includes(brainbitStatus?.signal?.state) ? 500 : 1000);
     }
   }
 }

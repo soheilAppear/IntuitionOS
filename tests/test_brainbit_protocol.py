@@ -2,6 +2,7 @@
 import asyncio
 import json
 import threading
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -162,6 +163,102 @@ def test_background_refresh_never_scans_or_reconnects(api):
 
     asyncio.run(exercise())
     assert [c[:2] for c in driver.calls] == [("status", {"refresh": True})]
+
+
+@pytest.mark.parametrize("signal_state", ["starting", "running", "stale", "contact", "stopping"])
+def test_active_signal_broadcasts_before_hud_expiry_without_starting_acquisition(api, monkeypatch, signal_state):
+    from plugins.brainbit import SIGNAL_FRESH_SECONDS
+
+    driver, _ = api
+    driver.state = "connected"
+    elapsed = 0.0
+    broadcasts = []
+    metadata_refreshes = []
+    status = driver.status
+    call = driver.call
+    sleep = asyncio.sleep
+
+    # Even identical healthy summaries must renew the HUD's freshness clock.
+    def signal_status():
+        return {**status(), "signal": {"state": signal_state, "age_seconds": 0.05,
+                                       "freshness_seconds": SIGNAL_FRESH_SECONDS}}
+
+    def tracked_call(action, **kwargs):
+        metadata_refreshes.append(elapsed)
+        return call(action, **kwargs)
+
+    async def broadcast(message):
+        broadcasts.append((elapsed, message))
+
+    async def immediate_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    async def advance(seconds):
+        nonlocal elapsed
+        await sleep(0)
+        elapsed += seconds
+        if elapsed > 3.5:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(driver, "status", signal_status)
+    monkeypatch.setattr(driver, "call", tracked_call)
+    monkeypatch.setattr(server, "time", SimpleNamespace(monotonic=lambda: elapsed))
+    monkeypatch.setattr(server, "_broadcast", broadcast)
+    monkeypatch.setattr(server.asyncio, "sleep", advance)
+    monkeypatch.setattr(server.asyncio, "to_thread", immediate_thread)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(server._poll_brainbit(driver))
+
+    assert broadcasts[-1][0] >= 3.5
+    assert all(current[0] - previous[0] + 0.05 < SIGNAL_FRESH_SECONDS
+               for previous, current in zip(broadcasts, broadcasts[1:]))
+    assert all(message["type"] == "brainbit_status" for _, message in broadcasts)
+    assert metadata_refreshes == [0.0, 3.0]
+    assert [entry[:2] for entry in driver.calls] == [("status", {"refresh": True})] * 2
+
+
+def test_blocked_metadata_refresh_cannot_delay_signal_broadcasts_and_is_cancelled(api, monkeypatch):
+    driver, _ = api
+    driver.state = "connected"
+    elapsed = 0.0
+    broadcasts = []
+    refreshes = []
+    cleanup = []
+    sleep = asyncio.sleep
+    status = driver.status
+
+    async def blocked_thread(function, *args, **kwargs):
+        refreshes.append((function, args, kwargs))
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup.append(True)
+
+    async def broadcast(message):
+        broadcasts.append((elapsed, message))
+
+    async def advance(seconds):
+        nonlocal elapsed
+        await sleep(0)
+        elapsed += seconds
+        if elapsed > 3.5:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(driver, "status", lambda: {
+        **status(), "signal": {"state": "running", "age_seconds": 0.01}})
+    monkeypatch.setattr(server, "time", SimpleNamespace(monotonic=lambda: elapsed))
+    monkeypatch.setattr(server, "_broadcast", broadcast)
+    monkeypatch.setattr(server.asyncio, "sleep", advance)
+    monkeypatch.setattr(server.asyncio, "to_thread", blocked_thread)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(server._poll_brainbit(driver))
+
+    assert broadcasts[-1][0] >= 3.5
+    assert len(broadcasts) >= 14
+    assert refreshes == [(driver.call, ("status",), {"refresh": True})]
+    assert cleanup == [True]
 
 
 def test_speculative_actor_cannot_connect(api):

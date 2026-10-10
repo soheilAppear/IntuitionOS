@@ -18,6 +18,7 @@ from .hw_base import HardwareDriver
 
 TRANSPORT = "Windows Bluetooth LE; SDK does not identify radio/dongle"
 MAX_FRAME = 65536
+SIGNAL_FRESH_SECONDS = 0.75
 
 
 class _WorkerClient:
@@ -170,7 +171,65 @@ class BrainBit(HardwareDriver):
 
     def status(self):
         with self._lock:
-            return copy.deepcopy(self._snapshot)
+            result = copy.deepcopy(self._snapshot)
+            result["signal"] = self._signal_status(time.monotonic())
+            return result
+
+    def _signal_status(self, now):
+        """Summarize the local cache without SDK access or raw signal values.
+
+        The caller holds ``_lock``. Freshness is recomputed on every read so
+        an idle or stalled stream cannot keep advertising a live signal.
+        """
+        acquisition = self._acq
+        mode = acquisition["mode"]
+        packets = [packet for packet in self._samples
+                   if now - packet["host_received_monotonic"] <= 5]
+        latest = self._samples[-1] if self._samples else None
+        age = max(0.0, now - latest["host_received_monotonic"]) if latest else None
+        duration = (packets[-1]["host_received_monotonic"] - packets[0]["host_received_monotonic"]
+                    if len(packets) > 1 else 0)
+        rate = (len(packets) - 1) / duration if duration > 0 else None
+        contact = self._contact_precheck
+        channel_count = len(acquisition["channels"])
+        result = {
+            "state": "stopped", "text": "EEG acquisition is stopped",
+            "mode": mode, "channel_count": channel_count,
+            "nominal_hz": acquisition["nominal_hz"],
+            "age_seconds": age, "received_rate_hz": rate,
+            "sample_count": len(packets), "freshness_seconds": SIGNAL_FRESH_SECONDS,
+            "issue_counts": {key: acquisition["stats"][key] for key in
+                             ("gaps", "duplicates", "nonfinite", "channel_mismatches", "queue_drops")},
+            "contact": {"available": contact is not None,
+                        "age_seconds": max(0.0, now - contact["host_received_monotonic"])
+                        if contact is not None else None},
+        }
+        state = acquisition["state"]
+        connection = self._snapshot["state"]
+        if state == "error":
+            result.update(state="error", text=acquisition.get("error") or "EEG acquisition failed")
+        elif connection in ("disabled", "unavailable", "error"):
+            result.update(state=connection, text=self._snapshot["text"])
+        elif connection != "connected":
+            result.update(state="disconnected", text="Connect a BrainBit device to view EEG signal status")
+        elif state in ("starting", "stopping"):
+            result.update(state=state, text="Starting EEG acquisition" if state == "starting"
+                          else "Stopping EEG acquisition")
+        elif state == "running":
+            if latest is None:
+                result.update(state="starting", text="Waiting for the first contact packet" if mode == "contact"
+                              else "Waiting for the first EEG packet")
+            elif age > SIGNAL_FRESH_SECONDS:
+                result.update(state="stale", text="Contact data is stale" if mode == "contact"
+                              else "EEG signal is stale; no recent packet received")
+            elif (not channel_count or len(latest["samples"]) != channel_count
+                  or any(value is None for value in latest["samples"])):
+                result.update(state="error", text="Latest packet has missing or nonfinite channel values")
+            elif mode == "contact":
+                result.update(state="contact", text="Contact check is receiving data; EEG signal is paused")
+            else:
+                result.update(state="running", text="EEG signal is streaming")
+        return result
 
     @staticmethod
     def _empty_acquisition():
@@ -232,11 +291,16 @@ class BrainBit(HardwareDriver):
             for index, channel in enumerate(result["channels"]):
                 values = [packet["samples"][index] for packet in packets
                           if len(packet["samples"]) > index and packet["samples"][index] is not None]
-                mean = sum(values) / len(values) if values else 0
+                # Normalize before calculating variance: even finite malformed
+                # device values must not overflow the status/preview response.
+                scale = max((abs(value) for value in values), default=0)
+                normalized = [value / scale for value in values] if scale else [0.0] * len(values)
+                mean = sum(normalized) / len(normalized) if normalized else 0
+                rms = scale * math.sqrt(sum((value - mean) ** 2 for value in normalized) / len(normalized)) if normalized else None
+                peak_to_peak = max(values) - min(values) if values else None
                 channel_stats.append({"name": channel["name"],
-                                      "rms_v": math.sqrt(sum((v - mean) ** 2 for v in values) / len(values))
-                                      if values else None,
-                                      "peak_to_peak_v": max(values) - min(values) if values else None})
+                                      "rms_v": rms if rms is not None and math.isfinite(rms) else None,
+                                      "peak_to_peak_v": peak_to_peak if peak_to_peak is not None and math.isfinite(peak_to_peak) else None})
         result["stats"]["channels"] = channel_stats
         if contact is not None:
             contact["age_seconds"] = max(0, now - contact["host_received_monotonic"])

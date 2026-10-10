@@ -55,6 +55,24 @@ function createMultimodalPanel({ document, isConnected, isCameraRunning = () => 
   function clearEeg() { el.eeg.getContext('2d').clearRect(0, 0, el.eeg.width, el.eeg.height); }
   function clearFrames() { clearCamera(); clearEeg(); cancel(staleTimer); staleTimer = null; }
 
+  function scheduleFrameExpiry() {
+    cancel(staleTimer);
+    staleTimer = null;
+    if (!known || !status.running || !visible() || pending === 'stop' || stopRequested) return;
+    const deadlines = [];
+    if (cameraFresh()) deadlines.push(500 - age(status.camera.age_ms / 1000) * 1000);
+    if (eegFresh()) deadlines.push(750 - age(status.eeg.stats.age_seconds) * 1000);
+    if (!deadlines.length) return;
+    staleTimer = schedule(() => {
+      staleTimer = null;
+      if (controlMode() === 'eeg' && !eegFresh() && guardToken) releaseGuard();
+      render();
+      // Camera and EEG have separate deadlines. Expiring the first must not
+      // leave the other sensor's last status displayed as fresh indefinitely.
+      scheduleFrameExpiry();
+    }, Math.max(1, Math.ceil(Math.min(...deadlines)) + 1));
+  }
+
   function render() {
     const online = !!isConnected(), ready = online && known;
     const running = ready && status.running;
@@ -313,15 +331,7 @@ function createMultimodalPanel({ document, isConnected, isCameraRunning = () => 
       drawCamera(data.camera || {});
       drawEeg(data.eeg || {});
     }
-    cancel(staleTimer);
-    const staleIn = controlMode() === 'eeg'
-      ? 750 - ((data.eeg?.stats?.age_seconds || 0) * 1000)
-      : Math.min(500 - (data.camera?.age_ms || 0), 750 - ((data.eeg?.stats?.age_seconds || 0) * 1000));
-    if (data.running && visible()) staleTimer = schedule(() => {
-      if (controlMode() === 'eeg' && !eegFresh() && guardToken) releaseGuard();
-      clearFrames();
-      render();
-    }, Math.max(1, staleIn + 1));
+    scheduleFrameExpiry();
     return true;
   }
 
