@@ -1,4 +1,4 @@
-# BrainBit connection and status
+# BrainBit connection, EEG signals, and status
 
 The HUD's **BrainBit** panel can discover nearby devices, connect to a selected
 headset, display its battery and firmware, and disconnect. It does not start EEG
@@ -58,15 +58,81 @@ Contact-check age refers to the last separate contact measurement. These are
 acquisition diagnostics, not a validated assessment of electrode contact or
 medical signal quality.
 
-The SDK uses Windows Bluetooth LE. It does not expose which Bluetooth radio or
-USB dongle carries the connection, so a connected dongle alone does not establish
-that it was used. Device family `LEBrainBit2` is supported, along with the other
-BrainBit families exposed by this SDK version.
+The SDK uses Windows Bluetooth LE. A compatible Windows Bluetooth LE USB dongle
+can supply the radio in place of the computer's built-in Bluetooth, but Windows must
+recognize it as a working Bluetooth adapter. The dongle still communicates with
+the headset over Bluetooth. The app cannot select or identify which radio carries
+the connection, so plugging in a dongle alone does not establish that it was used.
+If discovery fails, check the adapter's status in Windows Device Manager as well
+as the headset connection. Device family `LEBrainBit2` is supported, along with
+the other BrainBit families exposed by this SDK version.
 
 A failed or timed-out operation releases the worker and offers discovery again.
 The app does not reconnect automatically. If the backend goes offline, the HUD
 marks device state unconfirmed and disables controls until fresh status arrives.
 Closing or restarting the backend closes its owned worker and connection.
+
+## View EEG without the camera
+
+1. Connect the headset in **BrainBit** and turn off the normal Hand controls
+   camera.
+2. Expand **Experimental hand + EEG**. While stopped, optionally choose
+   **Contact check (5 s)** and wait for it to finish.
+3. Set **Control source → EEG classifier** before starting. This skips the
+   webcam for this acquisition; the selector also controls which experimental
+   classifier could later be armed.
+4. Choose **Start preview**. Leave **Arm webcam swipes** and **Arm EEG swipes**
+   unchecked to view signals without desktop actions.
+5. Watch the channel traces and **EEG live** indicator. BrainBit2 supplies four
+   channels at a nominal 250 Hz. The observed rate is estimated from host packet
+   arrivals and can fluctuate around that value.
+6. Choose **Stop & disarm (Esc)** when finished. Closing the panel alone does
+   not stop acquisition.
+
+Waveforms and signal status work before any training and do not require Ollama.
+An untrained-model message refers to movement prediction, not signal acquisition.
+To train later, use **Webcam direction** for the guided trials described below.
+
+## Checking signal quality
+
+Check transport and signal quality separately:
+
+| Indicator | What it establishes |
+|---|---|
+| Connected | The SDK has a device connection; acquisition may still be stopped. |
+| EEG live | Recent packets are arriving; this is not a clean-signal rating. |
+| EEG stale | The newest confirmed sample is older than 0.75 seconds, or a live status update has expired locally. |
+| Gaps, duplicates, nonfinite values, channel mismatches, queue drops | Cumulative acquisition diagnostics; compare their change over the observation period. Gaps count counter discontinuities, not the number of missing samples. |
+| Channel RMS and peak-to-peak values | Descriptive amplitude statistics over the cached full-rate samples; RMS removes the mean but still includes slow drift. |
+| Contact-check age | Time since a separate resistance measurement; it is not a continuous contact reading. |
+
+Each channel trace uses its own automatic vertical scale. Compare the numeric
+RMS and peak-to-peak values rather than assuming equal trace heights mean equal
+signal amplitudes.
+
+A stream can have no packet errors and still contain substantial movement,
+electrode drift, or 50/60 Hz electrical interference. Sit still with a relaxed jaw
+for a short comparison. If needed, stop preview, check contact, ensure electrodes
+touch the scalp with hair moved aside, and restart. See the manufacturer's
+[electrode-contact guidance](https://sdk.brainbit.com/device-recommendation/).
+Investigate nearby power supplies and cables if an analysis shows a strong mains
+frequency peak. A peak alone does not identify the interference source or prove
+that a Bluetooth adapter is at fault.
+
+The HUD does not automatically diagnose contact quality, measure mains-noise
+power, or apply a 50/60 Hz notch filter. Large constant baseline offsets alone
+do not fail the feature extractor's amplitude check; raw variation, flat signals,
+and suspicious plateaus are checked separately. Passing those broad engineering
+checks does not establish clean EEG or reliable movement classification.
+
+**For signal analysis:** the waveform response contains at most 250 display
+points across a cache of up to five seconds. It uses stride sampling without an
+anti-alias filter, so do not treat the displayed points as a continuous 250 Hz
+recording or use them directly for frequency-band or 50/60 Hz measurements.
+Spectral analysis requires a verified contiguous full-rate sample sequence from
+one acquisition session. The cached channel statistics and the internal EEG
+feature extractor use the full-rate buffer. The app has no recording or file
+export feature for raw EEG.
 
 ## Implementation and tests
 
@@ -106,8 +172,8 @@ Official references: [Python installation](https://sdk.brainbit.com/sdk2_python_
 
 This separate HUD panel is an exploratory movement experiment for **BrainBit2**.
 It displays mirrored webcam hand tracking next to four EEG channels, using
-approximate host arrival timing. **Webcam** mode uses camera direction;
-**EEG** mode predicts left, right, or rest exclusively from EEG features.
+approximate host arrival timing. **Webcam direction** uses camera direction;
+**EEG classifier** predicts left, right, or rest exclusively from EEG features.
 Camera movement verifies training and validation labels, and never enters the
 EEG classifier or supplies its action direction. Muscle activity and electrode
 motion can explain successful classification: this is not thought reading or
@@ -116,7 +182,7 @@ a medical measurement, and software tests do not demonstrate reliable control.
 1. Connect BrainBit in the connection panel. Wear it according to its manual;
    keep it powered on and disconnect the charger if the device manual requires it.
 2. Turn off the normal Hand controls camera. Expand **Experimental hand + EEG**.
-3. Optionally choose **Check contacts** while preview is stopped. This acquires
+3. Optionally choose **Contact check (5 s)** while preview is stopped. This acquires
    resistance for up to five seconds, then stops. Contact and signal acquisition
    are separate modes. Readings are historical and show their age, with no
    validated good/bad cutoff. The versioned Python SDK defines these values as
@@ -139,14 +205,14 @@ a medical measurement, and software tests do not demonstrate reliable control.
    still for the final half-second; remain still throughout rest trials. Each accepted trial needs
    fresh tracked camera data and a valid complete EEG window. Alternate labels
    and return to a neutral position between trials. No raw trial data is saved.
-6. Choose **Train & freeze**, then collect **eight new validation trials per
+6. Choose **Train & freeze model**, then collect **eight new validation trials per
    class**. These use the frozen model and separate, nonoverlapping EEG samples.
    Training and validation cannot be mixed, and completed validation cannot be
    extended until a favorable score appears. Read the class precision/recall,
    confusion matrix, uncertain predictions, and rest false activations. The
    fixed engineering gates are described below. Failing a gate keeps EEG arming
    unavailable; reset starts a new experiment.
-7. Select **EEG** mode without stopping acquisition to retain the calibrated
+7. Select **EEG classifier** without stopping acquisition to retain the calibrated
    session. Review prediction-only output first. If the gates passed and current
    EEG is valid, **Arm EEG swipes** explicitly enables only left/right desktop
    navigation. A working global **Escape** shortcut is required before arming.
@@ -164,7 +230,7 @@ a medical measurement, and software tests do not demonstrate reliable control.
    immediately; recovery never rearms it. Safe Mode and the desktop capability
    gate apply.
 9. Press **Escape** from any application while EEG control is armed, or choose
-   **Stop & disarm** when finished. It cancels startup/contact checking,
+   **Stop & disarm (Esc)** when finished. It cancels startup/contact checking,
    releases the preview camera and stops EEG. If native shutdown cannot be
    confirmed, the panel reports the error and the worker is terminated.
 

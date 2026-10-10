@@ -65,6 +65,10 @@ A frameless, always-on-top ambient overlay that lives at the top of your screen.
 - A confirmation bar for anything the gate will not run on its own, styled
   differently for actions that cannot be undone
 - Reminder toasts flash the HUD border when a scheduled task fires
+- Optional BrainBit panel with device connection, EEG live/stale/error status,
+  channel count, sample rates, sample age, and acquisition counters
+- Explicitly started EEG waveform preview, with optional webcam-assisted
+  experiments and separate training/validation before desktop control
 
 ### Terminal (classic)
 
@@ -168,6 +172,30 @@ available. Speech fills an editable draft—it is never submitted automatically.
 
 See the [recovery report](docs/2026-09-07-hud-recovery.md) for the observed failure,
 fixes, and live checks.
+
+### EEG signal preview (optional BrainBit headset)
+
+Install the optional SDK into the existing project environment, then launch:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-brainbit.txt
+.\.venv\Scripts\python.exe start_ui.py
+```
+
+In **BrainBit**, choose **Discover devices**, select the headset, and **Connect**.
+Turn off the normal Hand controls camera. In **Experimental hand + EEG**, choose
+**Control source → EEG classifier**, then **Start preview** to view EEG without
+starting the webcam. Leave both **Arm … swipes** controls unchecked. Viewing
+signals requires neither classifier training nor Ollama; an untrained prediction
+message does not prevent waveforms from appearing.
+
+**EEG live** means recent samples are arriving. It does not certify clean EEG:
+electrode drift, movement, and electrical interference can still affect a stream
+with no packet errors. Use **Stop & disarm (Esc)** before **Contact check (5 s)**,
+then restart preview. The [BrainBit guide](docs/brainbit.md) explains USB Bluetooth
+dongles, status indicators, [signal-quality checks](docs/brainbit.md#checking-signal-quality),
+and the separate calibration workflow. Samples remain in a bounded local memory
+buffer; the app does not save raw EEG recordings.
 
 ### Terminal
 
