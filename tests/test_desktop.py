@@ -1,8 +1,10 @@
 """Desktop input lifecycle tests use fakes: never switch the user's desktops."""
 
 import ctypes
+from queue import Queue
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -348,26 +350,60 @@ def wait_until(condition, timeout=1):
         threading.Event().wait(.003)
 
 
-def test_native_worker_interpolates_camera_targets_and_reverses_without_overshoot():
+@pytest.mark.parametrize("elapsed", [1 / 60, .03125])
+def test_native_worker_interpolates_camera_targets_and_reverses_without_overshoot(monkeypatch, elapsed):
+    # Control elapsed time while exercising the real animation thread. Windows
+    # may report the same monotonic tick for consecutive frames; that is valid
+    # and must not be mistaken for interpolation failing to advance.
+    clock = SimpleNamespace(now=100.0)
+    ticks, waiting = Queue(), Queue()
+
+    class SteppedStop(threading.Event):
+        def wait(self, timeout=None):
+            waiting.put(timeout)
+            duration = ticks.get()
+            if self.is_set():
+                return True
+            clock.now += duration
+            return False
+
+        def set(self):
+            super().set()
+            ticks.put(0.0)
+
+    monkeypatch.setattr(d, "time", SimpleNamespace(monotonic=lambda: clock.now))
     api = FakeUser32()
-    device = d._WindowsTouchpad(api)
+    device = d._WindowsTouchpad(api, sleep=lambda _: None)
+    device._stop = SteppedStop()
+
+    def step(duration):
+        before = len(api.frames)
+        ticks.put(duration)
+        waiting.get(timeout=2)  # The next wait acknowledges this frame finished.
+        assert len(api.frames) == before + 1
+        return api.frames[-1][0][3]
+
     try:
         device.begin()
+        waiting.get(timeout=2)
         device.update(1)
-        wait_until(lambda: len(api.frames) >= 4)
-        forward = [frame[0][3] for frame in api.frames[1:4]]
+        forward = []
+        for _ in range(3):
+            forward.append(step(elapsed))
+            assert step(0.0) == forward[-1]
         assert 4400 < forward[0] < forward[1] < forward[2] < 7400
         device.update(-1)
-        before = len(api.frames)
-        wait_until(lambda: len(api.frames) >= before + 3)
-        reversed_positions = [frame[0][3] for frame in api.frames[before:before + 3]]
-        assert reversed_positions[0] > reversed_positions[1] > reversed_positions[2] > 1400
+        reversed_positions = []
+        for _ in range(3):
+            reversed_positions.append(step(elapsed))
+            assert step(0.0) == reversed_positions[-1]
+        assert forward[-1] > reversed_positions[0] > reversed_positions[1] > reversed_positions[2] > 1400
+        worker = device._thread
         device.end(cancelled=True)
         assert api.frames[-2][0][3] == 4400
         assert all(contact[2] == 0xC000 for contact in api.frames[-1])
-        frame_count = len(api.frames)
-        threading.Event().wait(.04)
-        assert len(api.frames) == frame_count, "no animation survives gesture release"
+        assert not worker.is_alive(), "no animation survives gesture release"
+        assert device._thread is None
     finally:
         device.close()
     assert api.destroyed == [123]
