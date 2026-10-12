@@ -1,4 +1,4 @@
-# Hand tracker selection — September 2026
+# Hand tracker selection — October 2026
 
 ## Selected model
 
@@ -22,6 +22,9 @@ This supports testing WiLoR for occlusion, but does not establish frontal webcam
 mouse-control accuracy or evaluate the AnyHand checkpoint itself.
 
 ## Local comparison
+
+The following cross-model comparison was recorded on September 27, before the
+October detector-resolution change below.
 
 Hardware: RTX 5090, Ryzen 9 9900X, Windows. Four public annotated OneHand10K
 fixtures from [MMPose](https://github.com/open-mmlab/mmpose/tree/main/tests/data/onehand10k),
@@ -55,6 +58,52 @@ This is a bounded reference/synthetic check, not a live webcam or statistically
 representative benchmark. It does not measure real movement jitter, input latency,
 gesture accuracy, or this user's hand. Raw reports and the local comparison script
 remain in ignored `data/hand-benchmark/` and `data/compare_hand_models.py`.
+
+## October 10 RTX 5090 tuning
+
+The full AnyHand-WiLoR model already runs on CUDA with FP16 and all 32 layers.
+Increasing model size alone would not fix combined hand+EEG control: that path
+previously consumed landmarks from the JPEG preview, capped at eight updates per
+second, and its control loop also waited 125 ms between iterations.
+
+Combined click mode now reads a separate, fresh landmark snapshot on a 30 Hz
+control schedule. Each camera sequence is consumed once. The display keeps its
+image-aligned, eight-FPS preview, and EEG prediction keeps its separate 250 ms
+cadence. Slow or missing inference still pauses controls; this does not invent
+hand positions between camera frames or continue moving after hand loss.
+
+The detector now uses a **960-pixel inference size**, retaining the trained
+256-pixel reconstruction crop and the same confidence and anatomy checks.
+The camera frame remains 640×480; upsampling detection adds no sensor detail.
+A same-run comparison on the RTX 5090 used the same 16 fixtures plus eight fixed
+small-hand cases (four originals reduced to 50% and 30% scale):
+
+| Detector size | Original/rotated/occluded cases accepted | Small-hand cases accepted | Median complete inference |
+| --- | ---: | ---: | ---: |
+| 640 | 16/16 | 6/8 | 24.0 ms |
+| **960 (selected)** | **16/16** | **7/8** | **25.9 ms** |
+| 1280 | 16/16 | 7/8 | 29.6 ms |
+
+The 1280 setting also reduced mean per-case PCK on these fixtures. This small
+comparison supports 960 as a practical setting, not a guarantee for every hand,
+lighting condition, or webcam. Timing excludes camera capture, IPC and mouse
+dispatch. The ignored runner is `data/compare_wilor_detection.py`, with detailed
+results in `data/hand-benchmark/detector-scales.json`. Diagnostic comparisons can
+select `WiLoRModel(..., detector_size=640)` or `detector_size=1280` explicitly.
+
+An eight-second read-only check after loading the updated main app observed
+28.3 combined-control ticks/s and 23.7 distinct camera updates/s, with 47 ms
+median and 93 ms 95th-percentile control-frame age. The saved EEG model remained
+loaded with all 32 trials. Input was disarmed and a hand was visible in only
+25 of 357 status polls, so this verifies the faster delivery path rather than
+sustained hand accuracy or real click performance. The local report is
+`data/hand-benchmark/live-control-cadence.json`.
+
+The [AnyHand authors](https://github.com/chen-si-cs/AnyHand) recommend WiLoR for
+most users. Newer temporal reconstruction research is not automatically suitable
+for live control: [ViDiHand](https://arxiv.org/html/2606.30308) reports 5.5 FPS on
+four A100 GPUs and describes its current use as offline annotation. No claim is
+made that this app uses a universally best tracker.
 
 ## Runtime behavior
 

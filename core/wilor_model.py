@@ -230,13 +230,18 @@ class _HandSelector:
 class WiLoRModel:
     """Full 32-layer WiLoR transformer, with locally selected checkpoint."""
 
-    def __init__(self, model_dir, device_id=0, checkpoint_name="anyhand_wilor.ckpt", precision="float16"):
+    def __init__(self, model_dir, device_id=0, checkpoint_name="anyhand_wilor.ckpt", precision="float16",
+                 detector_size=960):
         if isinstance(device_id, bool) or not isinstance(device_id, int) or device_id < 0:
             raise ValueError("device_id must be a nonnegative integer")
         if checkpoint_name not in ("anyhand_wilor.ckpt", "wilor_final.ckpt"):
             raise ValueError("Unsupported WiLoR checkpoint name")
         if precision not in ("float32", "float16"):
             raise ValueError("precision must be float32 or float16")
+        # The 5090 comparison favors 960: more small-hand detections than 640,
+        # while 1280 costs more time and lowered accuracy on the same fixtures.
+        if type(detector_size) is not int or detector_size not in (640, 960, 1280):
+            raise ValueError("detector_size must be 640, 960 or 1280")
         model_dir = Path(model_dir)
         for name in (checkpoint_name, "detector.pt", "MANO_RIGHT.pkl", "mano_mean_params.npz"):
             if not (model_dir / name).is_file():
@@ -251,6 +256,7 @@ class WiLoRModel:
         self._torch = torch
         self._device = torch.device(f"cuda:{device_id}")
         self._dtype = torch.float16 if precision == "float16" else torch.float32
+        self._detector_size = detector_size  # Detection resolution; the trained pose crop remains 256 pixels.
         self._crop_scale = 2.0  # AnyHand's official predictor default.
         self._model = WiLor(mano_model_path=str(model_dir / "MANO_RIGHT.pkl"),
                             mano_mean_path=str(model_dir / "mano_mean_params.npz"),
@@ -272,6 +278,7 @@ class WiLoRModel:
             "vram_bytes": int(torch.cuda.get_device_properties(device_id).total_memory),
             "precision": precision, "landmarks": 21, "dimensions": 3,
             "loaded_state_tensors": loaded, "transformer_layers": 32,
+            "detector_size": detector_size, "pose_crop_size": 256,
         }
 
     def reset(self):
@@ -279,7 +286,7 @@ class WiLoRModel:
 
     def _detect(self, image):
         result = self._detector(image, conf=0.35, iou=0.3, max_det=4,
-                                verbose=False, device=self._device)[0]
+                                imgsz=self._detector_size, verbose=False, device=self._device)[0]
         if result.boxes is None or len(result.boxes) == 0:
             return np.empty((0, 4)), np.empty(0), np.empty(0, dtype=bool)
         boxes = result.boxes.xyxy.detach().cpu().numpy().astype(float)

@@ -18,6 +18,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 
 import yaml
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -61,11 +62,20 @@ from core.gestures import GestureRecognizer
 from core.hand_control import HandControls
 from core.hand_feedback import HandClickSound
 from core.multimodal import MultimodalPreview
+from core.eeg_click import EegClickController  # The explicit EEG mode gets only a lazy, current-pointer left-click actuator.
+from core.eeg_model_store import load_latest_decoder, save_archive  # Inert JSON calibration only; no executable model formats.
+from core.eeg_blink_store import load_latest_decoder as load_latest_blink_decoder, save_archive as save_blink_archive  # Blink evidence has a separate archive and strict decoder validation.
+from core.eeg_blink_store import load_latest_calibration, save_calibration_archive  # Untrained progress uses a distinct schema and cannot authorize input.
+from core.hand_mouse import HandMouseController  # Keep hand aiming and finger clicks while coordinating the additional EEG trigger.
 from core.voice import VoiceRecognizer
 from plugins.brainbit import BrainBit
 
 # Shared services are created during lifespan, rather than per HUD connection.
 _state: dict = {}
+# Saved EEG data stays inside this repository's ignored local data directory.
+_EEG_MODEL_DIRECTORY = Path(__file__).resolve().parent.parent / "data" / "eeg-models"
+_EEG_BLINK_MODEL_DIRECTORY = Path(__file__).resolve().parent.parent / "data" / "eeg-blink-models"  # Never overwrite or select the original eyes-closed calibration for blink control.
+_EEG_BLINK_CALIBRATION_DIRECTORY = Path(__file__).resolve().parent.parent / "data" / "eeg-blink-drafts"  # Canonical progress files are separate from frozen model archives.
 _clients: set = set()
 # One prediction window per connection: what the user is typing, and what we put
 # in front of them. Keyed by socket so two HUDs do not credit each other's hints.
@@ -650,7 +660,10 @@ async def lifespan(app: FastAPI):
             or gestures.status().get("tracker_cleanup_pending", False)
             or hand_controls.status().get("desktop", {}).get("cleanup_pending", False)),
         dispatch=actions.dispatch,
+        click_controller=EegClickController(),  # Construction injects no input; the service owns guarded clicks and cleanup.
+        pointer_controller=HandMouseController(eeg_compatible=True, bend_click=gesture_settings["bend_click"]),  # Keep finger clicks and the user's bend setting; report ownership to coordinate EEG.
     )
+    multimodal.set_control_mode("eeg_click")  # Open the simple rest/select practice workflow with all output disarmed.
 
     _state.update(
         {
@@ -2327,7 +2340,73 @@ async def multimodal_status(request: Request):
     # never enter the action dispatcher, WebSocket broadcasts, or journal.
     info = (preview.snapshot() if preview and request.url.path.endswith("/preview")
             else _multimodal_info())
+    info = _saved_eeg_metadata(info)
     return JSONResponse(info, headers=headers)
+
+
+def _saved_eeg_metadata(info):
+    """Expose only a saved basename, never feature vectors or filesystem paths."""
+    method = (info.get("eeg_control") or {}).get("method", "eyes_closed")  # Older service snapshots retain the established model profile.
+    saved = _state.get("eeg_saved_blink_model_file" if method == "double_blink" else "eeg_saved_model_file")  # A save acknowledgment belongs only to its own active method.
+    if saved and isinstance(info.get("eeg_control"), dict):
+        info = {**info, "eeg_control": {**info["eeg_control"], "saved_model_file": saved}}
+    calibration = _state.get("eeg_saved_calibration_file")
+    if calibration and method == "double_blink" and isinstance(info.get("eeg_control"), dict):
+        info = {**info, "eeg_control": {**info["eeg_control"], "saved_calibration_file": calibration}}  # Progress acknowledgment never appears as a trained model or another method's backup.
+    return info
+
+
+def _load_saved_eeg_model(preview):
+    """The client selects no filename; only the fixed local archive directory is read."""
+    if (preview.status().get("eeg_control") or {}).get("method") == "double_blink":
+        decoder, path = load_latest_blink_decoder(_EEG_BLINK_MODEL_DIRECTORY)  # The archive loader verifies the inert BlinkDecoder state.
+        outcome = preview.eeg_use_saved_blink_model(decoder, source=path.name)  # Blink loading has no experimental-validation bypass and never arms input.
+        if not outcome.get("error"):
+            _state.pop("eeg_saved_blink_model_file", None)  # The successfully loaded source supersedes an older blink save acknowledgment.
+        return outcome
+    decoder, path = load_latest_decoder(_EEG_MODEL_DIRECTORY)
+    # Core binds prediction to the live compatible acquisition while retaining historical validation.
+    outcome = preview.eeg_use_saved_model(decoder, use_unvalidated=True, source=path.name)
+    if not outcome.get("error"):
+        _state.pop("eeg_saved_model_file", None)  # Prefer the loaded source over a previous save acknowledgment.
+    return outcome
+
+
+def _save_eeg_model(preview):
+    """Export under the decoder lock, then write the inert archive atomically."""
+    if (preview.status().get("eeg_control") or {}).get("method") == "double_blink":
+        state = preview.eeg_export_blink_model()  # Core captures only the blink model while holding its decoder lock.
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        path = save_blink_archive(state, _EEG_BLINK_MODEL_DIRECTORY / f"double-blink-{stamp}.json")
+        _state["eeg_saved_blink_model_file"] = path.name  # Report only the local basename, scoped to this model type.
+        return _saved_eeg_metadata(preview.status())
+    archive = preview.eeg_export_model()
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    path = save_archive(archive, _EEG_MODEL_DIRECTORY / f"model-{stamp}.json")
+    _state["eeg_saved_model_file"] = path.name
+    return _saved_eeg_metadata(preview.status())
+
+
+def _save_eeg_progress(preview):
+    """Save only accepted blink calibration, without freezing or replacing its model."""
+    if (preview.status().get("eeg_control") or {}).get("method") != "double_blink":
+        raise ValueError("Choose double_blink before saving its calibration progress.")
+    state = preview.eeg_export_blink_calibration()  # Core rechecks the active profile while capturing its accepted features under lock.
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    path = save_calibration_archive(state, _EEG_BLINK_CALIBRATION_DIRECTORY / f"calibration-{stamp}.json")
+    _state["eeg_saved_calibration_file"] = path.name  # Expose only a basename, never the draft's features or filesystem location.
+    return _saved_eeg_metadata(preview.status())
+
+
+def _load_eeg_progress(preview):
+    """Explicitly resume a validated draft through the service's current-session checks."""
+    if (preview.status().get("eeg_control") or {}).get("method") != "double_blink":
+        raise ValueError("Choose double_blink before loading its calibration progress.")
+    decoder, path = load_latest_calibration(_EEG_BLINK_CALIBRATION_DIRECTORY)  # Only calibration-*.json is eligible; maintenance wrappers remain untouched.
+    outcome = preview.eeg_use_saved_blink_calibration(decoder, source=path.name)  # Core preserves provenance and never implicitly arms or starts a cue.
+    if not outcome.get("error"):
+        _state.pop("eeg_saved_calibration_file", None)  # The loaded source now describes the active draft instead of an older save acknowledgment.
+    return outcome
 
 
 @app.post("/multimodal/{operation}")
@@ -2340,7 +2419,11 @@ async def multimodal_operation(operation: str, request: Request):
                   "arm": "arm", "calibrate": "mark_trial", "reset_calibration": "reset_calibration",
                   "control_mode": "set_control_mode", "eeg_trial": "eeg_trial",
                   "eeg_train": "eeg_train", "eeg_reset": "eeg_reset",
-                  "eeg_arm": "eeg_arm", "eeg_guard": "eeg_guard"}
+                  "eeg_arm": "eeg_arm", "eeg_guard": "eeg_guard",
+                  "eeg_method": "eeg_method",  # Choosing a calibration method remains separate from starting, loading, or arming.
+                  "eeg_load_saved": "eeg_use_saved_model", "eeg_save": "eeg_export_model",
+                  "eeg_save_progress": "eeg_export_blink_calibration", "eeg_load_progress": "eeg_use_saved_blink_calibration",  # Progress operations remain explicit and separate from frozen-model selection.
+                  "eeg_target": "eeg_target"}  # Expose only the service's explicit practice/mouse destination setter.
     if operation not in operations:
         return JSONResponse({"error": "Unknown combined preview operation."}, status_code=404, headers=headers)
     try:
@@ -2349,7 +2432,7 @@ async def multimodal_operation(operation: str, request: Request):
         payload = None
     expected = {"arm": {"enabled"}, "calibrate": {"label"}, "control_mode": {"mode"},
                 "eeg_trial": {"label", "phase"}, "eeg_arm": {"enabled"},
-                "eeg_guard": {"token"}}.get(operation, set())
+                "eeg_guard": {"token"}, "eeg_target": {"target"}, "eeg_method": {"method"}}.get(operation, set())  # Reject extra click arguments at the boundary.
     if operation == "eeg_arm" and isinstance(payload, dict) and payload.get("enabled") is True:
         expected = {"enabled", "guard_token"}
     valid = isinstance(payload, dict) and set(payload) == expected
@@ -2358,9 +2441,13 @@ async def multimodal_operation(operation: str, request: Request):
     if valid and operation == "calibrate":
         valid = payload["label"] in ("left", "right")
     if valid and operation == "control_mode":
-        valid = payload["mode"] in ("webcam", "eeg")
+        valid = payload["mode"] in ("webcam", "eeg", "eeg_click")  # Keep legacy modes while explicitly admitting the binary workflow.
+    if valid and operation == "eeg_target":  # Destination selection cannot carry coordinates, button names, or arbitrary actions.
+        valid = payload["target"] in ("practice", "mouse")  # The core setter also disarms before accepting a new destination.
+    if valid and operation == "eeg_method":
+        valid = isinstance(payload["method"], str) and payload["method"] in ("eyes_closed", "double_blink")  # Accept only the two declared calibration profiles.
     if valid and operation == "eeg_trial":
-        valid = payload["label"] in ("left", "right", "rest") and payload["phase"] in ("train", "validate")
+        valid = payload["label"] in ("left", "right", "rest", "select") and payload["phase"] in ("train", "validate")  # The core enforces labels for the active decoder.
     token = (payload.get("token") if operation == "eeg_guard" else payload.get("guard_token")) if valid else None
     if valid and (operation == "eeg_guard" or operation == "eeg_arm" and payload["enabled"]):
         # The token binds explicit arming to the desktop main process's live
@@ -2374,11 +2461,22 @@ async def multimodal_operation(operation: str, request: Request):
     if preview is None:
         return JSONResponse({**_multimodal_info(), "error": "Restart the backend to enable the combined preview."},
                             status_code=503, headers=headers)
+    if operation in ("eeg_load_saved", "eeg_save", "eeg_load_progress", "eeg_save_progress"):
+        # Empty payload validation above prevents arbitrary paths, model data, or an implicit arm.
+        try:
+            action = {"eeg_load_saved": _load_saved_eeg_model, "eeg_save": _save_eeg_model,
+                      "eeg_load_progress": _load_eeg_progress, "eeg_save_progress": _save_eeg_progress}[operation]
+            outcome = await asyncio.to_thread(action, preview)
+        except (OSError, ValueError, TypeError) as exc:
+            outcome = {**preview.status(), "error": f"Saved EEG model: {exc}"}
+        return JSONResponse(_saved_eeg_metadata(outcome), status_code=409 if outcome.get("error") else 200, headers=headers)
     method = getattr(preview, operations[operation])
     args = ((payload["enabled"], payload.get("guard_token")) if operation == "eeg_arm" else
             (payload["enabled"],) if operation == "arm" else
             (payload["label"],) if operation == "calibrate" else
             (payload["mode"],) if operation == "control_mode" else
+            (payload["method"],) if operation == "eeg_method" else  # Forward only the chosen profile; it carries no arm or click permission.
+            (payload["target"],) if operation == "eeg_target" else  # Forward only the validated destination, never an immediate click request.
             (payload["label"], payload["phase"]) if operation == "eeg_trial" else
             (payload["token"],) if operation == "eeg_guard" else ())
     # Serialize acquisition starts against normal camera starts. Stop/disarm
@@ -2388,7 +2486,7 @@ async def multimodal_operation(operation: str, request: Request):
             outcome = await asyncio.to_thread(method, *args)
     else:
         outcome = await asyncio.to_thread(method, *args)
-    return JSONResponse(outcome, status_code=409 if outcome.get("error") else 200, headers=headers)
+    return JSONResponse(_saved_eeg_metadata(outcome), status_code=409 if outcome.get("error") else 200, headers=headers)
 
 
 @app.get("/health")

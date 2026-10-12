@@ -1674,6 +1674,52 @@ def test_no_hand_preview_has_current_camera_image_and_no_old_landmarks(monkeypat
     assert len(encoded) == 2
 
 
+def test_tracking_snapshot_reads_newer_hand_than_cached_jpeg_without_changing_overlay(monkeypatch):
+    recognizer, frame, cv2, clock, encoded, _resized = _preview_fixture(monkeypatch)
+    recognizer.preview()  # Establish one image lease, independently from the tracking reader.
+    recognizer._publish_preview(frame, _hand(), clock[0], cv2)
+    display = recognizer.preview()
+    lease = recognizer._preview_lease_until
+    clock[0] += 1 / 30
+    points = _hand(wrist=(0.6, 0.8))
+    recognizer._publish_preview(frame, points, clock[0], cv2)
+
+    tracking = recognizer.tracking_snapshot()
+    assert tracking["sequence"] > display["sequence"]
+    assert tracking["landmarks"] == [list(point) for point in points]
+    assert tracking["age_ms"] == 0 and tracking["tracked"]
+    assert "image" not in tracking
+    assert recognizer._preview_lease_until == lease  # Reading for input cannot prolong image encoding.
+    assert len(encoded) == 1
+    assert recognizer.preview()["landmarks"] == display["landmarks"]  # The existing JPEG overlay remains aligned.
+    tracking["landmarks"][0][0] = 99
+    assert recognizer.tracking_snapshot()["landmarks"][0][0] != 99  # Input consumers receive an isolated geometry copy.
+
+
+def test_tracking_snapshot_works_without_jpeg_lease_and_rejects_loss_staleness_and_stop(monkeypatch):
+    recognizer, frame, cv2, clock, encoded, _resized = _preview_fixture(monkeypatch)
+    recognizer._publish_preview(frame, _hand(), clock[0], cv2)
+    assert recognizer.tracking_snapshot()["tracked"]
+    assert recognizer._preview_lease_until == 0
+    assert encoded == []  # Pointer tracking alone never invokes the JPEG encoder.
+
+    clock[0] += 1 / 30
+    recognizer._publish_preview(frame, [], clock[0], cv2)
+    lost = recognizer.tracking_snapshot()
+    assert not lost["tracked"] and lost["landmarks"] == []  # Missing hands are visible on the next inference, not the next JPEG.
+    recognizer._publish_preview(frame, _hand(), clock[0], cv2)
+    clock[0] += 0.501
+    stale = recognizer.tracking_snapshot()
+    assert not stale["tracked"] and stale["landmarks"] == []
+    assert stale["last_reason"] == "stale_frame"
+
+    recognizer._publish_preview(frame, _hand(), clock[0], cv2)
+    recognizer._stop.set()  # A shutdown request must invalidate input before the capture thread finishes.
+    stopped = recognizer.tracking_snapshot()
+    assert not stopped["running"] and not stopped["tracked"] and stopped["landmarks"] == []
+    assert recognizer._preview_lease_until == 0 and encoded == []
+
+
 def test_preview_distinguishes_a_visible_unknown_pose_from_a_missing_hand(monkeypatch):
     recognizer, frame, cv2, clock, _encoded, _resized = _preview_fixture(monkeypatch)
     recognizer.preview()

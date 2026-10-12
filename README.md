@@ -39,8 +39,10 @@ preserved in the [historical archive](archive/README.md).
 
 For optional BrainBit headset connection and the explicitly started, local EEG +
 webcam experiment, see the [BrainBit guide](docs/brainbit.md). The experimental
-preview is disarmed by default. Its experimental EEG-only left/right/rest model
-requires separate training, held-out validation, and explicit desktop arming.
+preview is disarmed by default. Its default selection mode uses hand movements
+to aim the pointer, keeps finger clicks and drags, and adds a trained rest/select
+EEG pattern for clicking. Separate
+training, held-out validation, and explicit arming are required.
 
 The latest combined camera and EEG work is on
 [`update_10_10_2026_eeg_signal_status`](https://github.com/soheilAppear/IntuitionOS/tree/update_10_10_2026_eeg_signal_status).
@@ -67,8 +69,8 @@ A frameless, always-on-top ambient overlay that lives at the top of your screen.
 - Reminder toasts flash the HUD border when a scheduled task fires
 - Optional BrainBit panel with device connection, EEG live/stale/error status,
   channel count, sample rates, sample age, and acquisition counters
-- Explicitly started EEG waveform preview, with optional webcam-assisted
-  experiments and separate training/validation before desktop control
+- Explicitly started hand-camera and EEG waveform preview, with hand aiming,
+  EEG selection, and separate training/validation before desktop control
 
 ### Terminal (classic)
 
@@ -183,19 +185,120 @@ Install the optional SDK into the existing project environment, then launch:
 ```
 
 In **BrainBit**, choose **Discover devices**, select the headset, and **Connect**.
-Turn off the normal Hand controls camera. In **Experimental hand + EEG**, choose
-**Control source → EEG classifier**, then **Start preview** to view EEG without
-starting the webcam. Leave both **Arm … swipes** controls unchecked. Viewing
-signals requires neither classifier training nor Ollama; an untrained prediction
-message does not prevent waveforms from appearing.
+Turn off the normal Hand controls camera. **Experimental hand + EEG** now opens
+with **Control source → EEG selection / click** and **Selection target → Practice
+counter**. Choose **Start preview** to view the hand camera and EEG. Leave **Arm
+hand controls + EEG practice** unchecked for preview only. Viewing signals requires
+neither classifier training nor Ollama; an untrained prediction message does not
+prevent waveforms from appearing.
+
+To try selection and a single mouse click with **EEG click method → Eyes closed
+(existing model)**:
+
+1. Collect **8 training trials each for rest and select**, alternating labels.
+   Each trial lasts five seconds. For rest, keep your eyes open and relax. For
+   select, gently close your eyes, count four seconds, then reopen; keep your
+   head and jaw still. Keep the camera running; pointing is not needed during
+   calibration, and pointer movement remains disarmed.
+2. Choose **Train & freeze model**; the phase switches to **Validation**. Collect **8 new
+   trials per label**. Keep acquisition running. Validation determines whether
+   EEG clicks are enabled by the normal model path; hand aiming and finger clicks
+   can be armed independently. Choose **Save EEG model & trials** to retain
+   the model, training features and original validation results locally.
+3. Keep your hand visible in the camera, leave **Practice counter** selected,
+   and explicitly **Arm hand controls + EEG practice**. Point your index finger briefly,
+   then move your hand to aim the pointer. Pinch/release clicks and pinch-hold
+   drags remain active; optional index bend clicks follow your existing Hand
+   controls setting. **Practice affects only EEG: finger clicks and drags still
+   affect the desktop.** EEG selections increment the counter. Keep your hand visible and still
+   during selection. One action needs one second of confident rest, three distinct confident select
+   predictions, then one second of confident rest after reopening your eyes.
+   Holding select cannot repeat an action; an unfinished selection expires after
+   eight seconds and is cancelled without switching off hand controls.
+4. Choose **Mouse left click** when ready. Changing the target disarms; explicitly
+   **Arm hand controls + EEG clicks** again, then point briefly, aim with your hand, and repeat the
+   rest → select → rest cycle. It sends one left click at the current pointer;
+   finger clicks remain available too. Ordinary aiming continues through uncertain
+   EEG; the pointer holds only after a selection is confirmed. Finger gestures take priority and cancel a pending
+   EEG selection so it cannot add a second click. A fresh rest cycle is required
+   before the next EEG selection. Losing hand tracking cancels the selection,
+   releases an owned drag and pauses movement. Show your hand and point briefly
+   to resume at the current cursor position, without another arm-button step.
+   Stale or invalid EEG pauses EEG clicks while hand aiming and finger clicks continue.
+   Press **Escape** to stop and disarm
+   hand movement, finger input, and EEG clicks from any app.
+
+Hand aiming now consumes fresh camera landmarks on a 30 Hz control schedule,
+independently of the slower preview images and EEG predictions. The configured
+RTX 5090 tracker uses full AnyHand-WiLoR on CUDA with a 960-pixel detector;
+see the [measured tracker comparison](docs/hand-tracking.md#october-10-rtx-5090-tuning).
+Actual movement updates still depend on fresh camera inference.
+
+The default is a two-state signal-pattern experiment, not thought reading: eye,
+muscle, and electrode artifacts can affect classification. **Webcam direction
+(advanced)** and **EEG classifier (advanced swipes)** retain the older direction
+experiments. The [selection guide](docs/brainbit.md#eeg-selection-and-mouse-click)
+explains calibration, timing, and the Escape guard. New control, feature, and
+actuator logic includes inline comments explaining its checks and cleanup.
 
 **EEG live** means recent samples are arriving. It does not certify clean EEG:
 electrode drift, movement, and electrical interference can still affect a stream
 with no packet errors. Use **Stop & disarm (Esc)** before **Contact check (5 s)**,
 then restart preview. The [BrainBit guide](docs/brainbit.md) explains USB Bluetooth
 dongles, status indicators, [signal-quality checks](docs/brainbit.md#checking-signal-quality),
-and the separate calibration workflow. Samples remain in a bounded local memory
-buffer; the app does not save raw EEG recordings.
+and the separate calibration workflow. Eyes-closed click features use bounded 4–30 Hz power
+instead of broadband variance, without filtering the displayed raw traces or
+relaxing raw-signal checks. Samples remain in a bounded local memory buffer;
+the app does not save raw EEG recordings.
+
+The integrated controls move the real Windows cursor; a separate practice app is
+not required. In **Eyes closed (existing model)**, **Use saved EEG model** restores the latest local archive into a
+compatible running stream without repeating training. This explicitly selects an
+experimental saved model, including one whose original validation failed. The
+original score and failure stay visible; model selection leaves controls disarmed.
+Choose **Mouse left click**, then explicitly arm the hand controls and EEG clicks.
+
+Model backups stay in the Git-ignored `data/eeg-models/` directory.
+The JSON archive retains model parameters, derived training features, validation
+predictions and the original acquisition context. `core.eeg_model_store.load_decoder`
+checks and restores these values without arming controls. **Use saved EEG model**
+binds only inference to the new compatible acquisition; historical trial evidence
+keeps its original context. See
+[model backup and reuse details](docs/brainbit.md#model-backups-and-reuse).
+
+For a brief blink command, choose **EEG click method → Deliberate double blink**
+in the same panel. It uses a separate local model and retains your eyes-closed
+training and validation. **Collect remaining training** guides the unfinished
+**8 No command + 8 Double blink training trials**, with a three-second preparation
+countdown before each cue. Existing accepted trials are kept. Read normally and
+allow natural single blinks for No command; blink twice gently when prompted for
+Double blink, then keep your eyes open. Each trial lasts about five seconds.
+Wait while the cue says **Finishing signal collection**. A rejected trial pauses the sequence without
+clearing accepted data; **Cancel queued trials** stops future cues and lets the
+current trial finish. Manual trial buttons remain available.
+
+Training retains every accepted example, allows small timing differences, and
+learns from consistent whole double-blink trials: at least 6 of 8, or 75% when
+more are collected. After both classes reach eight and before freezing,
+**Collect another double-blink trial** lets you add clearer examples without
+resetting the existing data, up to 80 accepted training trials total. Fresh validation
+is still required after training.
+
+Choose **Train & freeze model**, then explicitly choose **Collect remaining
+validation** for **8 new trials of each**. Include normal reading, single blinks,
+and gentle jaw/head motion in no-command validation. Keep the preview running
+through training and validation.
+
+After validation passes, choose **Mouse left click** and **Arm hand controls + EEG
+clicks**. Your hand moves the Windows cursor; one recognized deliberate double
+blink produces one left click. Finger clicks and drags remain active. A single
+blink is not a command, and this method needs no sustained eyes-closed hold or
+rest/select/rest cycle. **Save double-blink model & trials** saves its learned pulse
+waveform features and validation metadata separately as `double-blink-*.json`.
+Loading a blink model does not bypass failed validation. Method changes disarm
+without clearing either model. See the [double-blink workflow](docs/brainbit.md#deliberate-double-blink-clicks)
+for calibration details. This is learned eye-movement waveform detection;
+automated tests do not establish your headset's end-to-end response time.
 
 ### Terminal
 

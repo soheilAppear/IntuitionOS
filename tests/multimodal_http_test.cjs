@@ -28,7 +28,13 @@ for (const [action, payload] of [['status', {}], ['preview', {}], ['start', {}],
   ['contact', {}], ['arm', { enabled: true }], ['calibrate', { label: 'left' }], ['reset_calibration', {}],
   ['eeg_trial', { label: 'rest', phase: 'train' }], ['eeg_trial', { label: 'right', phase: 'validate' }],
   ['eeg_train', {}], ['eeg_reset', {}], ['eeg_arm', { enabled: true, guard_token: guardToken }],
-  ['eeg_arm', { enabled: false }], ['eeg_guard', { token: guardToken }], ['control_mode', { mode: 'eeg' }]]) {
+  ['eeg_arm', { enabled: false }], ['eeg_guard', { token: guardToken }], ['control_mode', { mode: 'eeg' }],
+  // Binary trials and explicit output targets keep the same constrained local transport.
+  ['control_mode', { mode: 'eeg_click' }], ['eeg_trial', { label: 'select', phase: 'train' }],
+  ['eeg_trial', { label: 'select', phase: 'validate' }], ['eeg_target', { target: 'practice' }],
+  ['eeg_target', { target: 'mouse' }], ['eeg_load_saved', {}], ['eeg_save', {}],
+  ['eeg_save_progress', {}], ['eeg_load_progress', {}],
+  ['eeg_method', { method: 'eyes_closed' }], ['eeg_method', { method: 'double_blink' }]]) {
   test(`local ${action} request has constrained method, payload and native header`, async () => {
     const t = transport(action, payload), get = ['status', 'preview'].includes(action), options = t.calls[0];
     assert.equal(options.hostname, '127.0.0.1'); assert.equal(options.port, 7432);
@@ -49,11 +55,21 @@ test('arbitrary routes and extra action fields are rejected before network acces
     ['eeg_trial', { label: 'rest' }], ['eeg_trial', { label: 'up', phase: 'train' }],
     ['eeg_trial', { label: 'left', phase: 'test' }], ['eeg_trial', { label: 'rest', phase: 'train', raw: [] }],
     ['eeg_train', { save: true }], ['eeg_reset', { record: true }],
+    ['eeg_load_saved', { path: 'C:/private/model.json' }], ['eeg_save', { path: '../model.json' }],
+    ['eeg_save_progress', { path: '../draft.json' }], ['eeg_load_progress', { path: 'C:/private/draft.json' }],
+    ['eeg_save_progress', { samples: [] }], ['eeg_load_progress', { enabled: true }],
+    ['eeg_method', {}], ['eeg_method', { method: 'single_blink' }], ['eeg_method', { method: null }],
+    ['eeg_method', { method: ['double_blink'] }], ['eeg_method', { method: 'double_blink', enabled: true }],
+    ['eeg_method', { method: 'double_blink', model: {} }],
     ['eeg_arm', { enabled: true }], ['eeg_arm', { enabled: true, guard_token: 'not-a-uuid' }],
     ['eeg_arm', { enabled: false, guard_token: guardToken }], ['eeg_guard', { token: guardToken, arm: true }],
     ['eeg_guard', { token: 'bad' }], ['eeg_guard', { token: '11111111-2222-1333-8444-555555555555' }],
     ['eeg_guard', { token: '11111111-2222-4333-7444-555555555555' }],
-    ['control_mode', { mode: 'both' }], ['control_mode', { mode: 'eeg', enabled: true }]]) {
+    ['control_mode', { mode: 'both' }], ['control_mode', { mode: 'eeg', enabled: true }],
+    // Targets cannot supply arbitrary mouse buttons, coordinates, or implicit arming.
+    ['eeg_target', {}], ['eeg_target', { target: 'right_click' }],
+    ['eeg_target', { target: 'mouse', enabled: true }], ['eeg_target', { target: 'mouse', x: 100 }],
+    ['eeg_trial', { label: 'select', phase: 'train', target: 'mouse' }]]) {
     const t = transport(action, payload);
     await assert.rejects(t.promise, /Invalid preview/); assert.equal(t.calls.length, 0);
   }

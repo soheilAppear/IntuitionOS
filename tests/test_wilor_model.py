@@ -356,3 +356,43 @@ def test_unknown_checkpoint_name_rejected(tmp_path):
 def test_unsupported_precision_rejected_before_model_load(tmp_path, precision):
     with pytest.raises(ValueError, match="precision must be"):
         WiLoRModel(tmp_path, precision=precision)
+
+
+@pytest.mark.parametrize("detector_size", [True, 960.0, "960", 0, 256, 4096, None])
+def test_invalid_detector_resolution_fails_before_gpu_load(tmp_path, detector_size):
+    with pytest.raises(ValueError, match="detector_size must be"):
+        WiLoRModel(tmp_path, detector_size=detector_size)
+
+
+def test_higher_resolution_detector_keeps_original_image_coordinates_and_score_gate():
+    model = mock_model()
+    model._device = "cuda:0"
+    model._detector_size = 960
+    frame = np.zeros((480, 640, 3), np.uint8)
+
+    def tensor(values):
+        return SimpleNamespace(detach=lambda: SimpleNamespace(
+            cpu=lambda: SimpleNamespace(numpy=lambda: np.array(values))))
+
+    boxes = SimpleNamespace(
+        xyxy=tensor([[100, 120, 200, 300], [0, 0, 100, 100], [200, 120, 300, 300]]),
+        conf=tensor([.9, .34, .8]), cls=tensor([1, 0, 2]))
+    # Match the small Ultralytics tensor interface without importing CUDA.
+    class Boxes:
+        xyxy, conf, cls = boxes.xyxy, boxes.conf, boxes.cls
+        def __len__(self):
+            return 3
+
+    def detect(image, **options):
+        assert image is frame
+        assert options == dict(conf=.35, iou=.3, max_det=4, imgsz=960,
+                               verbose=False, device="cuda:0")
+        return [SimpleNamespace(boxes=Boxes())]
+
+    model._detector = detect
+    detected, scores, rights = model._detect(frame)
+    # YOLO already maps resized inference back to source pixels; scaling again
+    # would shift the pointer. Weak scores and unsupported classes stay rejected.
+    np.testing.assert_array_equal(detected, [[100, 120, 200, 300]])
+    np.testing.assert_array_equal(scores, [.9])
+    assert rights.tolist() == [True]

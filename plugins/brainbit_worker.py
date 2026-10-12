@@ -46,7 +46,7 @@ class SDKSession:
         self._scan_seconds = min(15.0, max(0.0, float(scan_seconds)))
         self._emit = emit or (lambda _snapshot: None)
         self._emit_acquisition = emit_acquisition or (lambda _frame: None)
-        self._command_enum = command_enum
+        self._command_enum = command_enum 
         self._lock = threading.RLock()
         self._scanner = None
         self._sensor = None

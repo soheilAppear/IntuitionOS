@@ -1,7 +1,10 @@
 // Local native transport only. Raw camera/EEG previews never use browser CORS.
 const http = require('node:http');
 const ACTIONS = new Set(['status', 'preview', 'start', 'stop', 'contact', 'arm', 'calibrate', 'reset_calibration',
-  'eeg_trial', 'eeg_train', 'eeg_reset', 'eeg_arm', 'eeg_guard', 'control_mode']);
+  // Selection target changes use their own explicit, local action.
+  'eeg_trial', 'eeg_train', 'eeg_reset', 'eeg_arm', 'eeg_guard', 'eeg_target', 'eeg_method', 'eeg_load_saved', 'eeg_save',
+  // Draft endpoints accept only empty JSON; the backend chooses the local file and verifies its format.
+  'eeg_save_progress', 'eeg_load_progress', 'control_mode']);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 async function requestMultimodal(action = 'status', payload = {}) {
@@ -14,9 +17,15 @@ async function requestMultimodal(action = 'status', payload = {}) {
     : action === 'eeg_guard' ? keys.length !== 1 || typeof payload.token !== 'string' || !UUID.test(payload.token)
     : action === 'arm' ? keys.length !== 1 || typeof payload.enabled !== 'boolean'
     : action === 'calibrate' ? keys.length !== 1 || !['left', 'right'].includes(payload.label)
-    : action === 'eeg_trial' ? keys.length !== 2 || !['left', 'right', 'rest'].includes(payload.label)
+    // The backend binds these labels to the currently selected decoder mode.
+    : action === 'eeg_trial' ? keys.length !== 2 || !['left', 'right', 'rest', 'select'].includes(payload.label)
       || !['train', 'validate'].includes(payload.phase)
-    : action === 'control_mode' ? keys.length !== 1 || !['webcam', 'eeg'].includes(payload.mode)
+    // A target never includes coordinates or an executable action from the renderer.
+    : action === 'eeg_target' ? keys.length !== 1 || !['practice', 'mouse'].includes(payload.target)
+    // Gesture selection names one supported detector; it cannot carry model data or arm permission.
+    : action === 'eeg_method' ? keys.length !== 1 || !['eyes_closed', 'double_blink'].includes(payload.method)
+    // Preserve the earlier direction experiments behind explicit advanced choices.
+    : action === 'control_mode' ? keys.length !== 1 || !['webcam', 'eeg', 'eeg_click'].includes(payload.mode)
     : keys.length !== 0) throw new Error('Invalid preview arguments');
   const method = ['status', 'preview'].includes(action) ? 'GET' : 'POST';
   const headers = { 'X-Intuition-Multimodal': '1' };

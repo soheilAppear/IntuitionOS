@@ -781,6 +781,30 @@ class GestureRecognizer:
 
     # ── On-demand camera diagnostics ─────────────────────────────────────
 
+    def tracking_snapshot(self) -> dict:
+        """Read the newest completed inference without requesting or copying a JPEG.
+
+        Pointer control needs every available hand update; the eight-FPS image
+        preview deliberately keeps its own older, image-aligned landmarks.
+        """
+        now = time.monotonic()  # Age landmarks from capture time, including inference latency.
+        with self._lock:  # Capture landmarks and their sequence atomically with the producer.
+            running = self._running and not self._stop.is_set()  # A stopping worker cannot authorize input.
+            source = self._diagnostic if running else self._empty_diagnostic()  # Never expose a stopped hand.
+            info = {key: source[key] for key in ("sequence", "tracked", "landmarks", "fps", "raw_pose",
+                                                "pose", "state", "progress", "hint", "last_reason")}  # Omit pixels entirely.
+            captured_at = source.get("captured_at")  # Use the latest inference's original frame timestamp.
+            age_ms = max(0, round((now - captured_at) * 1000)) if captured_at is not None else None
+            if age_ms is not None and age_ms > 500:  # Keep the same stale-frame boundary as the image preview.
+                info.update(tracked=False, landmarks=[], raw_pose=NONE, pose=NONE,
+                            state="waiting", progress=0.0, hint="Waiting for fresh camera frames",
+                            last_reason="stale_frame")  # An old pose cannot continue moving or clicking.
+            if not running:
+                info.update(sequence=self._capture_sequence, state=self._state, hint=self._reason,
+                            last_reason=self._diagnostic.get("last_reason") or "camera_off")
+            return {**info, "landmarks": [list(point) for point in info["landmarks"]],  # Callers cannot mutate live geometry.
+                    "running": running, "age_ms": age_ms, "tracker_backend": self.tracker_backend}
+
     def preview(self) -> dict:
         """Read the latest frame and renew a short encoding lease, never start capture.
 

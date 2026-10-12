@@ -6,7 +6,8 @@ import json
 import numpy as np
 import pytest
 
-from core.eeg_decoder import EegDecoder, LABELS, extract_features
+# Import the versioned click profile so tests exercise the public processing contract.
+from core.eeg_decoder import CLICK_FEATURE_PROFILE, EegDecoder, LABELS, extract_features
 
 
 CHANNELS = [{"num": 0, "name": "T3"}, {"num": 1, "name": "T4"}]
@@ -395,3 +396,290 @@ def test_indistinguishable_training_classes_abstain_without_ood():
     assert result["label"] is None
     assert result["confidence"] == pytest.approx(1 / 3)
     assert "Uncertain" in result["reason"]
+
+
+def click_extracted(label="rest", index=0, *, session="click-session"):
+    """Build independent synthetic click windows without reading a device."""
+    # Reuse separated synthetic vectors while mapping their labels to the binary task.
+    trial = extracted("left" if label == "select" else "rest", index, jitter=(index % 8 - 3.5) * 0.015,
+                      session=session)
+    # Tag the actual transform expected by the binary decoder before it binds a session.
+    trial["context"]["feature_profile"] = CLICK_FEATURE_PROFILE
+    # Return a fresh dictionary on every call so fault injection cannot affect later trials.
+    return trial
+
+
+def trained_click_decoder():
+    """Freeze a binary model using exactly eight chronological trials per class."""
+    # Both labels and processing are explicit; the legacy constructor remains unchanged.
+    decoder = EegDecoder(labels=("rest", "select"), feature_profile=CLICK_FEATURE_PROFILE)
+    # Alternate classes so counts and window order match a practical guided session.
+    for index in range(16):
+        # Select each configured class in its public immutable order.
+        label = decoder.labels[index % 2]
+        # Each vector has a unique identity and nonoverlapping packet counters.
+        assert decoder.add_trial(label, click_extracted(label, index), trial_id=index)["ok"]
+    # Freeze once; every following trial must be held out from parameter fitting.
+    assert decoder.train()["ok"]
+    # Return the real decoder, keeping validation and fault tests independent.
+    return decoder
+
+
+@pytest.mark.parametrize("labels", [None, "rest", {}, ("rest",), ("rest", "rest"),
+                                  ("left", "right"), ("rest", "unknown"),
+                                  ("rest", "select", "left", "right"), ("rest", [])])
+def test_decoder_rejects_invalid_label_configuration(labels):
+    # Invalid classes must fail before calibration can construct an unsafe model.
+    with pytest.raises(ValueError, match="labels"):
+        # Exercise the public constructor rather than reaching into private state.
+        EegDecoder(labels=labels)
+
+
+def test_click_configuration_is_immutable_and_survives_reset():
+    # Start with mutable caller-owned configuration to test defensive copying.
+    labels = ["rest", "select"]
+    # Bind both the two-class order and the processing profile at construction.
+    decoder = EegDecoder(labels=labels, feature_profile=CLICK_FEATURE_PROFILE)
+    # A caller modifying its original list must not relabel the model.
+    labels[1] = "left"
+    # The public configuration is an immutable tuple in its original order.
+    assert decoder.labels == ("rest", "select")
+    # Returned status lists must also be independent from internal configuration.
+    decoder.status()["labels"][1] = "right"
+    # Reassignment through the public API must not silently alter a frozen model later.
+    with pytest.raises(AttributeError):
+        # Assignment intentionally tests the read-only label property.
+        decoder.labels = ("rest", "left")
+    # Processing must be equally immutable, even before the first trial.
+    with pytest.raises(AttributeError):
+        # Assignment intentionally tests the read-only profile property.
+        decoder.feature_profile = None
+    # Reset clears data, not the user's selected calibration protocol.
+    status = decoder.reset()
+    # No discarded caller or status mutation may leak into the reset configuration.
+    assert status["labels"] == ["rest", "select"]
+    # The processing version remains explicit after reset.
+    assert status["feature_profile"] == CLICK_FEATURE_PROFILE
+    # The displayed feature description must match what the click extractor computes.
+    assert "[4,30)" in status["feature_processing"]
+
+
+@pytest.mark.parametrize("profile", ["unknown", True, {}, []])
+def test_unknown_processing_profiles_fail_closed(profile):
+    # Invalid decoder configuration should surface immediately as a configuration error.
+    with pytest.raises(ValueError, match="feature profile"):
+        # Do not silently default to variance when the requested transform is unsupported.
+        EegDecoder(feature_profile=profile)
+    # Extraction uses the existing rejection result instead of raising during a preview.
+    result = extract_features(packets(), CHANNELS, 250, feature_profile=profile)
+    # The caller must be able to suppress inference using the ordinary error contract.
+    assert not result["ok"] and "feature profile" in result["reason"]
+
+
+def test_click_power_excludes_line_bin_without_hiding_raw_diagnostics():
+    # Use real synthetic full-rate samples so this test checks actual spectral processing.
+    clean_rows = packets()
+    # Add strong line interference without crossing the unchanged raw amplitude limit.
+    noisy_rows = copy.deepcopy(clean_rows)
+    # A 60 Hz sinusoid should affect raw RMS far more than integrated 4--30 Hz power.
+    for index, row in enumerate(noisy_rows):
+        # Keep each original EEG sample and add the same controlled electrical component.
+        row["samples"] = [value + 500e-6 * np.sin(2 * np.pi * 60 * index / 250) for value in row["samples"]]
+    # Legacy extraction must retain the exact old context when no profile is selected.
+    legacy = extract_features(noisy_rows, CHANNELS, 250, {"session_id": "line-test"})
+    # Explicit None must remain fully equivalent to the default call.
+    assert legacy == extract_features(noisy_rows, CHANNELS, 250, {"session_id": "line-test"}, feature_profile=None)
+    # An omitted version key distinguishes the backwards-compatible legacy context.
+    assert "feature_profile" not in legacy["context"]
+    # Process both recordings with the identical versioned click transform.
+    click_clean = extract_features(clean_rows, CHANNELS, 250, {"session_id": "line-test"}, feature_profile=CLICK_FEATURE_PROFILE)
+    # No external filter or interpolated sample is involved in this comparison.
+    click_noisy = extract_features(noisy_rows, CHANNELS, 250, {"session_id": "line-test"}, feature_profile=CLICK_FEATURE_PROFILE)
+    # All three valid sample windows should satisfy unchanged engineering gates.
+    assert legacy["ok"] and click_clean["ok"] and click_noisy["ok"]
+    # The returned context must bind the click transform for downstream model checks.
+    assert click_noisy["context"]["feature_profile"] == CLICK_FEATURE_PROFILE
+    # Raw RMS and excursions still reveal interference; the click transform does not conceal it.
+    assert click_noisy["diagnostics"] == legacy["diagnostics"]
+    # Recover linear powers to verify that feature zero covers exactly the three adjacent bands.
+    powers = np.exp(np.asarray(click_noisy["features"]).reshape(-1, 4))
+    # Integrated 4--30 Hz power must equal the sum of the existing theta, alpha, and beta bins.
+    np.testing.assert_allclose(powers[:, 0], powers[:, 1:].sum(axis=1), rtol=1e-12)
+    # A finite Hann window permits tiny leakage; require negligible change in total band power.
+    np.testing.assert_allclose(np.asarray(click_clean["features"])[::4],
+                               np.asarray(click_noisy["features"])[::4], rtol=0, atol=0.02)
+    # The legacy broadband feature should still expose the deliberately much larger line power.
+    assert all(np.asarray(legacy["features"])[::4] > np.asarray(click_noisy["features"])[::4] + 4)
+
+
+@pytest.mark.parametrize("fault", ["spike", "flat", "plateau", "gap"])
+def test_click_profile_preserves_raw_quality_rejections(fault):
+    # Start from finite contiguous full-rate synthetic EEG before injecting one fault.
+    rows = packets()
+    # Excess raw amplitude must be rejected even if band selection would attenuate it.
+    if fault == "spike":
+        # A 20 mV spike exceeds the unchanged 10 mV peak-to-peak limit.
+        rows[200]["samples"][0] += 0.020
+    # A constant channel cannot become a usable selection signal through band processing.
+    elif fault == "flat":
+        # Replace every sample of one channel with a constant baseline.
+        for row in rows:
+            # Keep the other channel valid to test per-channel enforcement.
+            row["samples"][0] = 0.001
+    # Repeated extrema remain a possible-clipping rejection before spectral extraction.
+    elif fault == "plateau":
+        # Ten repeated extremes exceed the existing minimum plateau length.
+        for row in rows[100:110]:
+            # This amplitude stays below the raw-excursion ceiling to isolate the plateau gate.
+            row["samples"][0] = 100e-6
+    # Discontinuous counters must never be repaired by the new feature profile.
+    else:
+        # Introduce one duplicate/gap pair without changing timestamps or values.
+        rows[200]["counter"] += 1
+    # Both profiles should reject the same unchanged raw acquisition defect.
+    assert not extract_features(rows, CHANNELS, 250, feature_profile=CLICK_FEATURE_PROFILE)["ok"]
+
+
+def test_binary_validation_uses_two_classes_and_keeps_frozen_parameters():
+    # Train with the real binary model and keep an exact copy of every fitted parameter.
+    decoder = trained_click_decoder()
+    # A trained model alone must never authorize a click.
+    assert not decoder.status()["arm_eligible"]
+    # Copy arrays because validation must not update normalization, radii, or centroids.
+    frozen = {key: value.copy() for key, value in decoder._model.items()}
+    # New validation windows follow training chronologically and share no sample counters.
+    for index in range(16, 32):
+        # Alternate rest/select to obtain exactly eight held-out trials for each.
+        label = decoder.labels[index % 2]
+        # Synthetic separated classes should be evaluated by the same public inference method.
+        assert decoder.add_trial(label, click_extracted(label, index), phase="validate", trial_id=index)["ok"]
+    # Inspect public metrics rather than assuming three-class array positions.
+    status = decoder.status()
+    # Both classes must pass all unchanged gates before the service can consider arming.
+    assert status["arm_eligible"] and status["passed_validation"]
+    # The majority-class baseline for a balanced binary holdout is one half.
+    assert status["evaluation"]["baseline_accuracy"] == 0.5
+    # A successful binary classifier should not have its recall divided by three.
+    assert status["evaluation"]["balanced_accuracy"] == 1.0
+    # Rest errors are counted using select rather than nonexistent direction columns.
+    assert status["evaluation"]["rest_false_activations"] == 0
+    # The reported unit must disclose selection predictions, not desktop swipes.
+    assert "Accepted select predictions" in status["evaluation"]["rest_false_activation_unit"]
+    # No training or holdout sample may change a frozen parameter.
+    for key, expected in frozen.items():
+        # Exact equality catches accidental retraining during validation.
+        np.testing.assert_array_equal(decoder._model[key], expected)
+    # New training is forbidden until an explicit reset clears the model.
+    assert not decoder.add_trial("select", click_extracted("select", 32), trial_id=32)["ok"]
+    # Completed class validation cannot be extended until a favorable result appears.
+    assert not decoder.add_trial("rest", click_extracted("rest", 32), phase="validate", trial_id=32)["ok"]
+
+
+def test_one_false_select_in_eight_rest_trials_blocks_binary_arming():
+    # Fit clean separated classes before introducing one held-out false activation.
+    decoder = trained_click_decoder()
+    # Validation uses a fixed chronological sequence, including the deliberately wrong trial.
+    for index in range(16, 32):
+        # The real cue remains rest for even indices, including the first validation trial.
+        label = decoder.labels[index % 2]
+        # The first rest sample deliberately resembles select; all later trials are ordinary.
+        observed_label = "select" if index == 16 else label
+        # Retain the incorrect prediction rather than discarding or relabeling the trial.
+        assert decoder.add_trial(label, click_extracted(observed_label, index), phase="validate", trial_id=index)["ok"]
+    # One false select out of eight rest trials exceeds the unchanged ten-percent limit.
+    status = decoder.status()
+    # A seemingly high overall accuracy must not override the rest false-activation gate.
+    assert status["evaluation"]["accuracy"] == 15 / 16
+    # Report the exact observed false-selection count and denominator.
+    assert status["evaluation"]["rest_false_activation_rate"] == 1 / 8
+    # This safety gate remains false even when the other per-class thresholds pass.
+    assert not status["evaluation"]["gates"]["rest_false_activation_rate"]
+    # The binary model must stay unavailable to the click dispatcher.
+    assert not status["arm_eligible"] and status["state"] == "validation_failed"
+
+
+@pytest.mark.parametrize("profile", [None, "unknown"])
+def test_click_profile_binding_rejects_missing_or_changed_processing(profile):
+    # Check the constructor binding even before any acquisition has been learned.
+    fresh = EegDecoder(labels=("rest", "select"), feature_profile=CLICK_FEATURE_PROFILE)
+    # Start from an otherwise valid sample window and replace only its processing identity.
+    trial = click_extracted()
+    # Missing and unknown version keys must both be distinguished from click processing.
+    if profile is None:
+        # A legacy vector is not safe merely because it has the same width.
+        trial["context"].pop("feature_profile")
+    # Use an unsupported version to simulate processing changes after an app update.
+    else:
+        # Changing the version must force an explicit matching decoder configuration.
+        trial["context"]["feature_profile"] = profile
+    # No mismatched first trial may bind the decoder to the wrong transform.
+    assert "feature profile" in fresh.add_trial("rest", trial, trial_id=0)["error"]
+    # The same invariant must apply to prediction after a valid model has been frozen.
+    decoder = trained_click_decoder()
+    # A mismatched transform must abstain rather than return any desktop action label.
+    prediction = decoder.predict(trial)
+    # The rejection is distinct from ordinary statistical uncertainty.
+    assert not prediction["valid"] and prediction["label"] is None
+    # Preserve the actionable reason for the UI and control guard.
+    assert "feature profile" in prediction["reason"]
+
+
+def test_binary_ood_session_and_overlap_guards_remain_active():
+    # Start each fault from a correctly frozen binary click model.
+    decoder = trained_click_decoder()
+    # An extreme feature vector must not be converted into a high-confidence click.
+    outlier = click_extracted("select", 16)
+    # Finite in-contract numbers isolate the training-distance gate from format validation.
+    outlier["features"] = [-80, -80, -20, -80]
+    # Use the production predictor so OOD rejection is shared with held-out validation.
+    prediction = decoder.predict(outlier)
+    # A large normalized score cannot override a failed distance check.
+    assert prediction["ood"] and not prediction["valid"] and prediction["label"] is None
+    # A new acquisition must not reuse features from the previous physical fit/session.
+    changed_session = click_extracted("select", 16, session="replacement-session")
+    # Prediction must fail closed after the session identity changes.
+    assert not decoder.predict(changed_session)["valid"]
+    # Chronologically new timestamps cannot disguise reused training sample counters.
+    overlap = click_extracted("rest", 16)
+    # Preserve a valid 500-sample shape while overlapping the first training window.
+    overlap["window"].update(counter_start=10, counter_end=509)
+    # Held-out validation must reject the reused window instead of overstating accuracy.
+    assert "counters overlap" in decoder.add_trial("rest", overlap, phase="validate", trial_id=16)["error"]
+    # The legacy decoder must also reject click-profile vectors before binding any session.
+    assert "feature profile" in EegDecoder().add_trial("rest", click_extracted(), trial_id=0)["error"]
+
+
+def test_binary_click_processing_end_to_end_with_four_channels_and_line_noise():
+    # Use the same four channel names as the connected BrainBit2, without using real samples.
+    channels = [{"num": index, "name": name} for index, name in enumerate(("O2", "T3", "T4", "O1"))]
+    # Both calibration phases and later predictions must use the same fixed click transform.
+    decoder = EegDecoder(labels=("rest", "select"), feature_profile=CLICK_FEATURE_PROFILE)
+    # Build sixteen training plus sixteen held-out trials with disjoint counters and times.
+    for index in range(32):
+        # Freeze before the first held-out window; validation cannot change feature selection.
+        if index == 16:
+            # The minimum remains eight per class, even though there are only two classes.
+            assert decoder.train()["ok"]
+        # Alternate synthetic rest/select labels rather than correlating labels with elapsed time.
+        label = decoder.labels[index % 2]
+        # Two different known frequencies provide a controlled separability test, not a physiological claim.
+        rows = packets(20 if label == "rest" else 10, seed=index + 1,
+                       start=100 + index * 3, counter=index * 750)
+        # Expand to four finite channels and add line noise equally across the two classes.
+        for sample_index, row in enumerate(rows):
+            # Vary line amplitude independently of the class cue to avoid encoding the label in interference.
+            line = (100 + 20 * (index // 2 % 3)) * 1e-6 * np.sin(2 * np.pi * 60 * sample_index / 250)
+            # Duplicate known spectral content with channel-specific amplitudes for a full four-channel vector.
+            row["samples"] = [row["samples"][0] + line, row["samples"][1] + line,
+                              row["samples"][0] * 0.7 + line, row["samples"][1] * 1.2 + line]
+        # Run real raw integrity checks, detrending, spectral integration, and version tagging.
+        features = extract_features(rows, channels, 250, {"session_id": "synthetic-four-channel"},
+                                    feature_profile=CLICK_FEATURE_PROFILE)
+        # Fail immediately if raw validation or the new processing contract rejects this valid fixture.
+        assert features["ok"]
+        # Feed the resulting full metadata into the production training/validation path.
+        assert decoder.add_trial(label, features, phase="train" if index < 16 else "validate", trial_id=index)["ok"]
+    # A real four-channel extraction pipeline must separate the known synthetic classes in held-out windows.
+    assert decoder.status()["arm_eligible"]
+    # Scores and validation columns remain binary instead of silently creating a third class.
+    assert set(decoder.status()["evaluation"]["confusion_matrix"]) == {"rest", "select"}

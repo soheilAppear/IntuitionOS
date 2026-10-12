@@ -159,9 +159,9 @@ class Harness:
                            "counter_start": first["counter"], "counter_end": last["counter"],
                            "window_id": str(first["counter"]) + ":" + str(last["counter"])}}
 
-    def tick(self, count=1, *, x=0.5, tracked=True, gap=0, eeg_age=0.0, add_rows=True):
+    def tick(self, count=1, *, x=0.5, tracked=True, gap=0, eeg_age=0.0, add_rows=True, step=0.125):
         for _ in range(count):
-            self.clock.now += 0.125
+            self.clock.now += step  # Faster pointer tests retain the same real-time EEG sample rate and guard timing.
             if add_rows:
                 target = int(round((self.clock.now - self.started_at) * 250))
                 while self.eeg.counter < target:

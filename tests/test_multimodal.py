@@ -517,6 +517,22 @@ def test_status_has_no_images_samples_or_trial_features(setup):
     assert len(snapshot["eeg"]["waveform"]) <= 250
 
 
+@pytest.mark.parametrize("mode", ["webcam", "eeg", "eeg_click"])
+def test_worker_polls_combined_hands_at_thirty_hz_without_changing_legacy_timing(setup, monkeypatch, mode):
+    service, clock, _camera, _eeg, _actions = setup
+    service._control_mode = mode  # Isolate scheduler behavior from mode startup and device ownership.
+    waits = []
+    monkeypatch.setattr(service._halt, "is_set", lambda: bool(waits))  # One deterministic iteration, with no real thread or sleep.
+    monkeypatch.setattr(service._halt, "wait", waits.append)
+    monkeypatch.setattr(service, "_tick", lambda: setattr(clock, "now", clock.now + 0.01))
+
+    service._run(service._generation)
+
+    expected = 1 / 30 - 0.01 if mode == "eeg_click" else 0.125
+    assert waits == pytest.approx([expected])  # Combined ticks include their processing time within the 30 Hz interval.
+    assert service.TICK_SECONDS * 3 == 0.375  # Faster polling does not silently tighten the established processing-gap guard.
+
+
 def run_trial(setup, target, observed=None):
     service = setup[0]
     tick(setup)

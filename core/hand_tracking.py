@@ -375,6 +375,9 @@ def _worker(memory_name, backend="rtmpose"):
             report("GPU warmup")
             model.warmup()
             metadata = {**model.metadata, **gpu}
+            # Record the effective GPU and model settings once at startup so
+            # an installed checkpoint cannot be mistaken for an active tracker.
+            report("active model " + json.dumps(metadata, sort_keys=True))
         report("shared memory attachment")
         memory = shared_memory.SharedMemory(name=memory_name)
         send({"type": "ready", "metadata": metadata})

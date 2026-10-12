@@ -937,3 +937,495 @@ def test_bend_click_setting_releases_drag_and_commits_only_after_cleanup(mouse):
     assert controller.bend_click is True
     assert buttons(device) == ["down", "up", "up"]
     assert controller.update(hand("pinch"), 1.0)["state"] == "mouse_paused"
+
+
+@pytest.fixture
+def pointer_only():
+    device = Device()
+    controller = HandMouseController(device_factory=lambda: device, pointer_only=True)
+    return controller, device
+
+
+def test_pointer_only_requires_a_deliberate_point_before_hand_movement(pointer_only):
+    controller, device = pointer_only
+    for frame in range(5):
+        result = controller.update(hand("palm", dx=frame * 0.01), frame / 30)
+        assert result["pointer_only"] is True
+        assert result["pointer_ready"] is False
+    assert device.events == []
+    assert controller.update(hand(), 0.20)["state"] == "mouse_arming"
+    assert controller.update(hand(), 0.30)["pointer_ready"] is False
+    assert device.events == []
+    result = controller.update(hand(), 0.41)
+    assert result["state"] == "mouse_pointer" and result["pointer_ready"] is True
+    assert device.events[0][0] == "move"
+    assert buttons(device) == []
+
+
+@pytest.mark.parametrize("pose", ["pinch", "hook", "tip_bend", "depth_bend", "palm"])
+@pytest.mark.parametrize("bend_enabled", [False, True])
+def test_pointer_only_moves_through_click_poses_without_any_button_input(
+        pointer_only, pose, bend_enabled):
+    controller, device = pointer_only
+    controller.set_bend_click(bend_enabled)
+    arm(controller)
+    initial = device.events[-1][1:]
+    for frame in range(1, 61):
+        result = controller.update(hand(pose, dx=frame * 0.002), 0.21 + frame / 30)
+        assert result["state"] == "mouse_pointer"
+        assert result["pointer_ready"] is True
+        assert "click_id" not in result and "click_source" not in result
+        assert controller.pinching is False
+    assert device.events[-1][1] > initial[0]
+    assert buttons(device) == []
+    assert controller._click_id == 0
+    assert controller.update(hand(dx=0.12), 2.25)["pointer_ready"] is True
+    assert buttons(device) == []
+
+
+def test_pointer_only_pinch_approach_does_not_freeze_the_pointer(pointer_only):
+    controller, device = pointer_only
+    arm(controller)
+    for frame, distance in enumerate((0.7, 0.5, 0.4, 0.3, 0.05, 0.4, 0.7), start=1):
+        points = pinch_distance(distance)
+        points = [[x + frame * 0.01, y, z] for x, y, z in points]
+        before = len(device.events)
+        assert controller.update(points, 0.21 + frame / 30)["pointer_ready"] is True
+        assert len(device.events) == before + 1
+        assert device.events[-1][0] == "move"
+    assert buttons(device) == []
+
+
+def test_pointer_only_tracking_loss_clears_readiness_and_recovers_without_jump(pointer_only):
+    controller, device = pointer_only
+    arm(controller)
+    before = list(device.events)
+    missing = controller.update([], 0.25)
+    assert missing["state"] == "mouse_recovering" and missing["pointer_ready"] is False
+    assert device.events == before
+    recovered = controller.update(hand("palm", dx=0.03), 0.30)
+    assert recovered["pointer_ready"] is True
+    assert "EEG" in recovered["hint"]
+    assert "pinch" not in recovered["hint"].lower()
+    assert device.events == before
+    controller.update(hand("palm", dx=0.05), 0.34)
+    assert device.events[-1][1] > before[-1][1]
+    assert buttons(device) == []
+
+
+@pytest.mark.parametrize("cancel", ["fist", "missing", "time_gap", "physical", "reset", "close"])
+def test_pointer_only_stops_remain_input_free_and_require_fresh_point(pointer_only, cancel):
+    controller, device = pointer_only
+    arm(controller)
+    before = list(device.events)
+    if cancel == "reset":
+        result = controller.reset()
+    elif cancel == "close":
+        result = controller.close()
+    elif cancel == "physical":
+        device.block = "Release physical mouse buttons"
+        result = controller.update(hand(), 0.25)
+    elif cancel == "time_gap":
+        result = controller.update(hand(), 0.8)
+    else:
+        result = controller.update(hand("fist") if cancel == "fist" else [], 0.4)
+    assert result["state"] == "mouse_paused" and result["pointer_ready"] is False
+    assert device.events == before
+    device.block = None
+    assert controller.update(hand("palm"), 0.9)["pointer_ready"] is False
+    assert device.events == before
+    assert arm(controller, 1.0)["pointer_ready"] is True
+    assert buttons(device) == []
+
+
+def test_pointer_only_move_failure_latches_until_reset_without_button_cleanup(pointer_only):
+    controller, device = pointer_only
+    arm(controller)
+    device.fail["move"] = 1
+    result = controller.update(hand(dx=0.01), 0.25)
+    assert result["state"] == "mouse_error" and result["pointer_ready"] is False
+    count = len(device.events)
+    assert controller.update(hand(), 0.30)["state"] == "mouse_error"
+    assert len(device.events) == count
+    assert controller.reset()["pointer_ready"] is False
+    assert arm(controller, 1.0)["pointer_ready"] is True
+    assert buttons(device) == []
+
+
+@pytest.mark.parametrize("value", [1, "false", None, []])
+def test_pointer_only_setting_requires_an_explicit_boolean(value):
+    with pytest.raises(ValueError, match="pointer_only must be a boolean"):
+        HandMouseController(pointer_only=value)
+
+
+def test_pointer_only_mode_is_fixed_for_controller_lifetime(pointer_only, mouse):
+    controller, _ = pointer_only
+    default, _ = mouse
+    assert controller.pointer_only is True
+    assert default.pointer_only is False
+    with pytest.raises(AttributeError):
+        controller.pointer_only = False
+
+
+def test_pointer_hold_validates_moving_hand_without_moving_and_resumes_without_jump(pointer_only):
+    controller, device = pointer_only
+    arm(controller)
+    original = list(device.events)
+    for frame in range(1, 11):
+        result = controller.update(hand("pinch", dx=frame * 0.01),
+                                   0.21 + frame / 30, hold=True)
+        assert result["pointer_ready"] is True
+        assert "held" in result["hint"].lower()
+        assert device.events == original
+    result = controller.update(hand(dx=0.15), 0.60, hold=False)
+    assert result["pointer_ready"] is True
+    assert device.events == original
+    controller.update(hand(dx=0.15), 0.65)
+    assert device.events[-1][1:] == pytest.approx(original[-1][1:])
+    controller.update(hand(dx=0.17), 0.70)
+    assert device.events[-1][1] > original[-1][1]
+    assert buttons(device) == []
+
+
+def test_pointer_hold_during_initial_engagement_keeps_current_physical_position(pointer_only):
+    controller, device = pointer_only
+    for at in (0, 0.1, 0.21):
+        result = controller.update(hand(), at, hold=True)
+    assert result["pointer_ready"] is True
+    assert device.events == []
+    controller.update(hand(dx=0.05), 0.25)
+    assert device.events == []
+    controller.update(hand(dx=0.05), 0.30)
+    assert device.events == [("move", 0.5, 0.5)]
+    assert buttons(device) == []
+
+
+@pytest.mark.parametrize("guard", ["missing", "fist", "time_gap", "physical"])
+def test_pointer_hold_cannot_bypass_tracking_or_physical_input_guards(pointer_only, guard):
+    controller, device = pointer_only
+    arm(controller)
+    original = list(device.events)
+    if guard == "physical":
+        device.block = "Release physical input"
+    points = [] if guard == "missing" else hand("fist" if guard == "fist" else "point")
+    result = controller.update(points, 0.8 if guard == "time_gap" else 0.25, hold=True)
+    assert result["pointer_ready"] is False
+    assert result["state"] in ("mouse_recovering", "mouse_paused")
+    assert device.events == original
+
+
+@pytest.mark.parametrize("hold", [None, "false", 1, []])
+def test_pointer_hold_requires_explicit_boolean_and_cancels_invalid_input(pointer_only, hold):
+    controller, device = pointer_only
+    arm(controller)
+    original = list(device.events)
+    result = controller.update(hand(), 0.25, hold=hold)
+    assert result["state"] == "mouse_error" and result["pointer_ready"] is False
+    assert "hold must be a boolean" in result["error"]
+    assert device.events == original
+
+
+def test_pointer_hold_is_unavailable_on_ordinary_hand_mouse(mouse):
+    controller, device = mouse
+    arm(controller)
+    original = list(device.events)
+    result = controller.update(hand(), 0.25, hold=True)
+    assert result["state"] == "mouse_error"
+    assert "hold requires pointer_only=True" in result["error"]
+    assert device.events == original
+
+
+@pytest.fixture
+def eeg_mouse():
+    device = Device()
+    controller = HandMouseController(device_factory=lambda: device, eeg_compatible=True)
+    return controller, device
+
+
+def test_eeg_compatible_aiming_and_cleanup_report_manual_input_metadata(eeg_mouse):
+    controller, device = eeg_mouse
+    arming = controller.update(hand(), 0)
+    assert arming["pointer_ready"] is False
+    assert arming["finger_active"] is False and arming["button_down"] is False
+    controller.update(hand(), 0.1)
+    ready = controller.update(hand(), 0.21)
+    assert ready["eeg_compatible"] is True and ready["pointer_ready"] is True
+    assert ready["finger_active"] is False and ready["button_down"] is False
+    for result in (controller.reset(), controller.close()):
+        assert result["pointer_ready"] is False
+        assert result["finger_active"] is False and result["button_down"] is False
+    assert buttons(device) == []
+
+
+@pytest.mark.parametrize("hold", [False, True])
+def test_eeg_compatible_pinch_click_keeps_priority_during_eeg_hold(eeg_mouse, hold):
+    controller, device = eeg_mouse
+    arm(controller)
+    controller.update(hand(), 0.23, hold=hold)
+    before = list(device.events)
+    for at in (0.25, 0.30):
+        result = controller.update(hand("pinch"), at, hold=hold)
+        assert result["state"] == "mouse_pinch"
+        assert result["finger_active"] is True and result["pointer_ready"] is False
+        assert result["button_down"] is False
+    clicked = controller.update(hand(), 0.35, hold=hold)
+    assert clicked["click_id"] == 1 and clicked["click_source"] == "pinch"
+    assert clicked["finger_active"] is True and clicked["pointer_ready"] is False
+    assert clicked["button_down"] is False
+    assert device.events == before + [("down",), ("up",)]
+    assert controller.update(hand(), 0.40, hold=hold)["finger_active"] is False
+    assert buttons(device) == ["down", "up"]
+
+
+def test_eeg_compatible_pinch_approach_and_short_release_block_eeg_completion(eeg_mouse):
+    controller, device = eeg_mouse
+    arm(controller)
+    approach = controller.update(pinch_distance(0.45), 0.25, hold=True)
+    assert approach["state"] == "mouse_pointer"
+    assert approach["finger_active"] is True and approach["pointer_ready"] is False
+    controller.update(hand("pinch"), 0.30, hold=True)
+    released = controller.update(hand(), 0.33, hold=True)
+    assert released["finger_active"] is True and released["pointer_ready"] is False
+    assert "click_id" not in released
+    assert released["button_down"] is False and buttons(device) == []
+
+
+@pytest.mark.parametrize("bend_enabled", [False, True])
+@pytest.mark.parametrize("pose", ["hook", "tip_bend", "depth_bend"])
+def test_eeg_compatible_respects_bend_preference_even_while_holding(eeg_mouse, bend_enabled, pose):
+    controller, device = eeg_mouse
+    controller.set_bend_click(bend_enabled)
+    arm(controller)
+    beginning = controller.update(hand(pose), 0.25, hold=True)
+    assert beginning["finger_active"] is bend_enabled
+    assert beginning["pointer_ready"] is not bend_enabled
+    result = controller.update(hand(pose), 0.38, hold=True)
+    if bend_enabled:
+        assert result["click_source"] == "bend" and result["click_id"] == 1
+        assert result["finger_active"] is True and result["pointer_ready"] is False
+    else:
+        assert "click_id" not in result and result["pointer_ready"] is True
+        assert result["finger_active"] is False
+    assert buttons(device) == (["down", "up"] if bend_enabled else [])
+    assert result["button_down"] is False
+
+
+def test_eeg_compatible_drag_overrides_hold_then_resumes_without_jump(eeg_mouse):
+    controller, device = eeg_mouse
+    arm(controller)
+    held = controller.update(hand(), 0.23, hold=True)
+    assert held["pointer_ready"] is True and held["finger_active"] is False
+    controller.update(hand("pinch"), 0.28, hold=True)
+    controller.update(hand("pinch"), 0.48, hold=True)
+    dragging = controller.update(hand("pinch"), 0.64, hold=True)
+    assert dragging["button_down"] is True and dragging["finger_active"] is True
+    assert dragging["pointer_ready"] is False
+    before = device.events[-1][1:]
+    controller.update(hand("pinch", dx=0.06), 0.76, hold=True)
+    after = device.events[-1][1:]
+    assert after[0] > before[0]
+    released = controller.update(hand(dx=0.10), 0.88, hold=True)
+    assert released["button_down"] is False and released["finger_active"] is True
+    assert released["pointer_ready"] is False and "click_id" not in released
+    events = list(device.events)
+    resumed = controller.update(hand(dx=0.15), 0.92, hold=False)
+    assert resumed["pointer_ready"] is True and resumed["finger_active"] is False
+    assert device.events == events
+    controller.update(hand(dx=0.15), 0.97)
+    assert device.events[-1][1:] == pytest.approx(after)
+    controller.update(hand(dx=0.17), 1.02)
+    assert device.events[-1][1] > after[0]
+    assert buttons(device) == ["down", "up"]
+
+
+def test_eeg_compatible_hold_without_finger_input_preserves_target_and_reanchors(eeg_mouse):
+    controller, device = eeg_mouse
+    arm(controller)
+    original = list(device.events)
+    for frame in range(1, 8):
+        result = controller.update(hand(dx=frame * 0.01), 0.21 + frame / 30, hold=True)
+        assert result["pointer_ready"] is True
+        assert result["finger_active"] is False and result["button_down"] is False
+        assert device.events == original
+    controller.update(hand(dx=0.10), 0.50, hold=False)
+    assert device.events == original
+    controller.update(hand(dx=0.10), 0.55)
+    assert device.events[-1][1:] == pytest.approx(original[-1][1:])
+    assert buttons(device) == []
+
+
+def test_eeg_compatible_hold_at_first_engagement_does_not_move_or_click(eeg_mouse):
+    controller, device = eeg_mouse
+    for at in (0, 0.1, 0.21):
+        result = controller.update(hand(), at, hold=True)
+    assert result["pointer_ready"] is True and result["finger_active"] is False
+    assert device.events == []
+    controller.update(hand(), 0.25, hold=False)
+    controller.update(hand(), 0.30)
+    assert device.events == [("move", 0.5, 0.5)]
+
+
+@pytest.mark.parametrize("ending", ["reset", "close", "missing"])
+def test_eeg_compatible_drag_cleanup_releases_our_button_and_reports_it(eeg_mouse, ending):
+    controller, device = eeg_mouse
+    drag(controller)
+    if ending == "missing":
+        result = controller.update([], 0.65, hold=True)
+    else:
+        result = getattr(controller, ending)()
+    assert result["pointer_ready"] is False
+    assert result["button_down"] is False and result["finger_active"] is False
+    assert buttons(device) == ["down", "up"]
+
+
+def test_eeg_compatible_failed_drag_release_remains_visible_until_cleanup_succeeds(eeg_mouse):
+    controller, device = eeg_mouse
+    drag(controller)
+    device.fail["up"] = 2
+    for cleanup in (controller.close, controller.reset):
+        failed = cleanup()
+        assert failed["state"] == "mouse_error" and failed["pointer_ready"] is False
+        assert failed["button_down"] is True and failed["finger_active"] is True
+    stopped = controller.close()
+    assert stopped["button_down"] is False and stopped["finger_active"] is False
+    assert stopped["pointer_ready"] is False
+    assert buttons(device) == ["down", "up", "up", "up"]
+
+
+@pytest.mark.parametrize("operation", ["down", "up"])
+def test_eeg_compatible_failed_click_never_emits_completed_click_metadata(eeg_mouse, operation):
+    controller, device = eeg_mouse
+    arm(controller)
+    controller.update(hand("pinch"), 0.25, hold=True)
+    device.fail[operation] = 1
+    failed = controller.update(hand(), 0.35, hold=True)
+    assert failed["state"] == "mouse_error" and failed["pointer_ready"] is False
+    assert failed["button_down"] is False and failed["finger_active"] is False
+    assert "click_id" not in failed
+    assert buttons(device)[-1] == "up"
+
+
+@pytest.mark.parametrize("value", [1, "false", None, []])
+def test_eeg_compatible_requires_explicit_boolean(value):
+    with pytest.raises(ValueError, match="eeg_compatible must be a boolean"):
+        HandMouseController(eeg_compatible=value)
+
+
+def test_eeg_compatible_is_immutable_and_cannot_also_disable_finger_input(eeg_mouse, mouse):
+    controller, _ = eeg_mouse
+    default, _ = mouse
+    assert controller.eeg_compatible is True and controller.pointer_only is False
+    assert default.eeg_compatible is False
+    with pytest.raises(AttributeError):
+        controller.eeg_compatible = False
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        HandMouseController(eeg_compatible=True, pointer_only=True)
+
+
+@pytest.mark.parametrize("pose", ["hook", "tip_bend", "depth_bend"])
+def test_eeg_compatible_held_bend_keeps_manual_priority_after_its_single_click(eeg_mouse, pose):
+    controller, device = eeg_mouse
+    controller.set_bend_click(True)
+    arm(controller)
+    controller.update(hand(pose), 0.25, hold=True)
+    assert controller.update(hand(pose), 0.38, hold=True)["click_source"] == "bend"
+    for frame in range(1, 31):
+        result = controller.update(hand(pose), 0.38 + frame / 30, hold=True)
+        assert result["finger_active"] is True
+        assert result["pointer_ready"] is False and result["button_down"] is False
+        assert "click_id" not in result
+    assert buttons(device) == ["down", "up"]
+    released = controller.update(hand(), 1.42, hold=True)
+    assert released["pointer_ready"] is True and released["finger_active"] is False
+
+
+def test_combined_tracking_suspension_releases_drag_and_resumes_at_physical_cursor(eeg_mouse):
+    controller, device = eeg_mouse
+    drag(controller)
+    suspended = controller.suspend_tracking()
+    assert suspended["state"] == "mouse_paused"
+    assert suspended["pointer_ready"] is False
+    assert suspended["finger_active"] is False and suspended["button_down"] is False
+    assert buttons(device) == ["down", "up"]
+    before = list(device.events)
+    device.position = lambda: (0.82, 0.23)  # The user moved the physical mouse while tracking was absent.
+    for at in (0.7, 0.8, 0.9):
+        result = controller.update(hand("pinch", dx=0.12), at)
+        assert result["pointer_ready"] is False and "click_id" not in result
+    assert device.events == before
+    for at in (1.0, 1.1, 1.21):
+        result = controller.update(hand(dx=0.12), at)
+    assert result["pointer_ready"] is True
+    assert device.events == before  # Reacquisition itself must not move, press, or release anything.
+    controller.update(hand(dx=0.12), 1.25)
+    assert device.events[-1][0] == "move"
+    assert device.events[-1][1:] == pytest.approx((0.82, 0.23))
+    controller.update(hand(dx=0.14), 1.30)
+    assert device.events[-1][1] > 0.82
+    controller.update(hand("pinch", dx=0.14), 1.35)
+    clicked = controller.update(hand(dx=0.14), 1.45)
+    assert clicked["click_source"] == "pinch" and clicked["click_id"] == 1
+    assert buttons(device) == ["down", "up", "down", "up"]
+
+
+def test_combined_brief_tracking_gap_reanchors_to_actual_cursor_without_inherited_click(eeg_mouse):
+    controller, device = eeg_mouse
+    drag(controller)
+    assert controller.update([], 0.65)["state"] == "mouse_recovering"
+    assert buttons(device) == ["down", "up"]
+    device.position = lambda: (0.71, 0.38)
+    before = list(device.events)
+    recovered = controller.update(hand(dx=0.03), 0.70)
+    assert recovered["pointer_ready"] is True and recovered["finger_active"] is False
+    assert device.events == before
+    controller.update(hand(dx=0.03), 0.74)
+    assert device.events[-1][0] == "move"
+    assert device.events[-1][1:] == pytest.approx((0.71, 0.38))
+    assert buttons(device) == ["down", "up"]
+
+
+def test_combined_extended_loss_requires_point_then_reanchors_without_ui_reset(eeg_mouse):
+    controller, device = eeg_mouse
+    arm(controller)
+    assert controller.update([], 0.40)["state"] == "mouse_paused"
+    before = list(device.events)
+    device.position = lambda: (0.64, 0.59)
+    for at in (0.45, 0.55, 0.65):
+        assert controller.update(hand("palm", dx=-0.1), at)["pointer_ready"] is False
+    for at in (0.7, 0.8, 0.91):
+        recovered = controller.update(hand(dx=-0.1), at)
+    assert recovered["pointer_ready"] is True
+    assert device.events == before
+    controller.update(hand(dx=-0.1), 0.95)
+    assert device.events[-1][0] == "move"
+    assert device.events[-1][1:] == pytest.approx((0.64, 0.59))
+    assert buttons(device) == []
+
+
+def test_combined_tracking_suspension_does_not_clear_a_native_release_fault(eeg_mouse):
+    controller, device = eeg_mouse
+    drag(controller)
+    device.fail["up"] = 2
+    failed = controller.suspend_tracking()
+    assert failed["state"] == "mouse_error" and failed["button_down"] is True
+    failed_again = controller.suspend_tracking()
+    assert failed_again["state"] == "mouse_error" and failed_again["button_down"] is True
+    released_but_faulted = controller.suspend_tracking()
+    assert released_but_faulted["state"] == "mouse_error" and released_but_faulted["button_down"] is False
+    before = list(device.events)
+    for at in (1.0, 1.1, 1.21):
+        assert controller.update(hand(), at)["state"] == "mouse_error"
+    assert device.events == before
+    assert controller.reset()["state"] == "mouse_paused"  # Explicit cleanup acknowledges the native failure.
+    assert arm(controller, 2.0)["pointer_ready"] is True
+    assert buttons(device) == ["down", "up", "up", "up"]
+
+
+def test_tracking_suspension_before_first_point_never_creates_native_device():
+    created = []
+    controller = HandMouseController(eeg_compatible=True, device_factory=lambda: created.append(True))
+    for _ in range(5):
+        paused = controller.suspend_tracking()
+        assert paused["pointer_ready"] is False
+        assert paused["finger_active"] is False and paused["button_down"] is False
+    assert created == []

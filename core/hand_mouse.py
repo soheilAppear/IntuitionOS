@@ -133,6 +133,15 @@ class HandMouseController:
 
     Only a completed click returns click_id and click_source (bend or pinch).
     IDs increase across resets, and drag release emits no click event.
+
+    pointer_only=True retains hand aiming but bypasses every hand click/drag
+    path. Its feedback includes pointer_ready for a separate EEG click gate.
+    update(..., hold=True) validates an engaged hand but freezes its target;
+    the first frame after releasing the hold reanchors without moving.
+
+    eeg_compatible=True instead retains normal finger clicks and drags while
+    reporting their activity to an EEG controller. Finger gestures take priority
+    over hold=True, so a pending EEG selection cannot disable a manual click.
     """
 
     CONTROL_REGION = (0.15, 0.12, 0.85, 0.82)
@@ -150,9 +159,23 @@ class HandMouseController:
     VELOCITY_SMOOTH_SECONDS = 0.10
     VELOCITY_GAIN = 14.0
 
-    def __init__(self, on_feedback=None, *, device_factory=_WindowsMouse, bend_click=False):
+    def __init__(self, on_feedback=None, *, device_factory=_WindowsMouse, bend_click=False,
+                 pointer_only=False, eeg_compatible=False):
         if type(bend_click) is not bool:
             raise ValueError("bend_click must be a boolean")
+        # Require an explicit boolean so strings such as "false" cannot enable a mode.
+        if type(pointer_only) is not bool:
+            raise ValueError("pointer_only must be a boolean")
+        # Preserve a separate explicit mode for hand clicks combined with EEG selection.
+        if type(eeg_compatible) is not bool:
+            raise ValueError("eeg_compatible must be a boolean")
+        # A controller cannot simultaneously prohibit and enable finger button input.
+        if pointer_only and eeg_compatible:
+            raise ValueError("pointer_only and eeg_compatible are mutually exclusive")
+        # Keep the mode fixed for this controller's lifetime; switching uses a reset/new instance.
+        self._pointer_only = pointer_only
+        # The combined mode is also immutable so authorization assumptions cannot change mid-gesture.
+        self._eeg_compatible = eeg_compatible
         self.bend_click = bend_click
         self._factory = device_factory
         self._device = None
@@ -164,6 +187,14 @@ class HandMouseController:
         self._clear()
 
     def _clear(self):
+        # Ordinary startup uses its usual mapping; a later suspension explicitly requests reanchoring.
+        self._resume_at_physical_cursor = False
+        # A previously held bend cannot remain active after the hand controller is reset.
+        self._finger_pose_active = False
+        # A reset cannot report a manual gesture release from a previous input frame.
+        self._finger_release_frame = False
+        # Reset any EEG target hold so a new activation cannot resume an old target offset.
+        self._pointer_held = False
         self._point_since = None
         self._point_origin = None
         self._armed = False
@@ -188,6 +219,26 @@ class HandMouseController:
     def _feedback(self, state, hint, progress=0.0, **extra):
         result = {"state": state, "progress": _clamp(progress), "hint": hint,
                   "control_region": list(self.CONTROL_REGION), **extra}
+        # Expose readiness only for the dedicated aiming controller, preserving legacy feedback.
+        if self.pointer_only:
+            # Missing tracking, arming, pauses, and errors cannot authorize an EEG click.
+            result["pointer_ready"] = state == "mouse_pointer" and self._armed
+            # Let callers distinguish a movement-only controller from ordinary Hand Mouse.
+            result["pointer_only"] = True
+        # Combined control reports enough manual activity for the service to cancel competing EEG input.
+        if self.eeg_compatible:
+            # Include approach, button holds, completed clicks, and release frames as finger activity.
+            result["finger_active"] = bool(self._pinch_since is not None or self._pinch_approaching
+                                           or self._bend_since is not None or self._owned_left
+                                           or self._finger_pose_active or self._finger_release_frame
+                                           or state == "mouse_clicked")
+            # Button ownership stays visible even if a failed release leaves the controller errored.
+            result["button_down"] = self._owned_left
+            # EEG may complete only on a tracked, engaged target without a competing finger gesture.
+            result["pointer_ready"] = bool(state == "mouse_pointer" and self._armed
+                                           and not result["finger_active"])
+            # Let the service distinguish combined control from ordinary uncoordinated Hand Mouse.
+            result["eeg_compatible"] = True
         if self._callback:
             try:
                 self._callback(dict(result))
@@ -203,11 +254,15 @@ class HandMouseController:
             self._owned_left = False
 
     def _cancel(self, reason, *, error=None):
+        # Combined control resumes from the actual desktop cursor after any established hand suspension.
+        resume_at_cursor = self.eeg_compatible and self._device is not None
         try:
             self._release()
         except Exception as exc:
             error = f"Could not release Hand Mouse button: {exc}"
         self._clear()
+        # Preserve this recovery request across clearing all old gesture and filter state.
+        self._resume_at_physical_cursor = resume_at_cursor
         self._fault = error
         if error:
             return self._feedback("mouse_error", error, error=error)
@@ -219,6 +274,22 @@ class HandMouseController:
 
     def close(self):
         return self.reset("Hand Mouse stopped")
+
+    def suspend_tracking(self, reason="Hand tracking paused; point briefly to resume"):
+        """Release a drag and forget gestures while allowing fresh pointing to recover."""
+        with self._lock:
+            # Tracking loss must not silently clear an earlier native input/release fault.
+            return self._cancel(reason, error=self._fault)
+
+    @property
+    def pointer_only(self):
+        """A read-only mode: hand gestures can move but cannot press buttons."""
+        return self._pointer_only
+
+    @property
+    def eeg_compatible(self):
+        """A read-only mode coordinating normal finger input with a separate EEG controller."""
+        return self._eeg_compatible
 
     @property
     def pinching(self):
@@ -357,14 +428,54 @@ class HandMouseController:
         self._cursor = position
         self._filter_target = target
 
-    def update(self, points, now):
+    def _engage_pointer(self, wrist, scale, straight, others_curled, now):
+        """Share the existing deliberate pointing dwell across both control modes."""
+        # An already engaged hand may relax while its proximal anchor remains reliable.
+        if self._armed:
+            return None
+        # Starting movement still requires one straight index with the other fingers curled.
+        if not straight or not others_curled:
+            return self._cancel("Straighten your index finger briefly to start Hand Mouse")
+        # Moving too far during the initial dwell starts a fresh activation attempt.
+        if self._point_since is None or math.dist(wrist, self._point_origin) > scale * 0.45:
+            self._point_since, self._point_origin = now, wrist
+        # Measure the dwell using the caller's monotonic tracking time.
+        elapsed = now - self._point_since
+        # Report progress without creating an input device before the dwell completes.
+        if elapsed < self.ARM_SECONDS:
+            return self._feedback("mouse_arming", "Hold your pointing hand briefly to start",
+                                  elapsed / self.ARM_SECONDS)
+        # Construct the device lazily only after deliberate activation.
+        if self._device is None:
+            self._device = self._factory()
+        # Preserve the physical-button/modifier guard before the first movement.
+        blocked = self._device.blocked(own_left=False)
+        # Cancel instead of competing with existing physical input.
+        if blocked:
+            return self._cancel(blocked)
+        # Authorize motion; this flag alone never presses a mouse button.
+        self._armed = True
+        # Returning no feedback tells the caller that it may move the pointer now.
+        return None
+
+    def update(self, points, now, *, hold=False):
         with self._lock:
             try:
-                return self._update(points, now)
+                # A string or integer must never accidentally enable target freezing.
+                if type(hold) is not bool:
+                    raise ValueError("hold must be a boolean")
+                # Freezing requires a controller whose interaction with EEG input is explicit.
+                if hold and not (self.pointer_only or self.eeg_compatible):
+                    raise ValueError("hold requires pointer_only=True or eeg_compatible=True")
+                return self._update(points, now, hold=hold)
             except Exception as exc:
                 return self._cancel("Hand Mouse paused", error=f"Hand Mouse input failed: {exc}")
 
-    def _update(self, points, now):
+    def _update(self, points, now, *, hold=False):
+        # Recompute manual pose intent only from this frame's validated hand geometry.
+        self._finger_pose_active = False
+        # Report a manual release only on the frame where it actually occurred.
+        self._finger_release_frame = False
         if self._fault:
             return self._cancel("Hand Mouse paused", error=self._fault)
         if not isinstance(now, (int, float)) or not math.isfinite(now):
@@ -446,23 +557,64 @@ class HandMouseController:
             if not movement_shape:
                 return self._freeze(now, "Hand pose uncertain")
             self._uncertain_since = None
+            # A physical mouse may have moved during a brief gap; combined control must not jump back.
+            if self.eeg_compatible:
+                self._cursor = self._device.position()
             self._reanchor(landmarks)
             self._last_at, self._last_wrist, self._last_scale = now, wrist, scale
             self._last_anchor = anchor
             # Reacquisition only reanchors. Pending holds were discarded; a
             # fresh neutral pose is required before another click can start.
-            return self._feedback("mouse_pointer", "Hand found; separate thumb and index before clicking")
+            # The EEG aiming mode has no pinch rearm requirement or hand-generated clicks.
+            hint = ("Hand found; move your hand to aim; EEG controls selection"
+                    if self.pointer_only else "Hand found; separate thumb and index before clicking")
+            return self._feedback("mouse_pointer", hint)
 
         if not movement_shape:
             return self._freeze(now, "Hand pose uncertain")
         self._last_at, self._last_wrist, self._last_scale = now, wrist, scale
         self._last_anchor = anchor
+        # A bent finger retains manual priority after its one click until the user relaxes it.
+        self._finger_pose_active = bool(self.eeg_compatible and self._armed and self.bend_click and hook)
+
+        # Finish the movement-only path before any pinch, bend, or drag logic can run.
+        if self.pointer_only:
+            # Reuse ordinary Hand Mouse's deliberate pointing activation and input guards.
+            pending = self._engage_pointer(wrist, scale, straight, others_curled, now)
+            # Arming or paused feedback means no pointer movement is authorized yet.
+            if pending is not None:
+                return pending
+            # A selection holds the existing target while all tracking/input checks still run above.
+            if hold:
+                # A hold during initial engagement uses the current physical cursor without moving it.
+                if self._cursor is None:
+                    self._cursor = self._device.position()
+                # Keep the hand-to-cursor offset current while the hand moves during selection.
+                self._reanchor(landmarks)
+                # Remember to consume one reanchoring frame when selection releases the target.
+                self._pointer_held = True
+                # A validated held hand remains ready for the separate EEG completion check.
+                return self._feedback("mouse_pointer", "Pointer held; EEG selection in progress", 1.0)
+            # Releasing a hold must not map accumulated hand movement onto the pointer.
+            if self._pointer_held:
+                # Clear the hold only after a valid release frame has passed the tracking guards.
+                self._pointer_held = False
+                # Align this release frame with the held cursor before accepting new motion.
+                self._reanchor(landmarks)
+                # Resume on the next frame, preserving the target through this transition.
+                return self._feedback("mouse_pointer", "Move your hand to aim; EEG controls selection", 1.0)
+            # Aim with the same stable palm/index anchor and adaptive smoothing as Hand Mouse.
+            self._move(self._pointer_target(landmarks), dt)
+            # Report a ready target while leaving all button input to the separate EEG controller.
+            return self._feedback("mouse_pointer", "Move your hand to aim; EEG controls selection", 1.0)
 
         if self._pinch_since is not None:
             duration = now - self._pinch_since
             if not pinch_shape:
                 return self._freeze(now, "Pinch interrupted")
             if pinch_distance > 0.55:
+                # A release frame still belongs to the finger gesture and cannot complete an EEG click.
+                self._finger_release_frame = True
                 click = {}
                 if self._owned_left:
                     self._release()
@@ -531,21 +683,20 @@ class HandMouseController:
         if self._pinch_approaching:
             self._pinch_approaching = False
             self._reanchor(landmarks)
-        if not self._armed:
-            if not straight or not others_curled:
-                return self._cancel("Straighten your index finger briefly to start Hand Mouse")
-            if self._point_since is None or math.dist(wrist, self._point_origin) > scale * 0.45:
-                self._point_since, self._point_origin = now, wrist
-            elapsed = now - self._point_since
-            if elapsed < self.ARM_SECONDS:
-                return self._feedback("mouse_arming", "Hold your pointing hand briefly to start",
-                                      elapsed / self.ARM_SECONDS)
-            if self._device is None:
-                self._device = self._factory()
-            blocked = self._device.blocked(own_left=False)
-            if blocked:
-                return self._cancel(blocked)
-            self._armed = True
+        # Ordinary Hand Mouse keeps the same activation behavior after its pinch checks.
+        pending = self._engage_pointer(wrist, scale, straight, others_curled, now)
+        if pending is not None:
+            return pending
+        # A stable new point resumes a suspended combined controller at the current desktop target.
+        if self.eeg_compatible and self._resume_at_physical_cursor:
+            # Read physical cursor position only after fresh pointing and the normal input guards pass.
+            self._cursor = self._device.position()
+            # Bind this recovered hand pose to that cursor instead of its old absolute camera location.
+            self._reanchor(landmarks)
+            # Consume recovery once; later frames may move relative to the newly anchored pose.
+            self._resume_at_physical_cursor = False
+            # Returning before click and movement paths guarantees that reacquisition itself emits no input.
+            return self._feedback("mouse_pointer", "Hand found; move your hand to aim or pinch to click", 1.0)
         if self.bend_click and hook and not self._bend_latched:
             if self._bend_since is None:
                 self._bend_since = now
@@ -561,6 +712,25 @@ class HandMouseController:
         if self._bend_since is not None:
             self._bend_since = None
             self._reanchor(landmarks)
+        # Finger click and drag paths above always run before an EEG target hold can freeze aiming.
+        if self.eeg_compatible and hold:
+            # Initial engagement during a hold anchors at the current physical pointer without moving it.
+            if self._cursor is None:
+                self._cursor = self._device.position()
+            # Discard hand travel accumulated while EEG is selecting, preserving the selected target.
+            self._reanchor(landmarks)
+            # Require a reanchoring release frame before ordinary aiming resumes.
+            self._pointer_held = True
+            # Finger input remains available on the next frame despite this EEG-only movement hold.
+            return self._feedback("mouse_pointer", "EEG target held; pinch to click or hold to drag still works", 1.0)
+        # Ending an EEG hold must not jump to the hand's new absolute position.
+        if self.eeg_compatible and self._pointer_held:
+            # Consume the hold only after normal hand gesture handling and tracking validation.
+            self._pointer_held = False
+            # Bind the released hand pose to the current pointer before resuming motion.
+            self._reanchor(landmarks)
+            # Preserve the cursor on this first release frame; subsequent movement is intentional.
+            return self._feedback("mouse_pointer", "Move your hand; pinch to click or hold to drag", 1.0)
         self._move(self._pointer_target(landmarks), dt)
         hint = (f"Move your hand; {rearm_action} before another click" if self._bend_latched
                 else "Move your hand; pinch to click or hold to drag")
