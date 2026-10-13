@@ -48,7 +48,7 @@ class _InputFault(ValueError):
 
     def prediction_fields(self):
         return {"fault_code": self.code, "fault_category": self.category,
-                "recoverable": self.code == "signal_amplitude" and self.category == "signal_quality",
+                "recoverable": False,
                 "fault_details": self.details}
 
 
@@ -97,16 +97,14 @@ def _rows(rows):
 
 
 def _quality(data, channels):
+    """Reject unusable samples; waveform magnitude alone is not a CNN gate."""
     if len(data) < 125:
         raise _InputFault("Waiting for at least half a second of current EEG.", "buffer_short", "transport")
-    amplitude_fault = None
     for index, column in enumerate(data.T):
         name = channels[index]["name"]
-        excursion = float(np.ptp(column))  # Raw peak-to-peak variation is checked before normalization.
-        if excursion > .010:
-            amplitude_fault = amplitude_fault or _InputFault(
-                f"{name}: {excursion * 1000:.2f} mV peak-to-peak exceeds the 10 mV raw signal guard.",
-                "signal_amplitude", "signal_quality", channel=name, peak_to_peak_v=excursion, limit_v=.010)
+        # Positive gain is handled by the existing per-channel normalization.
+        # Keep the lower bound: a flat trace contains no useful waveform shape.
+        excursion = float(np.ptp(column))
         if excursion < 1e-9:
             raise _InputFault(f"{name} is flat; check signal contact.", "signal_flatline", "signal_quality", channel=name)
         run = 1
@@ -118,10 +116,6 @@ def _quality(data, channels):
             if run >= 5 and after in (low, high):
                 raise _InputFault(f"{name} has a repeated extreme plateau (possible clipping).",
                                   "signal_plateau", "signal_quality", channel=name)
-    # A large transient is recoverable only if every channel passed the hard
-    # contact/clipping checks. Channel iteration order must not mask a fault.
-    if amplitude_fault:
-        raise amplitude_fault
 
 
 def preprocess_waveform(data):
@@ -241,7 +235,6 @@ class FastCnnBlinkDecoder:
 
     def reset_stream(self):
         self._counter = self._last_at = self._last_receipt = None  # Discard the prior stream boundary after a lifecycle change.
-        self._paused_transport_boundary = None  # Only recoverable amplitude pauses retain a separate continuity boundary.
         self._live_rows = deque(maxlen=WINDOW_SAMPLES)  # Keep at most one second of inference evidence.
         self._last_predict_counter = None  # The next complete window starts a new scoring schedule.
         self._rest_count = self._select_count = 0
@@ -256,7 +249,7 @@ class FastCnnBlinkDecoder:
     def cancel_pending(self):
         """Retain rolling context, but exclude all evidence present at cancellation.
 
-        Used once on finger ownership entry/release, never on a successful CNN
+        Used once on hand input ownership entry/release, never on a successful CNN
         event. A whole-window classifier cannot locate a physical blink inside
         old data, so score transitions cannot reauthorize that buffered gesture.
         Lifecycle changes and stream faults still require reset_stream().
@@ -451,7 +444,6 @@ class FastCnnBlinkDecoder:
         if self._model is None:
             return self._prediction()
         now = self.clock() if now is None else now
-        transport_boundary = None
         try:
             if not _finite(now):
                 raise _InputFault("A finite current monotonic time is required.", "clock_invalid", "timing")
@@ -471,10 +463,8 @@ class FastCnnBlinkDecoder:
             if not _finite(receipt) or not -.05 <= now - receipt <= .75 or not -.05 <= now - latest["estimated_monotonic"] <= 1:
                 raise _InputFault("CNN EEG buffer is stale or incorrectly timed.", "buffer_stale", "timing")
             fresh = None
-            boundary = ((self._counter, self._last_at, self._last_receipt) if self._counter is not None
-                        else self._paused_transport_boundary)
-            if boundary is not None:
-                prior_counter, prior_at, prior_receipt = boundary
+            if self._counter is not None:
+                prior_counter, prior_at, prior_receipt = self._counter, self._last_at, self._last_receipt
                 fresh = [row for row in rows if 0 < (row["counter"] - prior_counter) % 2 ** 32 < 2 ** 31]
                 if not fresh:
                     if latest["counter"] != prior_counter:
@@ -486,16 +476,14 @@ class FastCnnBlinkDecoder:
                     if (fresh[0]["estimated_monotonic"] - prior_at > .5
                             or fresh[0]["estimated_monotonic"] - prior_at < -.25 or receipt - prior_receipt > .75):
                         raise _InputFault("EEG delivery paused; CNN history cleared.", "delivery_paused", "timing")
-            transport_boundary = (latest["counter"], latest["estimated_monotonic"], receipt)
-            # Check transport/context/timing first. A stale, discontinuous or
-            # malformed high-amplitude buffer must never become a soft pause.
+            # Large waveforms still need valid transport and usable samples.
+            # Normalization cannot repair gaps, flatlines, or clipped plateaus.
             _quality(data, context["channels"])
             if self._cancel_pending_watermark:
                 self._event_watermark = latest["counter"]
                 self._cancel_pending_watermark = False
             if self._counter is None:
                 self._counter, self._last_at, self._last_receipt = latest["counter"], latest["estimated_monotonic"], receipt
-                self._paused_transport_boundary = None  # Only recoverable amplitude pauses retain a separate continuity boundary.
                 return self._prediction(True, "Stream primed. Keep eyes open for one second of fresh CNN context.")
             if not fresh:
                 return self._prediction(True, "Waiting for new EEG packets; buffered windows cannot repeat a click.")
@@ -510,18 +498,13 @@ class FastCnnBlinkDecoder:
             score = float(_scores(preprocess_waveform(_rows(list(self._live_rows))), self._weights)[0])
             result = self._observe_score(score, self._counter, self._last_at, context["session_id"])
             if self._cancelled_evidence_remaining(self._counter):
-                return self._prediction(True, "Finger input ended; waiting for a CNN window containing only newer EEG.")
+                return self._prediction(True, "Hand input ended; waiting for a CNN window containing only newer EEG.")
             return result or self._prediction(True, "CNN ready: double blink deliberately." if self._rest_ready
                                               else "Keep eyes open until the CNN recognizes no command.")
         except (ValueError, TypeError, KeyError, OverflowError) as exc:
             self.reset_stream()
             fields = (exc.prediction_fields() if isinstance(exc, _InputFault) else
                       {"fault_code": "input_invalid", "fault_category": "input", "recoverable": False})
-            if fields["recoverable"]:
-                # Keep transport continuity while discarding all inference
-                # evidence. A later gap/reset during an artifact remains hard;
-                # the first clean buffer still only primes fresh inference.
-                self._paused_transport_boundary = transport_boundary
             return self._prediction(False, str(exc), **fields)
 
     def status(self):

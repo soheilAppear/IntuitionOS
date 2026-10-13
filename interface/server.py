@@ -64,6 +64,7 @@ from core.hand_control import HandControls
 from core.hand_feedback import HandClickSound
 from core.multimodal import MultimodalPreview
 from core.eeg_click import EegClickController  # The explicit EEG mode gets only a lazy, current-pointer left-click actuator.
+from core.eeg_hand_control import EegHandController  # Share measured desktop swipes with the explicitly armed EEG hand controls.
 from core.eeg_fast_blink_store import load_latest_decoder as load_latest_fast_cnn_decoder, save_archive as save_fast_cnn_archive  # Only the validated one-second profile is supported.
 from core.hand_mouse import HandMouseController  # Keep hand aiming and finger clicks while coordinating the additional EEG trigger.
 from core.voice import VoiceRecognizer
@@ -721,7 +722,11 @@ async def lifespan(app: FastAPI):
             or _camera_resource_busy(gestures.status())
             or hand_controls.status().get("desktop", {}).get("cleanup_pending", False)),
         click_controller=EegClickController(),  # Construction injects no input; the service owns guarded clicks and cleanup.
-        pointer_controller=HandMouseController(eeg_compatible=True, bend_click=gesture_settings["bend_click"]),  # Keep finger clicks and the user's bend setting; report ownership to coordinate EEG.
+        pointer_controller=EegHandController(
+            HandMouseController(eeg_compatible=True, bend_click=gesture_settings["bend_click"]),
+            active=lambda: multimodal.hand_navigation_authorized(),
+            mode=gesture_settings["desktop_mode"], travel_palms=gesture_settings["travel_palms"],
+        ),  # A shared arm owns pointer, finger clicks and desktop swipes; construction sends no input.
     )
 
     _state.update(
@@ -2476,9 +2481,15 @@ def _sync_cnn_camera_settings(preview):
     complexity = getattr(gestures, "model_complexity", ordinary.get("model_complexity"))
     index = getattr(gestures, "camera_index", None)
     bend = getattr(gestures, "bend_click", ordinary.get("bend_click"))
+    settings = _state.get("gesture_settings", {})
+    desktop_mode, travel_palms = settings.get("desktop_mode", "auto"), settings.get("travel_palms", 1.2)
     if (backend not in ("mediapipe", "rtmpose", "wilor") or type(complexity) is not int
-            or complexity not in (0, 1) or type(index) is not int or type(bend) is not bool):
-        return "Current Hand controls have an invalid tracker, camera, or click configuration."
+            or complexity not in (0, 1) or type(index) is not int or type(bend) is not bool
+            or desktop_mode not in ("auto", "shortcut") or type(travel_palms) not in (int, float)
+            or not .8 <= travel_palms <= 3.0):
+        return "Current Hand controls have an invalid tracker, camera, click, or desktop swipe configuration."
+    if not callable(getattr(pointer, "configure_navigation", None)):
+        return "Combined desktop swipes are unavailable; restart the backend."
     result = camera.configure(tracker_backend=backend, model_complexity=complexity, input_mode="desktop")
     if not isinstance(result, dict) or result.get("error"):
         return str(result.get("error")) if isinstance(result, dict) else "Preview tracker configuration was not confirmed."
@@ -2489,6 +2500,11 @@ def _sync_cnn_camera_settings(preview):
         result = pointer.set_bend_click(bend)
         if not isinstance(result, dict) or result.get("error"):
             return str(result.get("error")) if isinstance(result, dict) else "Hand click preference was not confirmed."
+    # Copy the user's current desktop behavior only while capture is stopped;
+    # input cleanup must succeed before the service can enable this controller.
+    result = pointer.configure_navigation(mode=desktop_mode, travel_palms=travel_palms)
+    if not isinstance(result, dict) or result.get("error") or result.get("ok") is not True:
+        return str(result.get("error") or "Desktop swipe configuration was not confirmed.") if isinstance(result, dict) else "Desktop swipe configuration was not confirmed."
     return None
 
 

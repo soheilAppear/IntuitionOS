@@ -169,6 +169,9 @@ def test_hand_bend_click_config_reaches_idle_recognizer_at_startup(app_dir, enab
             recognizer = server._state["gestures"]
             assert recognizer.bend_click is (enabled is True)
             assert server._state["gesture_settings"]["bend_click"] is (enabled is True)
+            combined = server._state["multimodal"].pointer_controller
+            assert combined.bend_click is (enabled is True)
+            assert combined.mouse._device is None
             assert recognizer._mouse is None
             assert recognizer.is_running() is False
 
@@ -217,6 +220,37 @@ def test_navigation_travel_default_and_user_setting_reach_both_modes(app_dir, tr
             assert recognizer.measured.travel_palms == expected
             assert recognizer._navigation.travel_palms == expected
             assert server._state["gesture_settings"]["travel_palms"] == expected
+            assert server._state["multimodal"].pointer_controller._tracker.travel_palms == expected
+
+    asyncio.run(boot())
+
+
+@pytest.mark.parametrize("mode", ["auto", "shortcut"])
+def test_combined_desktop_controller_is_idle_and_uses_shared_settings_at_startup(app_dir, monkeypatch, mode):
+    from core import desktop
+    from core.eeg_hand_control import EegHandController
+    from interface import server
+
+    path = app_dir / "config" / "config.yaml"
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+    cfg["gestures"]["desktop_mode"] = mode
+    path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    monkeypatch.setattr(desktop._WindowsTouchpad, "__init__",
+                        lambda *_a, **_kw: pytest.fail("Startup must not open a native touchpad"))
+
+    async def boot():
+        async with server.lifespan(server.app):
+            service = server._state["multimodal"]
+            pointer = service.pointer_controller
+            assert isinstance(pointer, EegHandController)
+            assert pointer.controls.desktop.status()["preference"] == mode
+            assert not pointer.controls.desktop.status()["active"]
+            assert pointer.mouse._device is None and not pointer.navigation_active
+            assert not service.hand_navigation_authorized() and not pointer.controls.active()
+            assert pointer.controls._authorize_desktop().get("error")
+            camera = service.camera
+            assert not camera.is_running() and camera.bindings == {}
+            assert camera.on_motion is None and camera.on_gesture is None
 
     asyncio.run(boot())
 

@@ -2,6 +2,11 @@
 
 Branch: `update_10_12_2026_eeg_signal_status`, continued from the previous EEG branch.
 
+**Historical report:** the [October 13 update](2026-10-13-camera-eeg.md) removes the raw 10 mV
+peak-to-peak cutoff, superseding the amplitude-pause behavior described below.
+Preprocessing and saved-model compatibility are unchanged. The test outcomes
+below record the October 12 cleanup and do not verify that later change.
+
 ## Result
 
 The EEG panel now exposes one workflow: a one-second fast double-blink CNN sends

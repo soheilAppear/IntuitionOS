@@ -116,7 +116,6 @@ class MultimodalPreview:
         self._eeg_last_result = None
         self._eeg_reason = "Collect labelled training trials, freeze the model, then collect held-out validation trials."
         self._eeg_last_disarm_reason = None  # Keep the first actual revocation visible through later prediction refreshes.
-        self._eeg_quality_pause_reason = None  # A recoverable fast-CNN artifact pauses only EEG output until fresh rest.
         self._eeg_guard_token = None
         self._eeg_guard_until = -math.inf
         self._eeg_retired_guard_tokens = set()
@@ -654,7 +653,6 @@ class MultimodalPreview:
         if retire_guard:
             self._retire_eeg_guard_locked()
         self._eeg_armed = False
-        self._eeg_quality_pause_reason = None
         self._eeg_reason = reason
         self._reset_eeg_debounce()
         self._pointer_at = -math.inf  # Revoking EEG authorization revokes hand aiming at the same instant.
@@ -697,9 +695,15 @@ class MultimodalPreview:
 
 
     def _hand_control_authorized(self, now):
-        """The existing explicit arm permits camera input through temporary EEG artifacts."""
+        """The shared explicit arm and live Escape guard authorize camera input."""
         return bool(self._hand_pointer_enabled() and self._owns_camera and self._eeg_control_authorized(now))
         # Actual moves still recheck fresh camera frames; hand loss releases an owned drag.
+
+    def hand_navigation_authorized(self):
+        """Recheck shared arm and fresh sensors before each measured desktop action."""
+        with self._lock:
+            now = self.clock()
+            return bool(self._hand_control_authorized(now) and self._hand_inputs_fresh(now))
 
     def _finger_blocks_eeg(self, now):
         """Optional aiming never gates EEG on a hand pose, only on competing native input."""
@@ -711,21 +715,13 @@ class MultimodalPreview:
         active = feedback.get("finger_active")
         if type(feedback.get("finger_action_active")) is bool:
             active = feedback["finger_action_active"]  # Approaching a pinch alone cannot erase CNN evidence.
-        return active is True or feedback.get("button_down") is True
+        return active is True or feedback.get("button_down") is True or feedback.get("navigation_active") is True
 
 
     def _cnn_event_eligible(self, now, prediction=None):
         prediction = self._eeg_prediction if prediction is None else prediction
-        return bool(self._eeg_quality_pause_reason is None
-                    and (prediction or {}).get("eligible_for_event", True) is True
+        return bool((prediction or {}).get("eligible_for_event", True) is True
                     and now - self._last_dispatch_at >= self._eeg_cooldown_seconds())
-
-
-    def _recoverable_cnn_amplitude_fault(self, prediction):
-        """Only the fast decoder's checked amplitude fault can retain authorization."""
-        return (prediction.get("valid") is False and prediction.get("recoverable") is True
-                and prediction.get("fault_category") == "signal_quality"
-                and prediction.get("fault_code") == "signal_amplitude")
 
 
     def _suspend_hand_tracking(self, reason):
@@ -833,7 +829,9 @@ class MultimodalPreview:
                 if finger_active:
                     self._last_finger_at = now
                     self._last_dispatch_at = now  # EEG must wait through cooldown and a new rest/select/rest cycle after finger input.
-                    self._eeg_reason = "Finger control takes priority; rest again before a new EEG selection."  # Explain why a queued EEG click was cancelled.
+                    self._eeg_reason = ("Desktop swipe takes priority; rest again before a new EEG selection."
+                                        if feedback.get("navigation_active") is True else
+                                        "Finger control takes priority; rest again before a new EEG selection.")  # Explain why a queued EEG click was cancelled.
                 if feedback.get("error"):
                     self._pointer_cleanup_pending = bool(feedback.get("error"))  # Input errors require confirmed cleanup before reuse.
                     self._disarm_eeg_locked(feedback.get("error") or "Hand target lost; point again and explicitly rearm.")  # Never release a queued click after losing its target.
@@ -886,7 +884,7 @@ class MultimodalPreview:
                     and self._confident_eeg_prediction(self._eeg_prediction or {}))
 
     def _eeg_control_authorized(self, now):
-        """Keep explicit authorization through fresh-signal artifact recovery, never device faults."""
+        """Keep explicit authorization during CNN warmup or finger cooldown, never device faults."""
         return bool(self._eeg_armed and not self._camera_changing and self._guard_ready(now)
                     and self._eeg_inputs_fresh(now) and not self._click_cleanup_pending
                     and not self._pointer_cleanup_pending and not self._pointer_needs_cleanup and not self._eeg_pending
@@ -932,7 +930,6 @@ class MultimodalPreview:
                     return self._result("Arming requires a frozen validated fast blink model, fresh EEG and confirmed input cleanup.")
                 self._eeg_armed = True
                 self._eeg_last_disarm_reason = None  # Only successful explicit arming acknowledges the prior revocation.
-                self._eeg_quality_pause_reason = None
                 self._eeg_reason = "Armed. Double blink deliberately for one left click. Escape disarms; a visible hand is not required."
             return self._result()
 
@@ -1162,7 +1159,7 @@ class MultimodalPreview:
                 with self._lock:
                     self._eeg_last_result = result.get("error") or ("Accepted " + trial["phase"] + " " +
                                              ("no-command" if trial["label"] == "rest" else "double-blink") + " trial.")
-            prediction = self._decoder.update(signal)  # The detector deduplicates counters and validates amplitude, clipping, gaps, and context.
+            prediction = self._decoder.update(signal)  # The detector checks clipping, flatlines, gaps and context; raw amplitude alone is not a veto.
             decoder_status = self._decoder.status()
             with self._lock:
                 if (generation != self._generation or decoder_epoch != self._decoder_epoch
@@ -1179,26 +1176,12 @@ class MultimodalPreview:
                 if fresh_event:
                     self._blink_last_event_id = event_id  # Consume blocked/disarmed detections too; they cannot be queued for a later target.
                 self._blink_dispatch_id = None
-                if (self._eeg_quality_pause_reason is not None and prediction.get("valid") is True
-                        and prediction.get("ready") is True and prediction.get("ready_for_blink") is True
-                        and prediction.get("label") == "rest" and not event_id):
-                    self._eeg_quality_pause_reason = None  # The decoder rebuilt fresh context and recognized rest after the artifact.
                 if not self._eeg_armed:
                     self._eeg_reason = prediction.get("reason") or "Double-blink prediction only; explicitly arm before clicking."
                 elif prediction.get("valid") is not True:
-                    if self._recoverable_cnn_amplitude_fault(prediction):
-                        # The decoder already discarded its waveform and latches.
-                        # Cancel service evidence without revoking camera aiming,
-                        # finger ownership, or the continuously renewed Escape guard.
-                        self._reset_eeg_debounce(reset_blink_stream=False)
-                        self._eeg_quality_pause_reason = prediction.get("reason") or "EEG amplitude exceeded the signal guard."
-                        self._eeg_reason = "EEG clicks paused: " + self._eeg_quality_pause_reason
-                    else:
-                        self._disarm_eeg_locked(prediction.get("reason") or "EEG quality failed; wait for recovery and explicitly rearm.")
-                elif self._eeg_quality_pause_reason is not None:
-                    self._eeg_reason = "EEG clicks paused after a signal artifact. " + (prediction.get("reason") or "Wait for fresh EEG and recognized rest.")
+                    self._disarm_eeg_locked(prediction.get("reason") or "EEG quality failed; wait for recovery and explicitly rearm.")
                 elif self._finger_blocks_eeg(now):
-                    self._eeg_reason = "Finger input takes priority; wait for release and a fresh double blink."
+                    self._eeg_reason = "Hand input takes priority; wait for release and a fresh double blink."
                 elif not self._cnn_event_eligible(now, prediction):
                     self._eeg_reason = ("EEG click cooldown; wait briefly before another deliberate double blink."
                                         if now - self._last_dispatch_at < self._eeg_cooldown_seconds() else
@@ -1296,8 +1279,8 @@ class MultimodalPreview:
                                     "window_seconds": 1.0, "trial_seconds": 1.0, "click_cooldown_seconds": 1.0,
                                     "can_arm": self._can_eeg_arm(now), "reason": self._eeg_reason,
                                     "last_disarm_reason": self._eeg_last_disarm_reason,
-                                    "signal_quality_paused": bool(self._eeg_armed and self._eeg_quality_pause_reason is not None),
-                                    "signal_quality_reason": self._eeg_quality_pause_reason,
+                                    "signal_quality_paused": False,  # Retain the response schema while amplitude pauses are retired.
+                                    "signal_quality_reason": None,
                                     "can_eeg_click": self._can_eeg_arm(now) and self._cnn_event_eligible(now) and not self._finger_blocks_eeg(now),
                                     "camera_required": self._camera_required(), "camera_mouse_enabled": self._cnn_camera_enabled,
                                     "saved_model_source": self._model_source, "guard_ready": self._guard_ready(now),

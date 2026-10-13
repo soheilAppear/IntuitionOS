@@ -88,9 +88,12 @@ test('real markup contains one workflow, accurate storage scope, and persistent 
   const html = fs.readFileSync(path.join(__dirname, '../ui/renderer/index.html'), 'utf8');
   const markup = html.match(/<details class="multimodal-panel"[\s\S]*?<\/details>/)[0];
   assert.doesNotMatch(markup.split('>')[0], /\bopen\b/);
-  assert.doesNotMatch(markup, /<select|practice|swipes|eyes.closed|5.second|automatic double|legacy/i);
+  assert.doesNotMatch(markup, /<select|practice|EEG swipes|eyes.closed|5.second|automatic double|legacy/i);
   assert.match(markup, /processed one-second training and validation waveforms/);
   assert.match(markup, /pinch-hold drags/); assert.match(markup, /not thought reading/);
+  assert.match(markup, /Desktop swipes: raise index, middle, ring, and pinky/);
+  assert.match(markup, /left for the next desktop or right for the previous/);
+  assert.match(markup, /combined mode supports horizontal swipes/);
   assert.match(markup, /does not measure physical blink-to-click latency/);
   assert.match(html, /id="camera-privacy"[^>]*role="status"/);
   for (const id of ['start','stop','eeg-camera','eeg-arm','camera','eeg','eeg-rest','eeg-select','eeg-train','eeg-save','eeg-load-saved'])
@@ -164,6 +167,43 @@ test('fast overall validation result does not invent pending legacy per-gate fla
   assert.doesNotMatch(r.el('eeg-gates').textContent, /pending/);
 });
 
+test('failed validation explains why fresh camera and EEG cannot arm either mouse control', () => {
+  const r = harness();
+  r.panel.acceptStatus(running({ eeg_control: { can_arm: false, can_eeg_click: false },
+    decoder: { state: 'validation_failed', passed_validation: false, arm_eligible: false,
+      evaluation: { complete: true, passed: false, accuracy: 13 / 16, balanced_accuracy: 13 / 16,
+        rest_false_activations: 1, rest_trials: 8, rest_false_activation_rate: .125,
+        confusion: { rest: { rest: 7, select: 1, uncertain: 0 }, select: { rest: 2, select: 6, uncertain: 0 } } } } }));
+  assert.equal(r.el('eeg-camera').checked, true);
+  assert.match(r.el('camera-status').textContent, /Hand tracked/);
+  assert.equal(r.el('eeg-arm').disabled, true); assert.equal(r.el('eeg-arm').checked, false);
+  for (const id of ['control-status', 'hand-pointer-status', 'prediction']) {
+    assert.match(r.el(id).textContent, /CNN validation failed/);
+    assert.match(r.el(id).textContent, /no-command false selections: 1 \/ 8 \(12\.5%\)/);
+    assert.match(r.el(id).textContent, /missed double blinks: 2 \/ 8/);
+    assert.doesNotMatch(r.el(id).textContent, /Explicitly arm, then point/);
+  }
+  r.el('eeg-arm').checked = true; r.el('eeg-arm').dispatch('change');
+  assert.equal(r.guards.length, 0); assert.equal(r.requests.length, 0);
+});
+
+for (const [name, evaluation] of [
+  ['missing', null],
+  ['malformed', { complete: true, passed: false, rest_false_activations: '1', rest_trials: 8,
+    confusion: { select: { rest: -2, select: 6, uncertain: 0 } } }],
+]) test(`failed validation stays clear and locked with ${name} evaluation details`, () => {
+  const r = harness();
+  r.panel.acceptStatus(running({ decoder: { state: 'validation_failed', passed_validation: false,
+    arm_eligible: false, evaluation } }));
+  for (const id of ['control-status', 'hand-pointer-status', 'prediction']) {
+    assert.match(r.el(id).textContent, /CNN validation failed/);
+    assert.doesNotMatch(r.el(id).textContent, /false selections:|missed double blinks:|NaN|undefined/);
+  }
+  assert.equal(r.el('eeg-arm').disabled, true); assert.equal(r.el('eeg-arm').checked, false);
+  r.el('eeg-arm').checked = true; r.el('eeg-arm').dispatch('change');
+  assert.equal(r.guards.length, 0); assert.equal(r.requests.length, 0);
+});
+
 test('unavailable global Escape prevents the arm POST', async () => {
   const r = harness({ guardMode: 'unavailable' }); r.panel.acceptStatus(running());
   r.el('eeg-arm').checked = true; r.el('eeg-arm').dispatch('change'); await flush();
@@ -190,14 +230,15 @@ test('late arm response cannot resurrect input after Stop', async () => {
   assert.equal(r.el('eeg-arm').checked, false); assert.match(r.el('summary').textContent, /stopped/i);
 });
 
-test('confirmed amplitude pause keeps checked state and Escape lease through clean-window refill', async () => {
+test('usable high-amplitude EEG keeps the acknowledged arm and normal CNN readiness', async () => {
   const r = harness(); await arm(r); const revocations = r.guardStops.length;
-  for (const prediction of [{ valid: false, reason: 'Amplitude too large.' }, { valid: true, ready: false, label: 'rest', reason: 'Collecting fresh CNN context.' }]) {
-    r.panel.acceptStatus(running({ eeg_control: { armed: true, can_arm: false, can_eeg_click: false,
-      signal_quality_paused: true, signal_quality_reason: 'Amplitude too large.', prediction } }));
-    assert.equal(r.el('eeg-arm').checked, true); assert.equal(r.el('eeg-arm').disabled, false);
-    assert.match(r.el('control-status').textContent, /Camera mouse active; EEG clicks paused: Amplitude too large/);
-  }
+  r.panel.acceptStatus(running({ eeg_control: { armed: true, can_arm: true, can_eeg_click: true,
+    signal_quality_paused: false, signal_quality_reason: null,
+    prediction: { valid: true, ready: true, ready_for_blink: true, label: 'rest', confidence: .1 } },
+    eeg: { stats: { ...running().eeg.stats, channels: [{ name: 'O2', peak_to_peak_v: .04, rms_v: .014 }] } } }));
+  assert.equal(r.el('eeg-arm').checked, true); assert.equal(r.el('eeg-arm').disabled, false);
+  assert.match(r.el('control-status').textContent, /CNN ready for a new double blink/);
+  assert.match(r.el('diagnostics').textContent, /40,000|40000/);
   assert.equal(r.guardStops.length, revocations);
 });
 
@@ -210,6 +251,42 @@ test('transient CNN recovery preserves backend arm while hard disarm shows its s
   r.panel.acceptStatus(running({ eeg_control: { armed: false, last_disarm_reason: 'EEG sample counter changed.' } }));
   assert.equal(r.el('eeg-arm').checked, false); assert.ok(r.guardStops.length > revocations);
   assert.match(r.el('control-status').textContent, /Last disarm: EEG sample counter changed/);
+});
+
+test('desktop navigation shows its live hint without calling the pointer ready or waiting', async () => {
+  const r = harness(); await arm(r); const revocations = r.guardStops.length;
+  for (const hint of ['Hold four fingers still', 'Next desktop: 70%', 'Lower your hand or make a fist before another swipe']) {
+    r.panel.acceptStatus(running({ eeg_control: { armed: true, can_arm: false, can_eeg_click: false,
+      hand_pointer: { state: 'desktop_swipe', ready: false, hint },
+      prediction: { valid: true, ready: false, ready_for_blink: false, reason: 'Desktop navigation has priority.' } } }));
+    assert.equal(r.el('eeg-arm').checked, true);
+    assert.equal(r.el('hand-pointer-status').textContent,
+      `Desktop swipe: ${hint} EEG clicks wait until navigation and recovery finish.`);
+    assert.doesNotMatch(r.el('hand-pointer-status').textContent, /Camera mouse (ready|waiting)/);
+    assert.equal(r.guardStops.length, revocations);
+  }
+  // Brief tracking loss can retain navigation ownership until its grace/reset completes.
+  r.panel.acceptStatus(running({ camera: { tracked: false }, eeg_control: { armed: true,
+    can_eeg_click: false, hand_pointer: { state: 'desktop_swipe', ready: false, hint: 'Tracking lost: navigation paused.' } } }));
+  assert.match(r.el('hand-pointer-status').textContent, /Desktop swipe: Tracking lost/);
+  assert.doesNotMatch(r.el('hand-pointer-status').textContent, /EEG blinks still click/);
+  r.panel.acceptStatus(running({ eeg_control: { armed: true, can_arm: false, can_eeg_click: false,
+    hand_pointer: { state: 'mouse_paused', ready: false, hint: 'Point briefly to resume aiming.' },
+    prediction: { valid: true, ready: false, ready_for_blink: false,
+      suppressed_evidence_remaining_seconds: .8, reason: 'Keep eyes open until rest.' } } }));
+  assert.match(r.el('hand-pointer-status').textContent, /Camera mouse waiting: Point briefly to resume aiming/);
+  assert.match(r.el('prediction').textContent, /0.8 s of newer EEG still needed after hand input/);
+  assert.equal(r.el('eeg-arm').checked, true); assert.equal(r.guardStops.length, revocations);
+});
+
+test('stale or disarmed metadata cannot advertise an active desktop swipe', () => {
+  const r = harness(), pointer = { state: 'desktop_swipe', ready: false, hint: 'Next desktop: 70%' };
+  r.panel.acceptStatus(running({ eeg_control: { armed: false, hand_pointer: pointer } }));
+  assert.match(r.el('hand-pointer-status').textContent, /disarmed/);
+  assert.doesNotMatch(r.el('hand-pointer-status').textContent, /Desktop swipe:/);
+  r.panel.acceptStatus(running({ camera: { age_ms: 900 }, eeg_control: { armed: true, hand_pointer: pointer } }));
+  assert.match(r.el('hand-pointer-status').textContent, /Camera mouse paused/);
+  assert.doesNotMatch(r.el('hand-pointer-status').textContent, /Desktop swipe:/);
 });
 
 test('camera expiry clears only camera while EEG expiry revokes the active guard', async () => {

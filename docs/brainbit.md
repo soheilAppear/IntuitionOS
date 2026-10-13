@@ -1,6 +1,6 @@
 # BrainBit and fast double-blink mouse clicks
 
-Updated **October 12, 2026** on
+Updated **October 13, 2026** on
 [`update_10_12_2026_eeg_signal_status`](https://github.com/soheilAppear/IntuitionOS/tree/update_10_12_2026_eeg_signal_status).
 
 The EEG workflow has one detector: a small causal CNN that recognizes a deliberate
@@ -74,10 +74,19 @@ For a new calibration:
    compatible fresh stream. A failed result remains failed when saved and loaded.
 
 Accepted trials contain 250 consecutive four-channel samples. Missing packets,
-incorrect timestamps, invalid values, clipping, flat signals, and excessive
-amplitude reject a trial instead of counting incomplete data as a success.
-Starting collection disarms input. Cancelling a batch does not turn a partial
-recording into an accepted example.
+incorrect timestamps, invalid values, clipping, repeated samples, and flat
+signals reject a trial instead of counting incomplete data as a success. Raw
+amplitude alone no longer rejects a trial: the former 10 mV peak-to-peak cutoff
+has been removed from collection and live detection. Starting collection disarms
+input. Cancelling a batch does not turn a partial recording into an accepted example.
+
+Preprocessing is unchanged: adjacent samples are averaged, each channel's DC
+offset and linear drift are removed, and its waveform is divided by a robust
+scale estimate. The existing 1 microvolt scale floor and normalized-input bound
+of -12 to +12 remain part of the frozen model format. Existing saved fast CNNs
+remain compatible and do not require retraining for this change. Normalization
+does not guarantee that an unfamiliar movement or contact artifact will be
+classified correctly; such artifacts can also resemble the learned blink shape.
 
 Held-out validation requires balanced accuracy of at least 75%, per-class precision
 and recall of at least 70%, and a no-command false-activation rate no greater than
@@ -90,17 +99,38 @@ After validation, explicitly check the arm control. With Camera mouse enabled,
 point your index finger briefly to engage movement, then move your hand to aim.
 The preview shows the same hand joints and connections as camera-only mode.
 The backend copies the current standalone tracker, camera index, model complexity,
-and optional bend-click preference before starting the EEG camera.
+optional bend-click preference, desktop movement mode, and hand travel before
+starting the EEG camera.
 
 - A recognized **double blink sends one left click**, even if no hand is visible.
 - **Pinch and release** sends a finger click; **pinch and hold** drags until release.
-- Finger input takes priority. It discards pending EEG commands; after finger
-  release, EEG clicking requires one second of newer signal and recognized rest.
+- **Four-finger horizontal swipes** switch virtual desktops, using the same
+  navigation settings as camera-only mode. The pointer pauses while navigating.
+- Finger input and desktop navigation take priority. They discard pending EEG
+  commands; afterward, EEG clicking requires one second of newer signal and
+  recognized rest, in addition to the ordinary click cooldown.
 - Losing hand tracking pauses movement and releases an owned drag. Show your
   hand and point briefly to resume aiming. Hand loss alone does not block an EEG click.
 - Changing Camera mouse disarms input but retains the model and running EEG session.
 - **Escape** disarms input from any app. **Stop** also ends EEG and releases the camera.
   Closing a panel alone does not stop acquisition or silently disarm a live control.
+
+For a desktop swipe, raise your index, middle, ring, and pinky; keep your thumb
+relaxed and apart from your index. Hold still for 0.30 seconds, then sweep left
+to reveal the next desktop (to the right), or right to reveal the previous one
+(to the left). Reach 100% and hold for 0.10 seconds to finish. The default travel
+is 1.2 palm widths; change **Hand travel to 100%** in Hand controls with the camera
+off. A fist or pinch before completion cancels. Lower your hand or make a fist
+for 0.20 seconds before another swipe; point again to resume aiming. Keeping the
+same raised pose does not repeat a desktop switch, and a cancelling pinch does
+not become a click.
+
+This combined mode supports left/right navigation only. At least two Windows
+desktops must already exist. **Smooth when supported** follows Windows' native
+four-finger touchpad assignment; configure it for desktop switching.
+**Measured steps** sends one adjacent-desktop shortcut at completion. Both
+choices use the same settings as standalone Hand controls. Stop and Escape also
+cancel navigation; no extra toggle or EEG retraining is needed.
 
 After a blink click, the rolling EEG window remains available. The detector waits
 for recognized rest and its one-second click cooldown before another command.
@@ -130,18 +160,19 @@ with both control panels closed, and rejects older status revisions.
 
 | Condition | Behavior |
 |---|---|
-| Temporary raw variation above 10 mV peak-to-peak | Pause EEG clicks; retain the existing arm and camera/finger controls. Discard pending evidence, then require fresh clean EEG and recognized rest. |
+| Raw variation above the former 10 mV peak-to-peak cutoff | Continue classifying the normalized waveform; amplitude alone does not pause input or reset CNN history. |
 | Packet gap, stale delivery, invalid context/data, flatline, repeated samples, or clipping | Disarm; show and retain the reason. Recover the stream and explicitly arm again. |
 | Escape lease expires or native input fails | Disarm and release owned input; do not replay a pending click. |
 | Hand disappears | Pause movement and release a drag; EEG clicks may still use the current cursor. |
 | Camera start/stop overlaps another request | Newer Stop/disable supersedes queued starts; release must complete before ownership can change. |
 | Backend or headset disconnects | Mark status unconfirmed and revoke input. Reconnect and explicitly resume. |
 
-The original repeated-unchecking issue was traced to raw amplitude excursions:
-the previous service treated each excursion as a full-control shutdown. Only this
-specific recoverable amplitude fault now pauses EEG independently. Transport,
-clipping, contact-related flatline, and guard checks remain strict; the amplitude
-limit and trained weights were not loosened.
+The original repeated-unchecking issue was traced to raw amplitude excursions.
+The October 12 update changed those shutdowns into temporary EEG pauses; the
+October 13 update removes that raw upper-amplitude gate entirely. Numeric
+validity, transport, clipping, contact-related flatline, and Escape guard checks
+remain in force. The CNN's preprocessing, trained weights, classification
+thresholds, rest requirement, and click cooldown are unchanged.
 
 **EEG live** means recent samples are arriving, not that they are clean. The panel
 shows nominal/received rates, last-sample age, and cumulative packet diagnostics.
@@ -197,6 +228,9 @@ $jsTests = rg --files tests -g '*_test.cjs'
 node --test @jsTests
 ```
 
-Live checks and automated results for this update are recorded in the
-[October 12 update report](2026-10-12-fast-blink.md). Synthetic classification tests
-cannot establish a wearer's real-world recognition accuracy.
+Automated results and live-check limitations for this update are recorded in the
+[October 13 update report](2026-10-13-camera-eeg.md). The
+[October 12 report](2026-10-12-fast-blink.md) records the preceding cleanup.
+Synthetic classification tests cannot establish a wearer's real-world recognition
+accuracy. Personal training examples, calibration archives, and pretrained weights
+are excluded from Git and stay on the local machine.

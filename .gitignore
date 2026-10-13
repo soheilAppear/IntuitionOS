@@ -7,6 +7,27 @@ ui/node_modules/
 # Runtime data — the directory is tracked, its contents are not
 data/*
 !data/.gitkeep
+# Downloaded networks and personal calibration archives must stay local even
+# when copied outside data/. Keep model code and setup scripts in Git.
+/models/
+/weights/
+/checkpoints/
+/pretrained_models/
+/.ollama/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.tflite
+*.task
+*.safetensors
+*.gguf
+*.ggml
+fast-cnn-blink-*.json
+cnn-blink-*.json
+model-20*T*.json
+MANO_RIGHT.pkl
+mano_mean_params.npz
 # User-generated files stay local and are never included in normal Git staging.
 /CreatedFolder/
 *.db

@@ -176,9 +176,10 @@ hand or a longer interruption requires pointing again.
 
 ## Camera mouse with fast double-blink clicks
 
-Updated October 12, 2026. **Fast double blink** is the only EEG detector.
+Updated October 13, 2026. **Fast double blink** is the only EEG detector.
 Enable **Camera mouse** in that panel to use the same tracker, camera index,
-model complexity, and optional bend-click preference as standalone Hand controls.
+model complexity, optional bend-click preference, desktop movement mode, and
+hand travel as standalone Hand controls.
 Both previews share one renderer for the hand skeleton and its 21 joints.
 The configured laptop default is MediaPipe Hands Full; selecting another supported
 tracker in Hand controls applies to the next EEG camera start as well.
@@ -191,15 +192,35 @@ it and use the fast EEG detector with your ordinary mouse or touchpad.
 After loading a validated model and explicitly arming, point briefly to engage
 movement, move your hand to aim, and double blink for one left click. A missing
 hand pauses movement and releases an owned drag, while EEG clicking at the
-current cursor remains available. Pinch/release clicks and pinch-hold drags take
-priority over EEG. After finger input ends, the detector requires one second
-of newer EEG and recognized rest so a buffered blink cannot become a late click.
+current cursor remains available. Pinch/release clicks, pinch-hold drags, and
+left/right desktop swipes take priority over EEG. After these hand actions end,
+the detector requires one second of newer EEG and recognized rest so a buffered
+blink cannot become a late click. The ordinary click cooldown also still applies.
 
-A temporary EEG amplitude spike pauses only EEG clicks. Camera aiming, pinch,
-and dragging remain armed. Recovery requires fresh clean EEG and recognized
-rest. Other signal, transport, guard, or input faults still disarm and retain a
-visible reason. Escape disarms both forms of input; Stop releases acquisition.
-Toggling Camera mouse disarms input and preserves EEG calibration and its session.
+For desktop navigation, raise four fingers with your thumb relaxed, hold still
+for 0.30 seconds, and move horizontally. Left reveals the next desktop to the
+right; right reveals the previous desktop to the left. Reach 100% and hold for
+0.10 seconds to finish. The navigation hint beneath the camera follows progress;
+the pointer and EEG clicks wait while navigation owns input. Lower your hand or
+make a fist for 0.20 seconds before another swipe, then point again to aim. A fist
+or pinch before completion cancels; a cancelling pinch never becomes a click.
+
+The combined mode supports horizontal navigation only, using the same hand-travel
+and desktop-movement settings as camera-only mode. Native smooth gestures follow
+Windows' four-finger touchpad assignment; measured steps send an adjacent-desktop
+shortcut when complete. At least two desktops must already exist. Configure
+these options in Hand controls with the camera off. No new EEG training or extra
+arm switch is needed; Escape and Stop cancel desktop navigation too.
+
+Raw EEG amplitude alone no longer pauses clicks or rejects a collected trial;
+the October 13 update removes the former 10 mV peak-to-peak cutoff. The CNN
+still uses the same normalized waveform input and existing saved models remain
+compatible. Large movement or contact artifacts can still resemble a blink;
+normalization does not guarantee their correct classification. Invalid data,
+flatlines, repeated samples, clipping, transport, guard, or input faults still
+disarm and retain a visible reason. Escape disarms both forms of input; Stop
+releases acquisition. Toggling Camera mouse disarms input and preserves EEG
+calibration and its session.
 
 The yellow **CAMERA ON** header indicator covers both standalone and EEG capture.
 It remains active during release, and indicates uncertainty if release fails or

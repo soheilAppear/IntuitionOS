@@ -1,117 +1,97 @@
-"""Recoverable amplitude artifacts pause EEG, never camera aiming or safety gates."""
+"""High amplitudes reach the CNN; transport, input ownership and Escape still gate clicks."""
 
+import copy
+import importlib
+
+import numpy as np
 import pytest
 
-from test_eeg_fast_blink import trained_decoder
+from test_eeg_fast_blink import add, clone, trained_decoder
 from test_eeg_fast_blink_control import fast, fast_hand
 
 
-AMPLITUDE = {"valid": False, "ready": False, "ready_for_blink": False, "eligible_for_event": False,
-             "fault_category": "signal_quality", "fault_code": "signal_amplitude", "recoverable": True,
-             "reason": "O2: 10.29 mV peak-to-peak exceeds the 10 mV raw signal guard."}
-
-
-def artifact(h, event_id="artifact-evidence", **changes):
-    h.emit(event_id, **{**AMPLITUDE, **changes})
-
-
-def ready_rest(h):
-    h.emit(None, label="rest", ready=True, ready_for_blink=True, eligible_for_event=True,
-           reason="Fresh CNN context and rest recognized.")
-
-
-def test_amplitude_pause_keeps_camera_arm_guard_and_model_while_suppressing_all_eeg(fast_hand):
+@pytest.fixture
+def high_amplitude_hand(fast_hand, trained_decoder, monkeypatch):
+    """Run real signal checks and detector state with a synthetic 40 mV waveform."""
     h = fast_hand
+    decoder = clone(trained_decoder)
+    for index in range(16, 32):
+        add(decoder, index, "select" if index % 2 else "rest", phase="validate")
+    assert decoder.status()["passed_validation"]
+    h.eeg.acq["channels"] = copy.deepcopy(decoder.status()["context"]["channels"])
+    decoder.bind_prediction_context({"session_id": h.eeg.acq["session_id"], "channels": h.eeg.acq["channels"],
+                                     "nominal_hz": 250, "units": "V", "feature_profile": decoder.feature_profile})
+    decoder.clock = h.clock
+    # Fix only classifier scores: these tests prove input acceptance and output
+    # arbitration, not the model's accuracy on unfamiliar high-amplitude data.
+    h.score = {"value": .1}
+    monkeypatch.setattr(importlib.import_module("core.eeg_fast_blink"), "_scores",
+                        lambda *_: np.array([h.score["value"]]))
+    raw_signal = h.eeg.acquisition_signal_window
+
+    def scaled_signal():
+        signal = raw_signal()
+        for row in signal["samples"]:
+            row["samples"] = [value * 20_000 for value in row["samples"]]
+        return signal
+
+    monkeypatch.setattr(h.eeg, "acquisition_signal_window", scaled_signal)
+    h.decoder = h.service._decoder = decoder
+    h.service._decoder_status = decoder.status()
     h.enable()
+    h.tick(12)
     h.arm()
-    h.tick(2)
-    token, decoder, session = h.guard_token, h.decoder, h.eeg.acq["session_id"]
-    moves, resets, serial = len(h.pointer.moves), h.decoder.stream_resets, h.service._blink_reset_serial
-    artifact(h)
+    h.tick(10)
+    assert h.control()["can_eeg_click"]
+    values = np.array([row["samples"] for row in scaled_signal()["samples"][-250:]])
+    assert np.all(np.ptp(values, axis=0) > .01)  # All channels exceed the removed raw-voltage cutoff.
+    return h
+
+
+@pytest.mark.parametrize("show_hand", [True, False])
+def test_high_amplitude_reaches_real_decoder_without_pausing_clicks(high_amplitude_hand, show_hand):
+    h = high_amplitude_hand
+    archive, moves = h.decoder.export_state(), len(h.pointer.moves)
+    h.show_hand = show_hand
+    h.score["value"] = .99
+    h.tick(3)
     control = h.control()
-    assert control["armed"] and control["guard_ready"] and control["signal_quality_paused"]
-    assert not control["can_eeg_click"] and control["signal_quality_reason"] == AMPLITUDE["reason"]
-    assert control["last_disarm_reason"] is None and "paused" in control["reason"].lower()
-    assert h.service._blink_reset_serial > serial and h.service._blink_dispatch_id is None
-    for _ in range(12):
-        artifact(h)
-    assert len(h.pointer.moves) > moves and h.control()["armed"]
-    assert h.service.eeg_guard(token).get("ok") and not h.service.status()["cleanup_pending"]
-    assert h.decoder.stream_resets == resets  # The detector handles its fault; service adds no second reset/wait.
-    assert h.service._decoder is decoder and h.eeg.acq["session_id"] == session
-    assert h.camera.stops == h.eeg.stops == 0 and h.mouse.clicks == 0
+    assert control["prediction"]["valid"] and control["prediction"]["fault_code"] is None
+    assert control["armed"] and control["guard_ready"] and control["last_disarm_reason"] is None
+    assert not control["signal_quality_paused"] and control["signal_quality_reason"] is None
+    assert h.mouse.clicks == 1
+    h.tick(10)
+    assert h.mouse.clicks == 1  # Sustained CNN evidence cannot repeat an already consumed event.
+    assert (len(h.pointer.moves) > moves) == show_hand
+    assert h.decoder.export_state() == archive
+    assert h.camera.stops == h.eeg.stops == 0
 
 
-def test_pause_survives_refill_and_select_until_fresh_recognized_rest_then_accepts_only_new_event(fast):
-    h = fast
-    h.arm()
-    artifact(h)
-    h.emit(None, label="rest", ready=False, ready_for_blink=False, eligible_for_event=False,
-           reason="Collecting fresh CNN context: 0.5 / 1.0 seconds.")
-    assert h.control()["armed"] and h.control()["signal_quality_paused"]
-    assert not h.control()["can_eeg_click"] and "0.5 / 1.0" in h.control()["reason"]
-    h.emit("queued-during-recovery", ready=True, ready_for_blink=False, eligible_for_event=True)
-    assert h.mouse.clicks == 0 and h.control()["signal_quality_paused"]
-    ready_rest(h)
-    assert not h.control()["signal_quality_paused"] and h.control()["signal_quality_reason"] is None
-    assert h.control()["can_eeg_click"] and h.control()["armed"]
-    h.emit("queued-during-recovery")
-    assert h.mouse.clicks == 0
-    h.emit("new-after-recovery")
-    assert h.mouse.clicks == 1 and h.control()["last_disarm_reason"] is None
-
-
-def test_existing_drag_and_new_finger_clicks_remain_authorized_during_amplitude_pause(fast_hand):
-    h = fast_hand
-    h.enable()
-    h.arm()
+def test_high_amplitude_keeps_pinch_drag_and_finger_priority(high_amplitude_hand):
+    h = high_amplitude_hand
     h.pointer.button_down = h.pointer.finger_active = True
     h.tick()
-    artifact(h)
-    assert h.pointer.button_down and h.control()["armed"]
+    h.score["value"] = .99
+    h.tick(3)
+    assert h.pointer.button_down and h.control()["armed"] and h.mouse.clicks == 0
     assert not h.service.status()["cleanup_pending"]
     h.pointer.button_down = h.pointer.finger_active = False
     h.pointer.click_id += 1
     h.tick()
     assert h.control()["finger_click_count"] == 1
-    assert h.control()["signal_quality_paused"] and h.mouse.clicks == 0
-
-
-def test_temporary_hand_loss_during_artifact_does_not_revoke_eeg_authorization(fast_hand):
-    h = fast_hand
-    h.enable()
-    h.arm()
-    artifact(h)
-    h.show_hand = False
+    h.tick(12)
+    assert h.mouse.clicks == 0  # A blink overlapping finger ownership is never replayed after release.
+    h.score["value"] = .1
     h.tick(3)
-    assert h.control()["armed"] and h.control()["signal_quality_paused"]
-    ready_rest(h)
-    h.emit("recovered-no-hand")
-    assert h.mouse.clicks == 1 and not h.control()["hand_pointer"]["ready"]
-
-
-@pytest.mark.parametrize("changes", [{"recoverable": False}, {"recoverable": 1},
-                                      {"fault_code": "signal_flat"}, {"fault_code": "signal_clipping"},
-                                      {"fault_category": "transport"}, {"fault_category": None},
-                                      {"valid": None}, {"fault_code": None}])
-def test_only_exact_checked_amplitude_fault_may_retain_fast_arm(fast, changes):
-    h = fast
-    h.arm()
-    token = h.guard_token
-    artifact(h, **changes)
-    assert not h.control()["armed"] and not h.control()["signal_quality_paused"]
-    assert h.service.eeg_guard(token).get("error")
-    assert h.control()["last_disarm_reason"] == AMPLITUDE["reason"] and h.mouse.clicks == 0
-
+    h.score["value"] = .99
+    h.tick(3)
+    assert h.mouse.clicks == 1 and h.control()["armed"]
 
 
 @pytest.mark.parametrize("fault", ["stale", "gap", "session", "missing_full_signal", "processing_pause", "guard", "stop"])
-def test_transport_guard_and_lifecycle_faults_still_hard_disarm_during_quality_pause(fast_hand, monkeypatch, fault):
-    h = fast_hand
-    h.enable()
-    h.arm()
+def test_high_amplitude_does_not_bypass_transport_guard_or_lifecycle(high_amplitude_hand, monkeypatch, fault):
+    h = high_amplitude_hand
     token = h.guard_token
-    artifact(h)
     if fault == "stale":
         h.tick(age=1)
     elif fault == "gap":
@@ -134,6 +114,19 @@ def test_transport_guard_and_lifecycle_faults_still_hard_disarm_during_quality_p
     assert h.mouse.clicks == 0
 
 
+@pytest.mark.parametrize("recoverable", [False, True, 1, None])
+def test_invalid_prediction_always_disarms_even_if_marked_recoverable(fast, recoverable):
+    h = fast
+    h.arm()
+    token = h.guard_token
+    h.emit("invalid-evidence", valid=False, ready=False, fault_category="signal_quality",
+           fault_code="signal_flat", recoverable=recoverable, reason="T3 is flat; check signal contact.")
+    assert not h.control()["armed"] and not h.control()["signal_quality_paused"]
+    assert h.service.eeg_guard(token).get("error")
+    assert h.control()["last_disarm_reason"] == "T3 is flat; check signal contact."
+    assert h.mouse.clicks == 0
+
+
 def test_hard_disarm_reason_survives_warmup_and_clears_only_after_successful_explicit_arm(fast):
     h = fast
     h.arm()
@@ -151,60 +144,17 @@ def test_hard_disarm_reason_survives_warmup_and_clears_only_after_successful_exp
     assert h.control()["last_disarm_reason"] is None and h.control()["armed"]
 
 
-def test_escape_during_recoverable_decoder_update_cannot_be_overwritten_by_pause(fast):
-    h = fast
-    h.arm()
-    h.decoder.on_update = lambda: h.service.eeg_arm(False)
-    artifact(h)
+def test_escape_during_high_amplitude_inference_cannot_be_overwritten(high_amplitude_hand, monkeypatch):
+    h = high_amplitude_hand
+    update = h.decoder.update
+
+    def escape_during_update(signal):
+        prediction = update(signal)
+        h.service.eeg_arm(False)
+        return prediction
+
+    monkeypatch.setattr(h.decoder, "update", escape_during_update)
+    h.score["value"] = .99
+    h.tick()
     assert not h.control()["armed"] and not h.control()["signal_quality_paused"]
     assert h.control()["last_disarm_reason"] == "EEG control disarmed." and h.mouse.clicks == 0
-
-
-def test_real_fast_decoder_artifact_recovery_and_service_pause_complete_without_rearming(fast_hand, trained_decoder, monkeypatch):
-    import copy
-    import importlib
-
-    import numpy as np
-
-    from test_eeg_fast_blink import add, clone
-
-    h = fast_hand
-    decoder = clone(trained_decoder)
-    for index in range(16, 32):
-        add(decoder, index, "select" if index % 2 else "rest", phase="validate")
-    assert decoder.status()["passed_validation"]
-    archive = decoder.export_state()
-    h.eeg.acq["channels"] = copy.deepcopy(decoder.status()["context"]["channels"])
-    decoder.bind_prediction_context({"session_id": h.eeg.acq["session_id"], "channels": h.eeg.acq["channels"],
-                                     "nominal_hz": 250, "units": "V", "feature_profile": decoder.feature_profile})
-    decoder.clock = h.clock
-    # The real quality, transport, waveform refill, counter dwell and event
-    # state run unchanged. Controlled scores isolate the service contract from
-    # classifier accuracy, which has separate held-out/continuous tests.
-    score = {"value": .1}
-    monkeypatch.setattr(importlib.import_module("core.eeg_fast_blink"), "_scores", lambda *_: np.array([score["value"]]))
-    h.decoder = h.service._decoder = decoder
-    h.service._decoder_status = decoder.status()
-    h.enable()
-    h.tick(12)
-    h.arm()
-    h.tick(10)
-    assert h.control()["can_eeg_click"]
-    moves = len(h.pointer.moves)
-    h.eeg.rows[-1]["samples"][0] += .02
-    h.tick()
-    assert h.control()["prediction"]["fault_code"] == "signal_amplitude"
-    assert h.control()["armed"] and h.control()["signal_quality_paused"]
-    score["value"] = .99
-    h.tick(20)
-    assert h.control()["prediction"]["ready"] and not h.control()["prediction"]["ready_for_blink"]
-    assert h.control()["signal_quality_paused"] and h.mouse.clicks == 0
-    score["value"] = .1
-    h.tick(3)
-    assert h.control()["prediction"]["ready_for_blink"] and not h.control()["signal_quality_paused"]
-    score["value"] = .99
-    h.tick(3)
-    assert h.mouse.clicks == 1 and h.control()["armed"]
-    h.tick(10)
-    assert h.mouse.clicks == 1 and len(h.pointer.moves) > moves
-    assert decoder.export_state() == archive and h.control()["last_disarm_reason"] is None

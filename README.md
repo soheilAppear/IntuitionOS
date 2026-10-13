@@ -37,14 +37,18 @@ The [branch consolidation report](docs/2026-09-07-main-consolidation.md) records
 the merge into `main` and subsequent bug fixes. The original 2025 prototype is
 preserved in the [historical archive](archive/README.md).
 
-**EEG update: October 12, 2026.** The combined camera and EEG work continues on
+**EEG update: October 13, 2026.** The combined camera and EEG work continues on
 [`update_10_12_2026_eeg_signal_status`](https://github.com/soheilAppear/IntuitionOS/tree/update_10_12_2026_eeg_signal_status).
 The EEG interface now has one detector: **Fast double blink CNN**, using a
 one-second signal window. One recognized double blink sends one left mouse
 click, including when your hand is outside the camera. Optional camera aiming
 uses the same configured hand tracker and joint overlay as camera-only mode,
-with pinch clicks and dragging retained. The yellow camera indicator covers
-both camera modes and turns off only after capture is released.
+with pinch clicks, dragging, and left/right virtual-desktop swipes retained.
+The raw amplitude cutoff has been removed while signal-integrity checks remain.
+The yellow camera indicator covers both camera modes and turns off only after
+capture is released. See the [October 13 update report](docs/2026-10-13-camera-eeg.md).
+Pretrained weights and personal EEG calibration archives stay local and are
+excluded from Git; this repository contains the model code, not trained weights.
 
 Start with the [BrainBit and fast double-blink guide](docs/brainbit.md).
 Training, separate held-out validation, and explicit arming are required; an
@@ -209,23 +213,35 @@ Install the optional headset SDK and local CNN trainer into the project environm
    **Train & freeze fast CNN**, then collect eight new trials of each label for
    validation. Save the model after validation.
 4. Once validation passes, explicitly arm the controls. Point briefly to engage
-   camera aiming; pinch/release clicks and pinch-hold drags still work. A
-   recognized double blink sends **one left click**, even without a visible hand.
-   Open your eyes and let the detector recognize rest before another command.
+   camera aiming; pinch/release clicks and pinch-hold drags still work. Raise four
+   fingers, hold still briefly, then sweep left or right to switch desktops with
+   the same navigation settings as camera-only mode. A recognized double blink
+   sends **one left click**, even without a visible hand. Open your eyes and let
+   the detector recognize rest before another command. Finger input and desktop
+   swipes pause EEG clicks until a fresh one-second window and rest are recognized.
 5. Press **Escape** to disarm input from any app. Choose **Stop** to release the
    camera and stop EEG acquisition. Closing a panel does not stop an active camera.
 
 The camera preview draws the same hand joints and connections in both modes.
+For desktop swipes, keep your thumb relaxed, hold four fingers still for 0.3
+seconds, then move horizontally. Left reveals the next desktop; right reveals
+the previous one. Reach 100% and hold briefly to finish. Lower your hand or make
+a fist for 0.2 seconds before another swipe, then point again to resume aiming.
+The combined mode supports horizontal navigation and needs at least two Windows
+desktops. **Hand controls** settings for movement mode and hand travel also apply.
 The header's yellow **CAMERA ON** indicator follows native capture ownership;
 **HAND ON/OFF** controls only standalone hand tracking. Starting, stopping, and
 unconfirmed release remain distinguishable from a confirmed camera-off state.
 
-A temporary EEG amplitude spike pauses blink clicks while camera control stays
-armed. Recovery discards pending blink evidence and requires fresh clean EEG
-and recognized rest. Packet gaps, stale data, flatlines, clipping, loss of the
-Escape guard, and input failures still stop input and show the reason. Hand
-loss pauses aiming and releases a drag; it does not require camera tracking for
-an EEG click. Finger input takes priority over blink commands.
+The October 13 update removes the raw 10 mV peak-to-peak cutoff from both
+trial collection and live detection. The CNN still receives the same normalized
+waveforms, so existing saved models remain compatible. A larger waveform alone
+does not pause clicks or reject a trial; movement and contact artifacts can still
+resemble a blink, and normalization does not guarantee correct classification.
+Packet gaps, stale or invalid data, flatlines, repeated samples, clipping, loss
+of the Escape guard, and input failures still stop input and show the reason.
+Hand loss pauses aiming and releases a drag; it does not require camera tracking
+for an EEG click. Finger input takes priority over blink commands.
 
 The CNN evaluates new EEG every 40 ms using a rolling one-second window.
 That window is not a guaranteed physical blink-to-click latency. Live inference

@@ -66,12 +66,21 @@ class Pointer:
         self.bend_click = False
         self.calls = []
         self.error = None
+        self.navigation_error = None
+        self.navigation_settings = None
 
     def set_bend_click(self, enabled):
         self.calls.append(("set_bend_click", enabled, threading.get_ident()))
         if self.error:
             return {"error": self.error}
         self.bend_click = enabled
+        return {"ok": True}
+
+    def configure_navigation(self, *, mode, travel_palms):
+        self.calls.append(("configure_navigation", mode, travel_palms, threading.get_ident()))
+        if self.navigation_error:
+            return {"error": self.navigation_error}
+        self.navigation_settings = {"mode": mode, "travel_palms": travel_palms}
         return {"ok": True}
 
 
@@ -138,6 +147,7 @@ def api(monkeypatch):
     monkeypatch.setattr(server, "_state", {
         "multimodal": preview, "preview_camera": preview.camera, "gestures": ordinary,
         "hand_controls": SimpleNamespace(status=lambda: {"desktop": desktop}),
+        "gesture_settings": {"desktop_mode": "shortcut", "travel_palms": 2.2},
         "gesture_lock": asyncio.Lock(),
     })
     monkeypatch.setattr(server.actions, "dispatch", lambda *_a, **_kw: pytest.fail("Duplicate action dispatch"))
@@ -168,7 +178,8 @@ def test_camera_enable_uses_current_standalone_settings_and_existing_actuator(ap
     assert camera.tracker_backend == "rtmpose" and camera.model_complexity == 0
     assert camera.camera_index == 2 and camera.input_mode == "desktop"
     assert camera.bindings == {} and camera.on_motion is None
-    assert pointer.bend_click is True and len(pointer.calls) == 1
+    assert pointer.bend_click is True and len(pointer.calls) == 2
+    assert pointer.navigation_settings == {"mode": "shortcut", "travel_palms": 2.2}
     assert [call[0] for call in camera.calls] == ["configure", "start"]
     assert ordinary.calls == [] and ordinary.input_mode == "mouse"
 
@@ -231,11 +242,14 @@ def test_enable_refuses_busy_or_nonisolated_input_before_configuration(api, owne
 
 
 @pytest.mark.parametrize("target,error", [("camera", "Tracker cleanup is unconfirmed"),
-                                         ("pointer", "Button release is unconfirmed")])
+                                         ("pointer", "Button release is unconfirmed"),
+                                         ("navigation", "Desktop input release is unconfirmed")])
 def test_configuration_failure_does_not_start_camera_or_replace_eeg_model(api, target, error):
     preview, _, _, client = api
     if target == "camera":
         preview.camera.configure_error = error
+    elif target == "navigation":
+        preview.pointer_controller.navigation_error = error
     else:
         preview.pointer_controller.error = error
     before = preview.status()
@@ -243,6 +257,30 @@ def test_configuration_failure_does_not_start_camera_or_replace_eeg_model(api, t
     assert response.status_code == 409 and response.json()["error"] == error
     assert not preview.calls and preview.status() == before
     assert not any(call[0] == "start" for call in preview.camera.calls)
+
+
+@pytest.mark.parametrize("settings", [
+    {"desktop_mode": "invalid", "travel_palms": 1.2},
+    {"desktop_mode": "auto", "travel_palms": True},
+    {"desktop_mode": "auto", "travel_palms": float("nan")},
+    {"desktop_mode": "auto", "travel_palms": 0.2},
+    {"desktop_mode": "auto", "travel_palms": 10},
+])
+def test_invalid_standalone_navigation_settings_cannot_start_combined_camera(api, settings):
+    preview, _, _, client = api
+    server._state["gesture_settings"] = settings
+    response = client.post("/multimodal/eeg_camera", headers=HEADERS, json={"enabled": True})
+    assert response.status_code == 409
+    assert "desktop swipe configuration" in response.json()["error"]
+    assert not preview.calls and not preview.camera.calls and not preview.pointer_controller.calls
+
+
+def test_missing_navigation_controller_requires_restart_before_enabling(api, monkeypatch):
+    preview, _, _, client = api
+    monkeypatch.setattr(preview.pointer_controller, "configure_navigation", None)
+    response = client.post("/multimodal/eeg_camera", headers=HEADERS, json={"enabled": True})
+    assert response.status_code == 409 and "restart" in response.json()["error"]
+    assert not preview.calls and not preview.camera.calls
 
 
 

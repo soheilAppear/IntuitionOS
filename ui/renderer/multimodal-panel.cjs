@@ -50,6 +50,24 @@ function createMultimodalPanel({ document, isConnected, isCameraRunning = () => 
     && decoder.validation_scope === 'held_out_one_second_trials'
     && Array.isArray(decoder.labels) && decoder.labels.length === 2 && LABELS.every(label => decoder.labels.includes(label))
     && complete(decoder.train_counts) && complete(decoder.validation_counts);
+  function validationFailure(decoder) {
+    const evaluation = decoder.evaluation || {};
+    if (decoder.state !== 'validation_failed'
+      && !(evaluation.complete === true && evaluation.passed === false)) return '';
+    // Report measured outcomes, not an invented explanation for whichever gate failed.
+    const details = [], validCount = value => Number.isInteger(value) && value >= 0;
+    const falseSelections = evaluation.rest_false_activations, restTrials = evaluation.rest_trials;
+    if (validCount(falseSelections) && validCount(restTrials) && restTrials > 0 && falseSelections <= restTrials)
+      details.push(`no-command false selections: ${falseSelections} / ${restTrials} (${number(falseSelections / restTrials * 100)}%)`);
+    const matrix = evaluation.confusion_matrix || evaluation.confusion;
+    const row = Array.isArray(matrix) ? matrix[1] : matrix?.select;
+    const outcomes = Array.isArray(row) ? row : [row?.rest, row?.select, row?.uncertain];
+    const blinkTrials = decoder.validation_counts?.select;
+    if (validCount(blinkTrials) && blinkTrials > 0 && outcomes.length === 3 && outcomes.every(validCount)
+      && outcomes.reduce((total, value) => total + value, 0) === blinkTrials)
+      details.push(`missed double blinks: ${blinkTrials - outcomes[1]} / ${blinkTrials}`);
+    return `CNN validation failed.${details.length ? ` ${details.join('; ')}.` : ''} Use a model that passed validation before arming.`;
+  }
   const armingSuppressed = () => stopRequested || ['stop','eeg_arm','eeg_trial','eeg_train',
     'eeg_reset','eeg_camera','eeg_load_saved'].includes(pending);
   function releaseGuard(token = guardToken, unconditional = false) {
@@ -203,8 +221,8 @@ function createMultimodalPanel({ document, isConnected, isCameraRunning = () => 
     const running = ready && status.running, stopping = pending === 'stop' || stopRequested;
     const busy = !!pending || ready && ['starting','stopping'].includes(status.state);
     const compatible = ready && workflowKnown(), cameraMouse = cameraMouseEnabled();
-    const trial = control.pending, eligible = modelEligible(decoder);
-    // Acknowledged camera/EEG quality pauses keep the lease; readiness is checked only when initially arming.
+    const trial = control.pending, eligible = modelEligible(decoder), validationBlock = validationFailure(decoder);
+    // CNN warmup and finger cooldown keep an acknowledged arm; readiness is checked only when initially arming.
     const armed = compatible && running && control.armed === true && eegFresh() && eligible && !armingSuppressed();
     put('summary', !online ? 'Backend offline' : !ready ? 'Status unconfirmed' : stopping ? 'Stopping / disarming'
       : `${running ? 'Running' : text(status.state, 'Stopped')} / ${armed ? 'armed' : 'disarmed'}`);
@@ -225,7 +243,7 @@ function createMultimodalPanel({ document, isConnected, isCameraRunning = () => 
     el.stop.disabled = !online; // Emergency stop is reachable through every pending operation.
     put('start-hint', !isBrainbitConnected() ? 'Connect BrainBit in the panel above before starting.'
       : isCameraRunning() ? 'Stop the separate Hand controls first so this panel can own desktop input.'
-      : cameraMouse ? 'Camera mouse uses the same Hand controls tracker, model, and settings. Start does not arm desktop input.'
+      : cameraMouse ? 'Camera mouse and left/right desktop swipes use the same Hand controls tracker, model, and settings. Start does not arm desktop input.'
       : 'Camera mouse is off. EEG clicks use the current cursor; no camera or visible hand is required. Start does not arm clicks.');
     el['eeg-camera'].checked = cameraMouse;
     el['eeg-camera'].disabled = !compatible || typeof control.camera_mouse_enabled !== 'boolean'
@@ -238,9 +256,13 @@ function createMultimodalPanel({ document, isConnected, isCameraRunning = () => 
       : `${status.camera.tracked ? 'Hand tracked' : 'No hand tracked'} · ${number(status.camera.fps, 0)} FPS · frame age ${seconds(age(status.camera.age_ms / 1000))}`);
     const pointer = control.hand_pointer || {};
     put('hand-pointer-status', !running ? 'Start EEG + camera, then explicitly arm to move the cursor.'
+      : !armed && validationBlock ? `Camera mouse and EEG clicks are locked. ${validationBlock}`
       : !armed ? 'Camera mouse is disarmed. Explicitly arm, then point briefly to engage hand aiming.'
-      : !cameraFresh() || status.camera.tracked !== true ? 'Camera mouse paused: show your hand in a fresh frame. EEG blinks still click at the current cursor without a visible hand.'
-      : `Camera mouse ${pointer.ready === true ? 'ready' : 'waiting'}: ${text(pointer.hint, 'Point briefly, then move your hand to aim.')} Pinch clicks and drags remain available.`);
+      : !cameraFresh() ? 'Camera mouse paused: waiting for a fresh frame. Check CNN readiness below before blinking.'
+      // Navigation owns hand input until its reset is complete; show its live hint instead of pointer readiness.
+      : pointer.state === 'desktop_swipe' ? `Desktop swipe: ${text(pointer.hint, 'Hold four fingers still, then move left or right.')} EEG clicks wait until navigation and recovery finish.`
+      : status.camera.tracked !== true ? 'Camera mouse paused: show your hand in a fresh frame. EEG blinks still click at the current cursor without a visible hand when the CNN is ready.'
+      : `Camera mouse ${pointer.ready === true ? 'ready' : 'waiting'}: ${text(pointer.hint, 'Point briefly, then move your hand to aim.')} Pinch clicks and drags remain available. Hold four fingers still, then sweep left or right to switch desktops.`);
     const stats = ready ? status.eeg?.stats || {} : {};
     put('eeg-status', !running ? 'EEG preview is off.' : !eegFresh() ? 'Waiting for fresh EEG samples.'
       : `${number(stats.received_rate_hz, 0)} Hz received / ${number(status.eeg.nominal_hz, 0)} Hz nominal · age ${seconds(age(stats.age_seconds))} · µV, auto scale per channel`);
@@ -252,14 +274,13 @@ function createMultimodalPanel({ document, isConnected, isCameraRunning = () => 
     el['eeg-arm'].checked = !!armed;
     el['eeg-arm'].disabled = !compatible || busy || !running || stopping || !!trial || !!batch
       || (!armed && (control.can_arm !== true || !eligible || !eegFresh()));
-    const paused = armed && cameraMouse && control.signal_quality_paused === true;
     put('control-status', !ready ? 'Control state unconfirmed. Arming is disabled.'
       : stopping ? 'Stop requested. Controls are disarmed while the backend confirms.'
-      : paused ? `Camera mouse active; EEG clicks paused: ${text(control.signal_quality_reason, text(control.prediction?.reason, 'Waiting for clean EEG.'))} Camera aiming, pinch clicks, and drags remain available. EEG clicks wait for a full clean 1-second window and eyes-open rest. Escape stops both controls.`
-      : armed ? `${cameraMouse ? 'Camera mouse + EEG clicks armed: point briefly, then move your hand to aim. Finger clicks and drags take priority.' : 'EEG mouse clicks armed: aim with your usual mouse or touchpad.'} One recognized double blink sends one left click at the current cursor, even without a visible hand. Escape stops controls from any app.`
+      : armed ? `${cameraMouse ? 'Camera mouse + EEG clicks armed: point briefly, then move your hand to aim. Hold four fingers still, then sweep left or right to switch desktops. Finger clicks, drags, and desktop swipes take priority over EEG.' : 'EEG mouse clicks armed: aim with your usual mouse or touchpad.'} One recognized double blink sends one left click at the current cursor, even without a visible hand. Escape stops controls from any app.`
+      : validationBlock ? `${validationBlock} Desktop controls are disarmed.`
       : 'Prediction only. Desktop controls are disarmed. A validated CNN and a separate explicit arm are required.');
     const readiness = decoder.trained ? describeCnnReadiness(control, decoder, control.prediction, eligible) : '';
-    if (armed && !paused) put('control-status', `${el['control-status'].textContent} ${readiness}`);
+    if (armed) put('control-status', `${el['control-status'].textContent} ${readiness}`);
     if (!armed && control.armed === false && text(control.last_disarm_reason))
       put('control-status', `${el['control-status'].textContent}\nLast disarm: ${text(control.last_disarm_reason)}`);
     const prediction = control.prediction;
@@ -336,19 +357,17 @@ function createMultimodalPanel({ document, isConnected, isCameraRunning = () => 
     put('eeg-gates', `${eligible ? 'Validation gates passed' : 'Arming locked until CNN validation passes'}: ${text(control.reason, text(evaluation.reason, 'Collect and validate the frozen CNN.'))}\nRequired: ${requirements.join(' · ')}`);
   }
   function describeCnnReadiness(control, decoder, prediction, eligible) {
+    const validationBlock = validationFailure(decoder);
+    if (!eligible && validationBlock) return validationBlock;
     if (!eegFresh()) return 'CNN paused: waiting for fresh EEG.';
     if (!eligible) return 'CNN clicks locked: the frozen model must pass separate validation.';
-    if (control.signal_quality_paused === true) {
-      return `EEG clicks paused: ${text(control.signal_quality_reason,
-        text(prediction?.reason, 'Waiting for a full clean EEG window and eyes-open rest.'))}`;
-    }
     const reason = text(prediction?.reason, text(decoder.reason, text(control.eeg_click_reason, text(control.reason))));
     if (prediction?.valid !== true) return `CNN paused. ${reason || 'Waiting for a usable EEG window.'}`;
     const remaining = Number.isFinite(prediction?.suppressed_evidence_remaining_seconds)
       ? prediction.suppressed_evidence_remaining_seconds : decoder.suppressed_evidence_remaining_seconds;
     if (Number.isFinite(remaining) && remaining > 0) {
       // This is remaining EEG evidence, not a wall-clock countdown or permission to click.
-      return `CNN recovery: ${seconds(remaining)} of newer EEG still needed after finger input. ${reason}`;
+      return `CNN recovery: ${seconds(remaining)} of newer EEG still needed after hand input. ${reason}`;
     }
     const readyForBlink = prediction?.ready_for_blink !== false && decoder.ready_for_blink !== false
       && (prediction?.ready_for_blink === true || decoder.ready_for_blink === true);

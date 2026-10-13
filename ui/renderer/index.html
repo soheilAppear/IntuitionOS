@@ -197,7 +197,7 @@
           <button type="button" id="multimodal-start" disabled>Start EEG + camera</button>
           <button type="button" id="multimodal-stop" disabled title="Stop all controls; global Escape is active while armed">Stop &amp; disarm (Esc)</button>
           <!-- Camera changes retain the EEG session and CNN, but require a new explicit arm. -->
-          <label title="Use the same Hand controls tracker, model, and settings; keep the EEG session and CNN."><input type="checkbox" id="multimodal-eeg-camera" disabled> Camera mouse</label>
+          <label title="Use the same Hand controls tracker, model, and settings for camera aiming and left/right desktop swipes; keep the EEG session and CNN."><input type="checkbox" id="multimodal-eeg-camera" disabled> Camera mouse</label>
           <label><input type="checkbox" id="multimodal-eeg-arm" disabled> <span id="multimodal-eeg-arm-label">Arm camera mouse + EEG clicks</span></label>
         </div>
         <div id="multimodal-control-status" class="multimodal-note" role="status" aria-live="polite">Prediction only. Desktop controls are disarmed.</div>
@@ -233,7 +233,8 @@
           <div id="multimodal-eeg-errors" class="multimodal-error" role="alert" hidden></div>
           <div id="multimodal-eeg-evaluation" class="multimodal-note"></div>
           <div id="multimodal-eeg-gates" class="multimodal-note"></div>
-          <p class="multimodal-note">After validation passes, explicitly arm. Wait for a fresh one-second EEG window. With Camera mouse enabled, point briefly to engage aiming; pinch/release clicks and pinch-hold drags remain active and take priority. Blinks click at the current cursor even without a visible hand. After a click, keep your eyes open until the detector is ready again. After actual finger input ends, EEG clicks need a full second of newer signal and recognized rest; ordinary aiming does not start that recovery. Changing Camera mouse disarms. Escape stops all controls.</p>
+          <p class="multimodal-note">After validation passes, explicitly arm. Wait for a fresh one-second EEG window. With Camera mouse enabled, point briefly to engage aiming; pinch/release clicks and pinch-hold drags remain active and take priority. Blinks click at the current cursor even without a visible hand. After a click, keep your eyes open until the detector is ready again. After finger input or desktop navigation ends, EEG clicks need a full second of newer signal and recognized rest; ordinary aiming does not start that recovery. Changing Camera mouse disarms. Escape stops all controls.</p>
+          <p class="multimodal-note">Desktop swipes: raise index, middle, ring, and pinky with your thumb relaxed, hold still for 0.3 seconds, then sweep left for the next desktop or right for the previous one. Hold briefly at 100% to finish; a fist or pinch cancels before completion. Lower your hand or hold a fist for 0.2 seconds before another swipe, then point again to aim. Use the Hand controls settings for travel and desktop movement. This combined mode supports horizontal swipes; at least two Windows desktops are needed.</p>
           <p class="multimodal-note">Validation tests held-out one-second trials, including normal reading, single blinks, and gentle movement. It does not measure physical blink-to-click latency or a continuous false-click rate. Scores are uncalibrated model scores, not probabilities. Failed validation keeps arming locked, including after loading.</p>
         </div>
       </div>

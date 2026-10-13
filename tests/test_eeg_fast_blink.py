@@ -109,6 +109,29 @@ def test_preprocessing_is_one_second_and_removes_dc_and_linear_drift():
         preprocess_waveform(np.zeros((1250, 4)))
 
 
+def test_preprocessing_preserves_shape_above_old_limit_with_per_channel_gain_and_drift():
+    values = waveform(1, True, dc=False, ramp=False)
+    # All channels exceed the old 10 mV cutoff. Positive channel gain, offset,
+    # and linear drift still describe the same normalized waveform.
+    enlarged = values * np.array([100, 200, 300, 400])
+    enlarged += np.array([.03, -.02, .05, -.04])
+    enlarged += np.linspace(-1, 1, 250)[:, None] * np.array([.02, -.03, .04, -.01])
+    assert np.all(np.ptp(enlarged, axis=0) > .010)
+    np.testing.assert_allclose(preprocess_waveform(enlarged), preprocess_waveform(values), atol=2e-5)
+
+
+@pytest.mark.parametrize("label", ["rest", "select"])
+def test_trial_accepts_large_waveforms_using_unchanged_normalization(label):
+    values = waveform(1, label == "select", dc=False, ramp=False)
+    values *= 2000  # Include a no-command example above the removed cutoff too.
+    assert np.all(np.ptp(values, axis=0) > .010)
+    decoder = FastCnnBlinkDecoder()
+    result = decoder.add_trial(label, packet_signal(values), trial_id="large", start=100, end=101)
+    assert result["ok"], result.get("error")
+    assert result["train_counts"][label] == 1
+    np.testing.assert_array_equal(decoder._training[0]["waveform"], preprocess_waveform(values))
+
+
 def test_torch_numpy_endpoint_parity_and_small_architecture():
     torch = pytest.importorskip("torch")
     torch.manual_seed(93)
@@ -134,6 +157,21 @@ def test_observed_development_trials_validate_without_changing_frozen_weights(tr
     assert status["prediction_interval_seconds"] == .04
     assert status["validation_scope"] == "held_out_one_second_trials"
     assert "not measured physical blink-completion latency" in status["disclaimer"]
+
+
+@pytest.mark.parametrize("label", ["rest", "select"])
+def test_large_heldout_trial_preserves_frozen_model_and_classification(trained_decoder, label):
+    reference, enlarged = clone(trained_decoder), clone(trained_decoder)
+    values = waveform(17, label == "select", kind="single", dc=False, ramp=False)
+    before = enlarged.export_state()["model"]
+    for decoder, gain in ((reference, 1), (enlarged, 200)):
+        supplied = packet_signal(values * gain, start=134, counter=8500)
+        result = decoder.add_trial(label, supplied, phase="validate", trial_id="new-heldout", start=134, end=135)
+        assert result["ok"], result.get("error")
+    assert np.all(np.ptp(values * 200, axis=0) > .010)
+    assert enlarged._validation[0]["predicted"] == reference._validation[0]["predicted"]
+    assert enlarged._validation[0]["score"] == pytest.approx(reference._validation[0]["score"], abs=2e-5)
+    assert enlarged.export_state()["model"] == before
 
 
 def test_independent_final_trials_reject_insufficient_generalization_without_retuning(trained_decoder):
@@ -225,7 +263,8 @@ def test_trial_rejects_incomplete_old_duration_reused_packets_and_bad_quality():
     short["samples"].pop()
     assert not decoder.add_trial("rest", short, trial_id=1, start=102, end=103)["ok"]
     bad = signal(1)
-    bad["samples"][100]["samples"][0] += .02
+    for row in bad["samples"][100:105]:
+        row["samples"][0] = .1  # A clipped plateau remains invalid regardless of amplitude.
     assert not decoder.add_trial("rest", bad, trial_id=1, start=102, end=103)["ok"]
 
 
@@ -290,7 +329,8 @@ def test_stream_faults_clear_history_without_replacing_frozen_model(trained_deco
         for row in snapshot["samples"]:
             row["samples"][0] = 0
     elif fault == "clip":
-        snapshot["samples"][-1]["samples"][0] += .02
+        for row in snapshot["samples"][-5:]:
+            row["samples"][0] = .02
     else:
         snapshot["samples"] *= 2
     result = decoder.update(snapshot, now=now)
@@ -306,43 +346,46 @@ def test_counter_wrap_and_repeated_snapshot_never_replay_events(trained_decoder)
     assert repeated["valid"] and not repeated["event_id"]
 
 
-def test_amplitude_pause_requires_fresh_context_and_rest_before_a_new_event(trained_decoder, monkeypatch):
+def test_large_transient_reaches_cnn_without_pausing_or_resetting_context(trained_decoder, monkeypatch):
     module = importlib.import_module("core.eeg_fast_blink")
     decoder, stream = clone(trained_decoder), continuous()
     stream["samples"][655]["samples"][0] += .02
-    phase = {"score": .1}
-    monkeypatch.setattr(module, "_scores", lambda *_: np.array([phase["score"]]))
+    # The classifier decides whether the normalized transient is a command.
+    # Controlled rest scores isolate gate behavior from classifier accuracy.
+    monkeypatch.setattr(module, "_scores", lambda *_: np.array([.1]))
     before = decoder.export_state()
-    run_stream(decoder, stream, end=630)
-    phase["score"] = .99
-    assert not any(p["event_id"] for p in run_stream(decoder, stream, start=640, end=650))
-    assert decoder._select_count == 2  # An unfinished command must be discarded.
-    fault = run_stream(decoder, stream, start=660, end=660)[0]
-    assert (fault["fault_code"], fault["fault_category"], fault["recoverable"]) == (
-        "signal_amplitude", "signal_quality", True)
-    assert not fault["valid"] and not fault["ready"] and not fault["event_id"]
-    assert fault["fault_details"]["channel"] == "O1"
-    assert fault["fault_details"]["peak_to_peak_v"] > fault["fault_details"]["limit_v"] == .010
-    assert decoder._counter is None and decoder._paused_transport_boundary[0] == 659
-    assert decoder._select_count == 0 and decoder.status()["fresh_context_seconds"] == 0
-    # The offending packet remains in the newest second through stop=900.
-    pauses = run_stream(decoder, stream, start=670, end=900)
-    assert all(p["recoverable"] and not p["event_id"] for p in pauses)
-    clean = run_stream(decoder, stream, start=910, end=910)[0]
-    assert clean["valid"] and not clean["ready"] and not clean["recoverable"]
-    assert decoder.status()["fresh_context_seconds"] == 0
-    warmup = run_stream(decoder, stream, start=920, end=1150)
-    assert all(p["valid"] and not p["ready"] and not p["event_id"] for p in warmup)
-    high = run_stream(decoder, stream, start=1160, end=1200)
-    assert all(p["ready"] and not p["event_id"] and not p["ready_for_blink"] for p in high)
-    phase["score"] = .1
-    assert run_stream(decoder, stream, start=1210, end=1230)[-1]["ready_for_blink"]
-    phase["score"] = .99
-    assert sum(bool(p["event_id"]) for p in run_stream(decoder, stream, start=1240, end=1260)) == 1
+    run_stream(decoder, stream, end=650)
+    results = run_stream(decoder, stream, start=660, end=950)
+    assert all(p["valid"] and p["ready_for_blink"] and p["fault_code"] is None for p in results)
+    assert not any(p["event_id"] for p in results)
+    assert decoder._counter == 949 and decoder.status()["fresh_context_seconds"] == 1
     assert decoder.export_state() == before
 
 
-@pytest.mark.parametrize("already_paused", [False, True])
+def test_actual_cnn_retains_scores_and_events_under_large_positive_channel_gains(trained_decoder):
+    reference = continuous(centers=(3, 3.3))
+    for row in reference["samples"]:
+        # Keep every quiet window above the normalization floor so this test
+        # measures gain invariance, not its intentional tiny-signal exception.
+        row["samples"] = [value * 5 for value in row["samples"]]
+    enlarged = copy.deepcopy(reference)
+    for row in enlarged["samples"]:
+        row["samples"] = [value * gain + offset for value, gain, offset in
+                          zip(row["samples"], [100, 200, 300, 400], [.03, -.02, .05, -.04])]
+    assert np.all(np.ptp([row["samples"] for row in enlarged["samples"][700:950]], axis=0) > .010)
+    before = trained_decoder.export_state()
+    decoder = clone(trained_decoder)
+    expected = run_stream(clone(trained_decoder), reference)
+    actual = run_stream(decoder, enlarged)
+    assert all(p["valid"] and p["fault_code"] is None for p in actual)
+    np.testing.assert_allclose([p["confidence"] for p in actual], [p["confidence"] for p in expected], atol=2e-5)
+    expected_events = [p["event_id"] for p in expected if p["event_id"]]
+    assert len(expected_events) == 1
+    assert [p["event_id"] for p in actual if p["event_id"]] == expected_events
+    assert decoder.export_state() == before
+
+
+@pytest.mark.parametrize("previous_large_buffer", [False, True])
 @pytest.mark.parametrize("fault,code", [
     ("stale", "buffer_stale"), ("gap", "packet_discontinuity"),
     ("boundary_gap", "packet_discontinuity"), ("backwards", "counter_backwards"),
@@ -352,15 +395,15 @@ def test_amplitude_pause_requires_fresh_context_and_rest_before_a_new_event(trai
     ("identical", "signal_identical"), ("plateau", "signal_plateau"),
     ("same_channel_plateau", "signal_plateau"),
 ])
-def test_hard_faults_dominate_amplitude_in_every_channel_and_between_paused_buffers(
-        trained_decoder, already_paused, fault, code):
+def test_hard_faults_still_reject_large_waveforms_in_every_channel_and_between_buffers(
+        trained_decoder, previous_large_buffer, fault, code):
     decoder, stream = clone(trained_decoder), continuous()
     run_stream(decoder, stream, end=650)
     stop = 660
-    if already_paused:
+    if previous_large_buffer:
         first = {**stream, "samples": copy.deepcopy(stream["samples"][:660])}
         first["samples"][-1]["samples"][0] += .02
-        assert decoder.update(first, now=first["samples"][-1]["host_received_monotonic"] + .01)["recoverable"]
+        assert decoder.update(first, now=first["samples"][-1]["host_received_monotonic"] + .01)["valid"]
         stop = 670
     snapshot = {**stream, "samples": copy.deepcopy(stream["samples"][:stop])}
     snapshot["samples"][-1]["samples"][0] += .02
@@ -394,11 +437,11 @@ def test_hard_faults_dominate_amplitude_in_every_channel_and_between_paused_buff
     result = decoder.update(snapshot, now=now)
     assert result["fault_code"] == code
     assert not result["recoverable"] and not result["valid"] and not result["event_id"]
-    assert decoder._counter is None and decoder._paused_transport_boundary is None
+    assert decoder._counter is None and decoder.status()["fresh_context_seconds"] == 0
     assert decoder.status()["trained"]
 
 
-def test_large_absolute_dc_does_not_trigger_amplitude_pause(trained_decoder):
+def test_large_absolute_dc_remains_valid(trained_decoder):
     decoder, stream = clone(trained_decoder), continuous()
     for row in stream["samples"]:
         row["samples"] = [v + .03 for v in row["samples"]]
@@ -406,14 +449,14 @@ def test_large_absolute_dc_does_not_trigger_amplitude_pause(trained_decoder):
     assert all(p["valid"] and not p["recoverable"] and p["fault_code"] is None for p in results)
 
 
-def test_unknown_fault_remains_hard_and_explicit_reset_clears_pause_boundary(trained_decoder, monkeypatch):
+def test_unknown_fault_remains_hard_after_large_signal_and_explicit_reset(trained_decoder, monkeypatch):
     module = importlib.import_module("core.eeg_fast_blink")
     decoder, stream = clone(trained_decoder), continuous()
     snapshot = {**stream, "samples": copy.deepcopy(stream["samples"][:250])}
     snapshot["samples"][-1]["samples"][0] += .02
-    assert decoder.update(snapshot, now=101.01)["recoverable"]
+    assert decoder.update(snapshot, now=101.01)["valid"]
     decoder.reset_stream()
-    assert decoder._paused_transport_boundary is None
+    assert decoder._counter is None and decoder.status()["fresh_context_seconds"] == 0
     def unexpected(*_):
         raise ValueError("unclassified input failure")
     monkeypatch.setattr(module, "_quality", unexpected)
