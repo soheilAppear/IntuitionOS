@@ -70,6 +70,37 @@ def test_the_server_starts_and_stops_cleanly(app_dir):
         assert state.get(key) is not None, f"startup did not provide {key!r}"
 
 
+@pytest.mark.parametrize("ui", ["hud", "terminal"])
+@pytest.mark.parametrize("custom", [False, True])
+def test_ollama_model_and_context_settings_reach_both_interfaces(app_dir, ui, custom):
+    from core.llm import DEFAULT_MODEL, DEFAULT_NUM_CTX
+    from interface import server, terminal
+
+    path = app_dir / "config" / "config.yaml"
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+    cfg.pop("model", None)
+    cfg.pop("num_ctx", None)
+    if custom:
+        cfg.update(model="test-local-model", num_ctx=4096)
+    path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+    if ui == "hud":
+        async def boot():
+            async with server.lifespan(server.app):
+                return server._state["brain"].llm
+        llm = asyncio.run(boot())
+    else:
+        _, brain, mem, sched, *_ = terminal.bootstrap()
+        try:
+            llm = brain.llm
+        finally:
+            sched.stop()
+            mem.close()
+
+    assert llm.model == ("test-local-model" if custom else DEFAULT_MODEL)
+    assert llm.num_ctx == (4096 if custom else DEFAULT_NUM_CTX)
+
+
 @pytest.mark.parametrize("abort", [False, True])
 def test_brainbit_stays_idle_at_startup_and_closes_on_lifespan_exit(app_dir, monkeypatch, abort):
     from interface import server
@@ -93,7 +124,7 @@ def test_brainbit_stays_idle_at_startup_and_closes_on_lifespan_exit(app_dir, mon
                 assert driver.status()["state"] == "disconnected"
                 assert driver._worker is None
                 assert server._state["multimodal"].status()["state"] == "stopped"
-                assert server._state["multimodal"].status()["armed"] is False
+                assert server._state["multimodal"].status()["eeg_control"]["armed"] is False
                 assert not server._state["preview_camera"].is_running()
                 if abort:
                     raise RuntimeError("test lifespan cancellation")

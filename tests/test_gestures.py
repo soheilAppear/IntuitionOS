@@ -7,6 +7,7 @@ and whether a camera's opinion can reach something irreversible.
 """
 
 import math
+import threading
 
 import pytest
 import sys
@@ -15,6 +16,115 @@ from types import SimpleNamespace
 from core import gestures as g
 from core.capabilities import capabilities, gate
 from core.hand_tracking import TrackerStartupError
+
+
+def test_camera_resource_tracks_open_handle_before_any_inference_and_confirmed_release(monkeypatch):
+    entered, finish = threading.Event(), threading.Event()
+    recognizer = g.GestureRecognizer()
+    def read():
+        entered.set()
+        assert finish.wait(2)
+        return False, None
+    camera = SimpleNamespace(isOpened=lambda: True, set=lambda *_: None, read=read, release=lambda: None)
+    _install_camera_worker_fakes(monkeypatch, camera, lambda _: None)
+    assert recognizer.status()["camera_resource"]["release_confirmed"] is True
+    assert recognizer.start()["ok"]
+    try:
+        assert entered.wait(1)
+        status = recognizer.status()
+        assert not status["running"]  # No frame/hand is required for camera privacy.
+        assert status["camera_resource"]["state"] == "open"
+        assert status["camera_resource"]["in_use"] is True
+        detached = recognizer.preview()["camera_resource"]
+        detached["in_use"] = False
+        assert recognizer.tracking_snapshot()["camera_resource"]["in_use"] is True
+    finally:
+        recognizer._stop.set()
+        finish.set()
+        recognizer._thread.join(2)
+    assert recognizer.status()["camera_resource"] == {
+        "state": "released", "in_use": False, "release_confirmed": True, "cleanup_pending": False, "error": None}
+
+
+def test_camera_privacy_stays_in_use_during_blocked_native_release(monkeypatch):
+    releasing, finish = threading.Event(), threading.Event()
+    recognizer = g.GestureRecognizer()
+    def release():
+        releasing.set()
+        assert finish.wait(2)
+    camera = SimpleNamespace(isOpened=lambda: True, set=lambda *_: None,
+                             read=lambda: (True, object()), release=release)
+    def process(_):
+        raise RuntimeError("inference failed")
+    _install_camera_worker_fakes(monkeypatch, camera, process)
+    assert recognizer.start()["ok"]
+    try:
+        assert releasing.wait(1)
+        resource = recognizer.status()["camera_resource"]
+        assert resource["state"] == "releasing" and resource["in_use"] is True
+        assert not resource["release_confirmed"]
+        assert not recognizer.preview()["running"]
+    finally:
+        finish.set()
+        recognizer._thread.join(2)
+    assert recognizer.status()["state"] == "error"
+    assert recognizer.status()["camera_resource"]["release_confirmed"] is True
+
+
+def test_failed_camera_release_retains_native_object_and_blocks_restart_until_stop_retry(monkeypatch):
+    fail, releases = [True], []
+    recognizer = g.GestureRecognizer()
+    def release():
+        releases.append(True)
+        if fail[0]:
+            raise RuntimeError("native release refused")
+    camera = SimpleNamespace(isOpened=lambda: True, set=lambda *_: None,
+                             read=lambda: (True, object()), release=release)
+    def process(_):
+        raise RuntimeError("inference stopped")
+    _install_camera_worker_fakes(monkeypatch, camera, process)
+    recognizer._run()
+    resource = recognizer.status()["camera_resource"]
+    assert resource["state"] == "release_failed" and resource["in_use"] is True
+    assert resource["cleanup_pending"] and not resource["release_confirmed"]
+    assert recognizer._failed_camera is camera
+    assert "cleanup" in recognizer.start()["error"]
+    assert "cleanup" in recognizer.configure(model_complexity=0)["error"]
+    result = recognizer.stop()
+    assert result["camera_cleanup_pending"] and result["camera_released"] is False
+    fail[0] = False
+    assert recognizer.stop()["ok"]
+    assert recognizer._failed_camera is None
+    assert len(releases) == 3
+    assert recognizer.status()["camera_resource"]["release_confirmed"] is True
+
+
+def test_camera_opening_and_failed_fallback_release_never_claim_an_open_or_released_device(monkeypatch):
+    recognizer = g.GestureRecognizer()
+    opened, releases = [], []
+    def release():
+        releases.append(True)
+        raise RuntimeError("failed unopened-handle cleanup")
+    camera = SimpleNamespace(isOpened=lambda: False, release=release)
+    _install_camera_worker_fakes(monkeypatch, camera, lambda _: None)
+    def create(*_):
+        opened.append(recognizer.status()["camera_resource"])
+        return camera
+    sys.modules["cv2"].VideoCapture = create
+    recognizer._run()
+    assert len(opened) == 1  # A failed first release must not open a fallback owner.
+    assert opened[0]["state"] == "opening" and opened[0]["in_use"] is None
+    resource = recognizer.status()["camera_resource"]
+    assert resource["state"] == "release_failed" and resource["in_use"] is None
+    assert not resource["release_confirmed"] and resource["cleanup_pending"]
+
+
+def test_tracker_error_before_native_camera_open_leaves_privacy_off(monkeypatch):
+    recognizer = g.GestureRecognizer()
+    monkeypatch.setitem(sys.modules, "mediapipe", SimpleNamespace(solutions=None))
+    recognizer._run()
+    assert recognizer.status()["camera_resource"]["release_confirmed"] is True
+    assert recognizer.status()["camera_resource"]["in_use"] is False
 
 
 # ── Building hands ──────────────────────────────────────────────────────────
@@ -2167,7 +2277,7 @@ def test_gpu_tracker_keeps_landmarks_aligned_with_mirrored_preview(monkeypatch, 
     handled, previews = [], []
     monkeypatch.setattr(recognizer, "_handle", lambda points, now: handled.append(points))
 
-    def publish(frame, points, *_):
+    def publish(frame, points, *_, **_kwargs):
         previews.append((frame, points))
         recognizer._stop.set()
 
@@ -2192,7 +2302,7 @@ def test_invalid_gpu_landmarks_become_hand_loss(monkeypatch, backend, output):
     lifecycle, _ = _gpu_tracker_fixture(monkeypatch, recognizer, process=lambda _: output)
     previews = []
 
-    def publish(frame, points, *_):
+    def publish(frame, points, *_, **_kwargs):
         previews.append(points)
         recognizer._stop.set()
 
@@ -2410,3 +2520,299 @@ def test_failed_constructor_retains_partial_tracker_until_cleanup_succeeds(
         assert len(attempts) == 3
     assert recognizer._failed_tracker is None
     assert recognizer.status()["tracker_cleanup_pending"] is False
+
+
+def test_camera_reader_keeps_only_newest_frame_while_inference_is_busy():
+    allow_more, third_published, finish_read = (threading.Event() for _ in range(3))
+    stop = threading.Event()
+    reads = []
+
+    def read():
+        number = len(reads) + 1
+        reads.append(number)
+        if number == 2:
+            assert allow_more.wait(2)
+        if number == 4:
+            third_published.set()
+            assert finish_read.wait(2)
+        return True, number
+
+    reader = g._LatestCameraFrame(SimpleNamespace(read=read), stop, lambda: None)
+    reader.start()
+    try:
+        first = reader.take()
+        assert first.frame == 1
+        allow_more.set()  # Simulate inference using frame 1 while capture continues.
+        assert third_published.wait(2)
+        newest = reader.take()
+        assert newest.frame == 3  # Frame 2 never becomes an input backlog.
+        assert newest.captured_at >= first.captured_at
+        assert newest.read_seconds >= 0
+        assert reader.dropped_frames == 1
+        assert reader.valid(first)  # A newer frame alone does not invalidate completed inference.
+    finally:
+        stop.set()
+        allow_more.set()
+        finish_read.set()
+        reader.close()
+    assert reader.take() is None
+
+
+def _install_camera_worker_fakes(monkeypatch, camera, process):
+    monkeypatch.setitem(sys.modules, "cv2", SimpleNamespace(
+        CAP_DSHOW=1, CAP_PROP_FRAME_WIDTH=2, CAP_PROP_FRAME_HEIGHT=3,
+        COLOR_BGR2RGB=4, VideoCapture=lambda *_: camera,
+        flip=lambda frame, _axis: frame, cvtColor=lambda frame, _mode: frame))
+    monkeypatch.setitem(sys.modules, "mediapipe", SimpleNamespace(
+        solutions=SimpleNamespace(hands=SimpleNamespace(
+            Hands=lambda **_: SimpleNamespace(process=process, close=lambda: None)))))
+
+
+def test_camera_failure_during_inference_discards_late_hand_and_preview(monkeypatch):
+    inference_started, failed, next_take, finish_read = (threading.Event() for _ in range(4))
+    recognizer = g.GestureRecognizer()
+    handled, published, reads = [], [], []
+    original_failure = recognizer._camera_read_failed
+
+    class ObservedReader(g._LatestCameraFrame):
+        takes = 0
+
+        def take(self):
+            self.takes += 1
+            if self.takes == 2:
+                next_take.set()
+            return super().take()
+
+    def read():
+        reads.append(True)
+        if len(reads) == 1:
+            return True, object()
+        if len(reads) == 2:
+            assert inference_started.wait(2)
+            return False, None
+        assert finish_read.wait(2)
+        return False, None
+
+    def on_failure():
+        original_failure()
+        failed.set()
+
+    def process(_frame):
+        inference_started.set()
+        assert failed.wait(2)
+        points = [SimpleNamespace(x=x, y=y, z=z) for x, y, z in _hand()]
+        return SimpleNamespace(multi_hand_landmarks=[SimpleNamespace(landmark=points)])
+
+    camera = SimpleNamespace(isOpened=lambda: True, set=lambda *_: None,
+                             read=read, release=lambda: None)
+    _install_camera_worker_fakes(monkeypatch, camera, process)
+    monkeypatch.setattr(g, "_LatestCameraFrame", ObservedReader)
+    monkeypatch.setattr(recognizer, "_camera_read_failed", on_failure)
+    monkeypatch.setattr(recognizer, "_handle", lambda *_: handled.append(True))
+    monkeypatch.setattr(recognizer, "_publish_preview", lambda *_, **__: published.append(True))
+    worker = threading.Thread(target=recognizer._run)
+    worker.start()
+    try:
+        assert next_take.wait(2)
+        assert handled == []
+        assert published == []
+        assert recognizer._diagnostic["landmarks"] == []
+        assert recognizer._preview_snapshot is None
+    finally:
+        recognizer._stop.set()
+        finish_read.set()
+        worker.join(timeout=3)
+    assert not worker.is_alive()
+
+
+def test_blocked_camera_read_keeps_ownership_until_stop_can_release(monkeypatch):
+    read_started, finish_read = threading.Event(), threading.Event()
+    lifecycle = []
+
+    def read():
+        read_started.set()
+        assert finish_read.wait(5)
+        lifecycle.append("read finished")
+        return True, object()
+
+    camera = SimpleNamespace(isOpened=lambda: True, set=lambda *_: None,
+                             read=read, release=lambda: lifecycle.append("released"))
+    _install_camera_worker_fakes(monkeypatch, camera, lambda _: None)
+    recognizer = g.GestureRecognizer()
+    assert recognizer.start()["ok"]
+    try:
+        assert read_started.wait(2)
+        assert recognizer.stop()["stopping"]
+        assert lifecycle == []
+        assert recognizer.status()["state"] == "stopping"
+        assert "error" in recognizer.start()
+        assert not recognizer.tracking_snapshot()["tracked"]
+    finally:
+        finish_read.set()
+        recognizer._thread.join(timeout=3)
+    assert not recognizer._thread.is_alive()
+    assert lifecycle == ["read finished", "released"]
+    assert recognizer.stop() == {"ok": True}
+
+
+def test_old_inference_cannot_move_or_click_before_new_capture(monkeypatch):
+    recognizer = g.GestureRecognizer(input_mode="mouse", mouse_factory=_FakeMouseController)
+    clock = [10.0]
+    frames = iter([g._CapturedFrame(object(), 10.0, 0.01, 0, 1000.0), None])
+
+    class Reader:
+        dropped_frames = 0
+        def __init__(self, *_):
+            pass
+        def start(self):
+            pass
+        def take(self):
+            return next(frames)
+        def valid(self, _):
+            return True
+        def close(self):
+            pass
+
+    def process(_):
+        clock[0] = 10.501
+        points = [SimpleNamespace(x=x, y=y, z=z) for x, y, z in _hand()]
+        return SimpleNamespace(multi_hand_landmarks=[SimpleNamespace(landmark=points)])
+
+    camera = SimpleNamespace(isOpened=lambda: True, set=lambda *_: None, release=lambda: None)
+    _install_camera_worker_fakes(monkeypatch, camera, process)
+    monkeypatch.setattr(g, "_LatestCameraFrame", Reader)
+    monkeypatch.setattr(g.time, "monotonic", lambda: clock[0])
+    handled, resets = [], []
+    monkeypatch.setattr(recognizer, "_handle", lambda *_: handled.append(True))
+    monkeypatch.setattr(recognizer, "_reset_controls", lambda _, reason: resets.append(reason))
+    recognizer._run()
+    assert handled == []
+    assert resets == ["stale_frame", "camera_stopped"]
+    assert recognizer._preview_snapshot is None
+
+
+def test_camera_failure_while_encoding_cannot_restore_old_pixels_or_landmarks(monkeypatch):
+    recognizer, frame, cv2, clock, _encodes, _resizes = _preview_fixture(monkeypatch)
+    recognizer.preview()
+    valid = [True]
+    original_encode = cv2.imencode
+
+    def encode(*args):
+        valid[0] = False
+        recognizer._camera_read_failed()
+        return original_encode(*args)
+
+    cv2.imencode = encode
+    recognizer._publish_preview(frame, _hand(), clock[0], cv2, frame_valid=lambda: valid[0])
+    assert recognizer._preview_snapshot is None
+    assert recognizer.tracking_snapshot()["landmarks"] == []
+    assert recognizer._diagnostic["last_reason"] == "camera_read_failed"
+
+
+def test_stage_timing_stays_aligned_with_landmarks_and_is_copied(monkeypatch):
+    recognizer, frame, cv2, clock, _encodes, _resizes = _preview_fixture(monkeypatch)
+    recognizer.preview()
+    first = {"capture_read_ms": 30.0, "frame_wait_ms": 0.3, "inference_ms": 6.0,
+             "frame_age_ms": 6.3, "dropped_frames": 2}
+    recognizer._publish_preview(frame, _hand(), clock[0], cv2, timing=first)
+    clock[0] += 0.05  # A second inference, before the next eight-FPS JPEG.
+    latest = {**first, "inference_ms": 8.0, "frame_age_ms": 8.3, "dropped_frames": 3}
+    recognizer._publish_preview(frame, _hand(), clock[0], cv2, timing=latest)
+    assert recognizer.preview()["timing"] == first
+    assert recognizer.tracking_snapshot()["timing"] == latest
+    recognizer.preview()["timing"]["dropped_frames"] = -1
+    recognizer.tracking_snapshot()["timing"]["inference_ms"] = -1
+    latest["inference_ms"] = -2
+    assert recognizer.preview()["timing"]["dropped_frames"] == 2
+    assert recognizer.tracking_snapshot()["timing"]["inference_ms"] == 8.0
+
+
+@pytest.mark.parametrize("fps_result", [True, False, "exception"])
+def test_camera_requests_30_fps_without_requiring_driver_support(monkeypatch, fps_result):
+    settings, processed, released = [], [], []
+    recognizer = g.GestureRecognizer(model_complexity=1)
+
+    def configure(prop, value):
+        settings.append((prop, value))
+        if prop == 5:
+            if fps_result == "exception":
+                raise RuntimeError("FPS setting is unsupported")
+            return fps_result
+        return True
+
+    def process(_):
+        processed.append(True)
+        return SimpleNamespace(multi_hand_landmarks=None)
+
+    camera = SimpleNamespace(isOpened=lambda: True, set=configure,
+                             read=lambda: (True, object()), release=lambda: released.append(True))
+    _install_camera_worker_fakes(monkeypatch, camera, process)
+    sys.modules["cv2"].CAP_PROP_FPS = 5
+    recognizer.on_status = lambda status: recognizer._stop.set() if status["running"] else None
+    recognizer._run()
+    assert settings == [(2, 640), (3, 480), (5, 30)]
+    assert processed == [True]
+    assert released == [True]
+    assert recognizer.status()["state"] == "off"
+    assert recognizer.model_name == "MediaPipe Hands full"
+
+
+def test_high_resolution_stage_durations_preserve_monotonic_control_timestamps(monkeypatch):
+    recognizer = g.GestureRecognizer()
+    frames = iter([g._CapturedFrame(object(), 10.0, 0.0025, 0, 1000.0), None])
+
+    class Reader:
+        dropped_frames = 2
+        def __init__(self, *_):
+            pass
+        def start(self):
+            pass
+        def take(self):
+            return next(frames)
+        def valid(self, _):
+            return True
+        def close(self):
+            pass
+
+    camera = SimpleNamespace(isOpened=lambda: True, set=lambda *_: None, release=lambda: None)
+    _install_camera_worker_fakes(monkeypatch, camera, lambda _: SimpleNamespace(multi_hand_landmarks=None))
+    monkeypatch.setattr(g, "_LatestCameraFrame", Reader)
+    monkeypatch.setattr(g.time, "monotonic", lambda: 10.0)
+    precise_times = iter([1000.003, 1000.008])
+    monkeypatch.setattr(g.time, "perf_counter", lambda: next(precise_times))
+    handled, published = [], []
+    monkeypatch.setattr(recognizer, "_handle", lambda points, now: handled.append(now))
+    monkeypatch.setattr(recognizer, "_publish_preview",
+                        lambda frame, points, at, cv2, **kw: published.append((at, kw["timing"])))
+    recognizer._run()
+    assert handled == [10.0]
+    assert published == [(10.0, {"capture_read_ms": 2.5, "frame_wait_ms": 3.0,
+                                "inference_ms": 5.0, "frame_age_ms": 8.0, "dropped_frames": 2})]
+
+
+def test_camera_read_duration_uses_precise_clock_without_changing_capture_clock(monkeypatch):
+    stop, next_read, finish_read = (threading.Event() for _ in range(3))
+    calls = []
+
+    def read():
+        calls.append(True)
+        if len(calls) > 1:
+            next_read.set()
+            assert finish_read.wait(2)
+        return True, object()
+
+    precise_times = iter([1000.0, 1000.0025, 1000.003, 1000.004])
+    monkeypatch.setattr(g.time, "perf_counter", lambda: next(precise_times))
+    monkeypatch.setattr(g.time, "monotonic", lambda: 10.0)
+    reader = g._LatestCameraFrame(SimpleNamespace(read=read), stop, lambda: None)
+    reader.start()
+    try:
+        assert next_read.wait(2)
+        frame = reader.take()
+        assert frame.captured_at == 10.0
+        assert frame.captured_perf == 1000.0025
+        assert frame.read_seconds == pytest.approx(0.0025)
+    finally:
+        stop.set()
+        finish_read.set()
+        reader.close()

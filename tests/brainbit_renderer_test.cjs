@@ -46,6 +46,8 @@ function renderer() {
     Date: class extends Date { static now() { return time; } },
     require: name => name === 'electron' ? { ipcRenderer: { on() {}, send() {} } }
       : name === './camera-preview.cjs' ? { readCameraPreview() { throw new Error('Unexpected camera access'); } }
+      : name === './camera-privacy.cjs' ? { createCameraPrivacyIndicator: () => ({ accept() {}, connectionChanged() {}, refresh() {} }) }
+      : name === './hand-overlay.cjs' ? require('../ui/renderer/hand-overlay.cjs')
       : name === './brainbit-http.cjs' ? { requestBrainbit: (action, deviceId) => new Promise((resolve, reject) => {
         requests.push({ action, deviceId, resolve, reject });
       }) } : name === './multimodal-panel.cjs' ? { createMultimodalPanel: () => ({ connectionChanged() {}, acceptStatus() {}, refreshControls() {} }) }

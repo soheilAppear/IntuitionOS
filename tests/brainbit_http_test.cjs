@@ -76,7 +76,7 @@ for (const action of ['discover', 'connect', 'disconnect', 'refresh']) {
     assert.equal(t.options.headers['Content-Type'], 'application/json');
     assert.ok(!Object.keys(t.options.headers).some(name => name.toLowerCase() === 'origin'));
     assert.deepEqual(JSON.parse(t.request.body), action === 'connect' ? { device_id: deviceId } : {});
-    assert.equal(t.timers[0].delay, 30000);
+    assert.equal(t.timers[0].delay, action === 'connect' ? 50000 : 30000);
     t.complete({ state: 'pending' }, 202);
     const result = await t.promise;
     assert.equal(result.ok, true);

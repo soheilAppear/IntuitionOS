@@ -1,6 +1,13 @@
 # Hand tracker selection — October 2026
 
-## Selected model
+## Laptop default
+
+The 8 GB RTX 4070 Laptop configuration selects **MediaPipe Hands Full**
+(`tracker_backend: mediapipe`, `model_complexity: 1`). It is included in the
+project's Python requirements and performs hand inference on the CPU, leaving
+GPU memory available for Ollama. WiLoR and RTMPose require separate setup.
+
+## Optional GPU model
 
 **Full WiLoR with AnyHand fine-tuned weights**, using all 32 transformer layers.
 The app uses the dedicated hand detector, reconstructs 21 joints in 3D, then
@@ -68,9 +75,25 @@ second, and its control loop also waited 125 ms between iterations.
 
 Combined click mode now reads a separate, fresh landmark snapshot on a 30 Hz
 control schedule. Each camera sequence is consumed once. The display keeps its
-image-aligned, eight-FPS preview, and EEG prediction keeps its separate 250 ms
-cadence. Slow or missing inference still pauses controls; this does not invent
-hand positions between camera frames or continue moving after hand loss.
+image-aligned, eight-FPS preview, and the legacy bandpower EEG classifier keeps
+its separate 250 ms cadence. Slow or missing inference still pauses controls;
+this does not invent hand positions between camera frames or continue moving
+after hand loss.
+
+Camera reads now run independently of hand inference and JPEG encoding, with
+only one pending frame. If inference falls behind, the next pass takes the
+newest frame instead of processing a backlog. Frames older than 500 ms cannot
+drive input. This keeps the selected pretrained tracker and camera resolution;
+it does not synthesize motion between observations. Combined blink mode also
+shares one detached EEG snapshot between its display and decoder to reduce
+repeated copying. Camera status exposes capture-read, pending-frame wait, and
+inference timings for diagnosis; those host timings do not measure sensor
+exposure-to-screen latency.
+
+Capture requests 30 FPS after setting 640×480, falling back to the camera's
+working default if the driver rejects that setting. On the current Windows
+webcam, a read-only capture probe measured 19.8 FPS at its default and 29.6 FPS
+after the explicit request, without changing resolution or pixel format.
 
 The detector now uses a **960-pixel inference size**, retaining the trained
 256-pixel reconstruction crop and the same confidence and anatomy checks.
@@ -139,11 +162,54 @@ With bend clicking enabled, straighten the index briefly between clicks to avoid
 triggering both click gestures. The option lasts until the backend restarts. Its
 guide appears only when the backend confirms it is enabled.
 
+Moving the hand still moves the cursor while the fingertips approach a pinch.
+Only actual pinch contact holds the click target. The pointer uses the proximal
+index joints, so curling the fingertip alone does not move that target. This
+also prevents tracking noise near the approach boundary from repeatedly
+freezing the cursor and discarding hand travel.
+
 Brief tracking uncertainty freezes the pointer for up to 150 ms, allowing the
 same hand to recover without repeating the activation pose. Missing or unreliable
 input cancels a pending click and releases a drag immediately. Recovery itself
 never clicks: release any pinch before making a new click gesture. A different
 hand or a longer interruption requires pointing again.
+
+## Camera mouse with fast double-blink clicks
+
+Updated October 12, 2026. **Fast double blink** is the only EEG detector.
+Enable **Camera mouse** in that panel to use the same tracker, camera index,
+model complexity, and optional bend-click preference as standalone Hand controls.
+Both previews share one renderer for the hand skeleton and its 21 joints.
+The configured laptop default is MediaPipe Hands Full; selecting another supported
+tracker in Hand controls applies to the next EEG camera start as well.
+
+Only one mode can own the camera and pointer at a time. Turn off standalone
+Hand controls before starting the combined preview. Camera mouse is selected by
+default, but capture still starts only after an explicit Start. You may disable
+it and use the fast EEG detector with your ordinary mouse or touchpad.
+
+After loading a validated model and explicitly arming, point briefly to engage
+movement, move your hand to aim, and double blink for one left click. A missing
+hand pauses movement and releases an owned drag, while EEG clicking at the
+current cursor remains available. Pinch/release clicks and pinch-hold drags take
+priority over EEG. After finger input ends, the detector requires one second
+of newer EEG and recognized rest so a buffered blink cannot become a late click.
+
+A temporary EEG amplitude spike pauses only EEG clicks. Camera aiming, pinch,
+and dragging remain armed. Recovery requires fresh clean EEG and recognized
+rest. Other signal, transport, guard, or input faults still disarm and retain a
+visible reason. Escape disarms both forms of input; Stop releases acquisition.
+Toggling Camera mouse disarms input and preserves EEG calibration and its session.
+
+The yellow **CAMERA ON** header indicator covers both standalone and EEG capture.
+It remains active during release, and indicates uncertainty if release fails or
+status becomes unavailable. It turns off after confirmed release, independently
+of hand visibility, the selected panel, or whether mouse control is armed.
+The separate **HAND ON/OFF** button controls only standalone hand tracking.
+
+See the [fast CNN guide](brainbit.md#fast-double-blink-calibration) for collection,
+validation, model reuse, and timing. A one-second input window is not a guarantee
+of subsecond physical click latency.
 
 ## Desktop and Task View navigation
 

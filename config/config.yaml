@@ -1,6 +1,7 @@
 # Global config with safe defaults
 backend: ollama                  # can be: ollama or fallback
-model: nemotron-3.5-lightning:latest
+model: qwen3:4b-instruct-2507-q4_K_M # compact local model for the 8 GB RTX 4070 Laptop GPU
+num_ctx: 8192                    # bound KV-cache memory while leaving room for the tool prompt
 temperature: 0.2
 max_tokens: 600
 timezone: America/New_York
@@ -27,7 +28,7 @@ gestures:
   camera_index: 0     # first webcam; raise this if you have several
   desktop_mode: auto # smooth horizontal swipes when supported; Task View uses a Windows shortcut
   travel_palms: 1.2  # 0.8–3.0; deliberate travel completes automatically, with no fist required
-  tracker_backend: wilor # Full WiLoR + AnyHand on NVIDIA GPU; install with setup_wilor.py on a new machine
+  tracker_backend: mediapipe # CPU hand tracking; leaves the laptop GPU available for Ollama
   model_complexity: 1 # MediaPipe only: 1 = full; 0 = lighter model for slower CPUs
   # Poses use timed holds; legacy hold_frames/cooldown_s do not control them.
   # HUD mode/travel changes last for this session. Edit here and restart to persist.

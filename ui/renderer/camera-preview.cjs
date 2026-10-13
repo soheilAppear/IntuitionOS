@@ -2,9 +2,18 @@
 const http = require('node:http');
 
 function readCameraPreview() {
+  return readLocalCamera('/gestures/preview', 'X-Intuition-Preview', 1024 * 1024);
+}
+
+function readCameraPrivacy() {
+  // Metadata only: polling this route never requests pixels or opens capture.
+  return readLocalCamera('/camera/privacy', 'X-Intuition-Camera', 64 * 1024);
+}
+
+function readLocalCamera(path, header, maxBytes) {
   return new Promise((resolve, reject) => {
-    const request = http.get({ hostname: '127.0.0.1', port: 7432, path: '/gestures/preview',
-      headers: { 'X-Intuition-Preview': '1' } }, response => {
+    const request = http.get({ hostname: '127.0.0.1', port: 7432, path,
+      headers: { [header]: '1' } }, response => {
       if (response.statusCode !== 200) {
         response.resume(); reject(new Error('Camera preview unavailable')); return;
       }
@@ -12,7 +21,7 @@ function readCameraPreview() {
       const chunks = [];
       response.on('data', chunk => {
         size += chunk.length;
-        if (size > 1024 * 1024) { request.destroy(new Error('Camera preview too large')); return; }
+        if (size > maxBytes) { request.destroy(new Error('Camera preview too large')); return; }
         chunks.push(chunk);
       });
       response.on('error', reject);
@@ -29,4 +38,4 @@ function readCameraPreview() {
   });
 }
 
-module.exports = { readCameraPreview };
+module.exports = { readCameraPreview, readCameraPrivacy };

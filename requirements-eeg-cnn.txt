@@ -1,0 +1,4 @@
+# Optional CPU trainer for the small EEG waveform CNN. Live inference uses NumPy.
+# Keep the existing camera/voice environment and GPU allocation unchanged.
+--index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1+cpu

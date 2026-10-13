@@ -558,6 +558,119 @@ DEFAULT_BINDINGS: dict = {
 }
 
 
+@dataclass(frozen=True)
+class _CapturedFrame:
+    frame: object
+    captured_at: float
+    read_seconds: float
+    generation: int
+    captured_perf: float
+
+
+class _LatestCameraFrame:
+    """Drain one camera continuously, keeping at most one unprocessed frame.
+
+    The caller retains camera ownership and must close this reader before
+    releasing the device. A failed read invalidates even a frame already being
+    inferred, so its landmarks cannot restore input after camera loss.
+    """
+
+    def __init__(self, camera, stop, on_failure):
+        self._camera = camera
+        self._stop = stop
+        self._on_failure = on_failure
+        self._closing = threading.Event()
+        self._condition = threading.Condition()
+        self._latest = None
+        self._generation = 0
+        self._error = None
+        self._done = False
+        self._dropped = 0
+        self._thread = threading.Thread(target=self._read, name="camera-reader", daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def take(self):
+        """Take the newest frame once; never build a processing backlog."""
+        with self._condition:
+            while True:
+                if self._error is not None:
+                    raise self._error
+                if self._closing.is_set() or self._stop.is_set():
+                    return None
+                if self._latest is not None:
+                    latest, self._latest = self._latest, None
+                    return latest
+                if self._done:
+                    return None
+                self._condition.wait(timeout=0.05)
+
+    def valid(self, frame):
+        with self._condition:
+            return (frame.generation == self._generation and self._error is None
+                    and not self._closing.is_set() and not self._stop.is_set())
+
+    @property
+    def dropped_frames(self):
+        with self._condition:
+            return self._dropped
+
+    def close(self):
+        self._closing.set()
+        with self._condition:
+            self._latest = None
+            self._condition.notify_all()
+        # Never call release() concurrently with a native read(). The owning
+        # worker stays alive (and Stop reports stopping) if the driver hangs.
+        if self._thread.is_alive():
+            self._thread.join()
+
+    def _invalidate(self):
+        with self._condition:
+            self._generation += 1
+            self._latest = None
+            self._condition.notify_all()
+        self._on_failure()
+
+    def _read(self):
+        failed_reads = 0
+        try:
+            while not self._closing.is_set() and not self._stop.is_set():
+                read_at = time.perf_counter()
+                ok, frame = self._camera.read()
+                captured_perf = time.perf_counter()
+                captured_at = time.monotonic()
+                if self._closing.is_set() or self._stop.is_set():
+                    break
+                if not ok:
+                    self._invalidate()
+                    failed_reads += 1
+                    if failed_reads >= 20:
+                        raise RuntimeError("The camera is not providing video frames.")
+                    time.sleep(0.05)
+                    continue
+                failed_reads = 0
+                with self._condition:
+                    if self._latest is not None:
+                        self._dropped += 1
+                    self._latest = _CapturedFrame(
+                        frame, captured_at, max(0.0, captured_perf - read_at),
+                        self._generation, captured_perf)
+                    self._condition.notify_all()
+        except Exception as exc:
+            with self._condition:
+                self._generation += 1
+                self._latest = None
+                self._error = exc
+                self._condition.notify_all()
+            self._on_failure()
+        finally:
+            with self._condition:
+                self._done = True
+                self._condition.notify_all()
+
+
 class GestureRecognizer:
     """Owns the camera, classifies frames, and reports deliberate gestures.
 
@@ -608,6 +721,10 @@ class GestureRecognizer:
         self._lock = threading.RLock()
         self._input_lock = threading.RLock()
         self._tracker_cleanup_lock = threading.RLock()
+        self._camera_cleanup_lock = threading.RLock()
+        self._failed_camera = None
+        self._camera_resource = {"state": "released", "in_use": False,
+                                 "release_confirmed": True, "cleanup_pending": False, "error": None}
         self._failed_tracker = None
         self._tracker_error = None
         self._mouse_factory = mouse_factory
@@ -657,7 +774,7 @@ class GestureRecognizer:
                 "tracked": False, "raw_pose": NONE, "pose": NONE,
                 "landmarks": [], "fps": 0.0, "state": "idle", "progress": 0.0,
                 "hint": "Turn on the camera to see hand tracking", "last_reason": None,
-                "captured_at": None}
+                "captured_at": None, "timing": {}}
 
     # ── Availability ─────────────────────────────────────────────────────
 
@@ -697,6 +814,7 @@ class GestureRecognizer:
                     "model": self.model_name, "model_complexity": self.model_complexity,
                     "model_name": self.model_name,
                     "tracker_backend": self.tracker_backend,
+                    "camera_resource": dict(self._camera_resource),
                     "tracker_cleanup_pending": self._failed_tracker is not None,
                     "input_mode": self.input_mode,
                     "navigation_active": self._navigation_active,
@@ -720,6 +838,8 @@ class GestureRecognizer:
         """Change capture settings while off, without altering a live drag."""
         with self._input_lock:
             with self._lock:
+                if self._failed_camera is not None:
+                    return {"error": "Camera release cleanup is still pending. Turn the camera off again to retry."}
                 if self._navigation_error:
                     return {"error": "Navigation input cleanup is still pending. Turn the camera off again to retry."}
                 if self._failed_tracker is not None:
@@ -803,7 +923,9 @@ class GestureRecognizer:
                 info.update(sequence=self._capture_sequence, state=self._state, hint=self._reason,
                             last_reason=self._diagnostic.get("last_reason") or "camera_off")
             return {**info, "landmarks": [list(point) for point in info["landmarks"]],  # Callers cannot mutate live geometry.
-                    "running": running, "age_ms": age_ms, "tracker_backend": self.tracker_backend}
+                    "camera_resource": dict(self._camera_resource),
+                    "running": running, "age_ms": age_ms, "tracker_backend": self.tracker_backend,
+                    "timing": dict(source.get("timing", {}))}
 
     def preview(self) -> dict:
         """Read the latest frame and renew a short encoding lease, never start capture.
@@ -836,6 +958,8 @@ class GestureRecognizer:
             elif "control_region" in info:
                 info["control_region"] = list(info["control_region"])
             return {**info, "landmarks": [list(point) for point in info["landmarks"]],
+                    "camera_resource": dict(self._camera_resource),
+                    "timing": dict(info.get("timing", {})),
                     "running": running, "model": self.model_name,
                     "model_name": self.model_name, "effective_pose": info["pose"],
                     "last_cancel_reason": info["last_reason"],
@@ -855,7 +979,7 @@ class GestureRecognizer:
         if end_lease:
             self._preview_lease_until = 0.0
 
-    def _publish_preview(self, frame, points, frame_at, cv2) -> None:
+    def _publish_preview(self, frame, points, frame_at, cv2, *, frame_valid=None, timing=None) -> None:
         """Update cheap metadata every frame; JPEG work happens outside the lock."""
         now = time.monotonic()
         raw_pose = classify(points)
@@ -864,7 +988,8 @@ class GestureRecognizer:
         if raw_pose == NONE and points:
             raw_pose = UNKNOWN
         with self._lock:
-            if not self._running or self._stop.is_set():
+            if (not self._running or self._stop.is_set()
+                    or (frame_valid is not None and not frame_valid())):
                 self._preview_snapshot = None
                 return
             self._capture_sequence += 1
@@ -877,6 +1002,8 @@ class GestureRecognizer:
                 pose=self._mouse_pose if self.input_mode == "mouse" else self.measured._pose,
                 landmarks=[list(point) for point in points],
                 fps=round(fps, 1), captured_at=frame_at)
+            if timing is not None:
+                self._diagnostic["timing"] = dict(timing)
             if now >= self._preview_lease_until:
                 self._preview_snapshot = None
                 return
@@ -902,13 +1029,17 @@ class GestureRecognizer:
             # A preview encoder failure must not interrupt gesture controls.
             return
         with self._lock:
-            if self._running and not self._stop.is_set() and time.monotonic() < self._preview_lease_until:
+            if (self._running and not self._stop.is_set()
+                    and time.monotonic() < self._preview_lease_until
+                    and (frame_valid is None or frame_valid())):
                 self._preview_snapshot = snapshot
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     def start(self) -> dict:
         with self._lock:
+            if self._failed_camera is not None:
+                return {"error": "Camera release cleanup is still pending. Turn the camera off again to retry."}
             if self._navigation_error:
                 return {"error": "Navigation input cleanup is still pending. Turn the camera off again to retry."}
             if self._failed_tracker is not None:
@@ -976,13 +1107,16 @@ class GestureRecognizer:
                     return {"error": self._reason, "stopping": True}
                 return {"ok": True, "stopping": True}
         self._retry_tracker_cleanup()
+        self._retry_camera_cleanup()
         with self._lock:
             cleanup_error = self._cleanup_error_text()
             if cleanup_error:
                 self._state = "error"
                 self._reason = cleanup_error
                 self._report_status()
-                result = {"error": self._reason, "camera_released": True}
+                result = {"error": self._reason, "camera_released": self._camera_resource["release_confirmed"]}
+                if self._failed_camera is not None:
+                    result["camera_cleanup_pending"] = True
                 if self._failed_tracker is not None:
                     result["tracker_cleanup_pending"] = True
                 return result
@@ -993,6 +1127,8 @@ class GestureRecognizer:
 
     def _cleanup_error_text(self):
         """Describe retained input/tracker resources after camera release."""
+        if self._failed_camera is not None:
+            return f"Camera release failed: {self._camera_resource['error']}. Turn the camera off again to retry cleanup."
         failures = []
         if self.input_mode == "mouse" and self._mouse_error:
             failures.append(f"hand mouse button release failed: {self._mouse_error}")
@@ -1001,6 +1137,45 @@ class GestureRecognizer:
         if self._failed_tracker is not None:
             failures.append(f"hand tracker cleanup failed: {self._tracker_error}")
         return "The camera is released, but " + "; ".join(failures) if failures else None
+
+    def _set_camera_resource(self, state, in_use, *, error=None):
+        # Privacy follows the native handle, not successful landmarks, a preview
+        # lease, or the worker's input-enabled flag. Readers receive detached data.
+        with self._lock:
+            self._camera_resource = {"state": state, "in_use": in_use,
+                                     "release_confirmed": state == "released",
+                                     "cleanup_pending": state == "release_failed", "error": error}
+
+    def _release_camera(self, camera):
+        # Only the worker (after reader.join) or a post-worker Stop retry owns
+        # this call. A native release failure must retain its object and privacy
+        # state rather than claiming that the camera is off.
+        with self._camera_cleanup_lock:
+            with self._lock:
+                in_use = True if self._camera_resource["in_use"] is True else None
+            self._set_camera_resource("releasing", in_use)
+            try:
+                camera.release()
+            except Exception as exc:
+                with self._lock:
+                    self._failed_camera = camera
+                self._set_camera_resource("release_failed", in_use, error=str(exc))
+                return False
+            with self._lock:
+                if self._failed_camera is camera:
+                    self._failed_camera = None
+                self._set_camera_resource("released", False)
+            return True
+
+    def _retry_camera_cleanup(self):
+        # stop() calls this only after the capture worker has actually ended.
+        with self._camera_cleanup_lock:
+            with self._lock:
+                camera = self._failed_camera
+                if camera is not None:
+                    self._state = "stopping"  # Block a new owner until this retry and Stop finish.
+            if camera is not None:
+                self._release_camera(camera)
 
     def _retry_tracker_cleanup(self):
         # Normal cleanup belongs to the capture worker. This path is only used
@@ -1025,8 +1200,18 @@ class GestureRecognizer:
 
     # ── The capture loop ─────────────────────────────────────────────────
 
+    def _camera_read_failed(self):
+        # Serialize against input and publication from any in-flight inference.
+        # The reader has already invalidated that frame before acquiring this
+        # lock, so a late inference cannot restore the lost hand afterward.
+        with self._input_lock:
+            with self._lock:
+                self._clear_preview_locked("camera_read_failed")
+            self._reset_controls(time.monotonic(), "camera_read_failed")
+
     def _run(self) -> None:
         camera = None
+        reader = None
         hands = None
         failure = None
         try:
@@ -1052,44 +1237,46 @@ class GestureRecognizer:
 
             if self._stop.is_set():
                 return
+            self._set_camera_resource("opening", None)
             camera = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
             if not camera.isOpened():
-                camera.release()
+                if not self._release_camera(camera):
+                    raise RuntimeError("The initial camera handle could not be released; fallback capture was not opened.")
+                camera = None
+                if self._stop.is_set():
+                    return
+                self._set_camera_resource("opening", None)
                 camera = cv2.VideoCapture(self.camera_index)
             if not camera.isOpened():
                 raise RuntimeError(f"No camera at index {self.camera_index}. Check it is "
                                    "connected and not in use by another application.")
+            self._set_camera_resource("open", True)
 
             # A smaller frame is enough for landmarks and keeps a webcam loop off
             # the CPU budget the rest of the system needs.
             camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            # Some cameras negotiate only 20 FPS unless explicitly requested.
+            # Keep a working default if the driver rejects this optional hint.
+            try:
+                camera.set(cv2.CAP_PROP_FPS, 30)
+            except Exception:
+                pass
 
-            failed_reads = 0
+            reader = _LatestCameraFrame(camera, self._stop, self._camera_read_failed)
+            reader.start()
             while not self._stop.is_set():
-                ok, frame = camera.read()
-                if not ok:
-                    with self._lock:
-                        self._clear_preview_locked("camera_read_failed")
-                    self._reset_controls(time.monotonic(), "camera_read_failed")
-                    failed_reads += 1
-                    if failed_reads >= 20:
-                        raise RuntimeError("The camera is not providing video frames.")
-                    time.sleep(0.05)
-                    continue
-                failed_reads = 0
-                frame_at = time.monotonic()
-                frame = cv2.flip(frame, 1)  # mirror, so the user's left is left
+                captured = reader.take()
+                if captured is None:
+                    break
+                # Python 3.12's Windows monotonic clock is coarse (15.625 ms).
+                # Use QPC durations without changing the shared control clock.
+                inference_at = time.perf_counter()
+                frame_at = captured.captured_at
+                frame = cv2.flip(captured.frame, 1)  # mirror, so the user's left is left
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 result = hands.process(rgb)
-                with self._lock:
-                    if self._stop.is_set():
-                        break
-                    if not self._running:
-                        self._running = True
-                        self._state = "running"
-                        self._reason = "Watching for gestures."
-                        self._report_status()
+                inferred_at = time.perf_counter()
                 now = time.monotonic()
                 if self.tracker_backend in ("rtmpose", "wilor"):
                     points = self._tracker_points(result)
@@ -1098,19 +1285,52 @@ class GestureRecognizer:
                                  if result.multi_hand_landmarks else None)
                     points = [(p.x, p.y, p.z) for p in landmarks] if landmarks else []
 
-                if not points:
-                    self.stabiliser.feed(NONE, now)
-                    self.motion.reset()
-                    self._handle([], now)
-                    self._publish_preview(frame, [], frame_at, cv2)
-                    continue
-
-                self._handle(points, now)
-                self._publish_preview(frame, points, frame_at, cv2)
+                with self._input_lock:
+                    if not reader.valid(captured):
+                        continue
+                    if time.monotonic() - frame_at > 0.5:
+                        with self._lock:
+                            self._clear_preview_locked("stale_frame")
+                        self._reset_controls(time.monotonic(), "stale_frame")
+                        continue
+                    with self._lock:
+                        if self._stop.is_set():
+                            break
+                        if not self._running:
+                            self._running = True
+                            self._state = "running"
+                            self._reason = "Watching for gestures."
+                            self._report_status()
+                    if not points:
+                        self.stabiliser.feed(NONE, now)
+                        self.motion.reset()
+                    self._handle(points, now)
+                # JPEG encoding must not hold the input lock: Stop and camera
+                # loss can release a drag even while an encoder is finishing.
+                self._publish_preview(
+                    frame, points, frame_at, cv2,
+                    frame_valid=lambda: (reader.valid(captured)
+                                         and time.monotonic() - frame_at <= 0.5),
+                    timing={
+                        "capture_read_ms": round(captured.read_seconds * 1000, 2),
+                        "frame_wait_ms": round(max(0.0, inference_at - captured.captured_perf) * 1000, 2),
+                        "inference_ms": round(max(0.0, inferred_at - inference_at) * 1000, 2),
+                        "frame_age_ms": round(max(0.0, inferred_at - captured.captured_perf) * 1000, 2),
+                        "dropped_frames": reader.dropped_frames,
+                    })
         except Exception as exc:  # a dying camera must not take the backend with it
             failure = f"Gesture capture stopped: {exc}"
         finally:
             self._reset_controls(time.monotonic(), "camera_stopped")
+            with self._lock:
+                self._running = False
+                self._state = "stopping"
+                self._reason = "Releasing the camera."
+                self._clear_preview_locked("capture_error" if failure else "camera_stopped", end_lease=True)
+                if camera is not None:
+                    self._camera_resource.update(state="releasing", release_confirmed=False)
+            if reader is not None:
+                reader.close()
             if hands is not None:
                 try:
                     hands.close()
@@ -1120,10 +1340,10 @@ class GestureRecognizer:
                             self._failed_tracker = hands
                             self._tracker_error = str(exc)
             if camera is not None:
-                try:
-                    camera.release()
-                except Exception:
-                    pass
+                self._release_camera(camera)
+            else:
+                # Startup failed or was cancelled before acquiring any handle.
+                self._set_camera_resource("released", False)
             with self._lock:
                 self._running = False
                 self._clear_preview_locked("capture_error" if failure else "camera_stopped", end_lease=True)

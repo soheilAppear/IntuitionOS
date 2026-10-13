@@ -5,7 +5,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 
-function transport() {
+function transport(method = 'readCameraPreview') {
   const request = new EventEmitter();
   request.destroy = error => { request.emit('error', error); request.emit('close'); };
   const response = new EventEmitter();
@@ -18,7 +18,7 @@ function transport() {
     setTimeout: (fn, delay) => { assert.equal(delay, 1500); deadline = fn; return 1; },
     clearTimeout: () => { cleared = true; },
   });
-  const promise = module.exports.readCameraPreview();
+  const promise = module.exports[method]();
   return { promise, request, response, options, start: () => receive(response),
     expire: () => deadline(), get cleared() { return cleared; } };
 }
@@ -59,4 +59,17 @@ test('preview transport has an absolute deadline and rejects HTTP or JSON failur
   const invalidResult = assert.rejects(invalid.promise);
   invalid.response.emit('data', Buffer.from('not json')); invalid.response.emit('end');
   invalid.request.emit('close'); await invalidResult;
+});
+
+test('camera privacy reads bounded metadata through its own local route and header without pixels', async () => {
+  const t = transport('readCameraPrivacy');
+  assert.equal(t.options.hostname, '127.0.0.1');
+  assert.equal(t.options.path, '/camera/privacy');
+  assert.equal(t.options.headers['X-Intuition-Camera'], '1');
+  assert.equal(t.options.headers['X-Intuition-Preview'], undefined);
+  assert.equal(t.options.headers.Origin, undefined);
+  t.start();
+  const result = assert.rejects(t.promise, /too large/);
+  t.response.emit('data', Buffer.alloc(64 * 1024 + 1));
+  await result;
 });

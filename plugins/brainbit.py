@@ -132,7 +132,9 @@ class BrainBit(HardwareDriver):
 
     name = "brainbit"
 
-    def __init__(self, enabled=True, scan_seconds=5, connect_timeout=15,
+    # The Windows SDK can spend over 25 seconds in create_sensor, including
+    # setup and metadata. Let it finish before enforcing the worker deadline.
+    def __init__(self, enabled=True, scan_seconds=5, connect_timeout=40,
                  request_timeout=20):
         self._lock = threading.RLock()
         self._worker = None
@@ -264,8 +266,15 @@ class BrainBit(HardwareDriver):
         with self._lock:
             now = time.monotonic()
             result = copy.deepcopy(self._acq)
-            packets = copy.deepcopy([packet for packet in self._samples
-                                     if now - packet["host_received_monotonic"] <= 5])
+            # _acquisition_event stores only these primitive fields and a
+            # detached float/None sample list. Copy that fixed shape directly
+            # instead of recursively visiting every scalar at camera cadence.
+            # Markers have no enforced shape, so preserve their deep isolation.
+            packets = [{"counter": packet["counter"], "marker": copy.deepcopy(packet["marker"]),
+                        "samples": list(packet["samples"]),
+                        "host_received_monotonic": packet["host_received_monotonic"],
+                        "estimated_monotonic": packet["estimated_monotonic"]}
+                       for packet in self._samples if now - packet["host_received_monotonic"] <= 5]
             contact = copy.deepcopy(self._contact_precheck)
             last_receipt = self._samples[-1]["host_received_monotonic"] if self._samples else None
         if sample_limit is not None and len(packets) > sample_limit:
@@ -564,6 +573,7 @@ class BrainBit(HardwareDriver):
             payload = response.get("result")
             if not isinstance(payload, dict) or "state" not in payload:
                 raise OSError("Invalid BrainBit worker response")
+            connection_failed = action == "connect" and payload["state"] == "disconnected"
             stopped = None
             with self._lock:
                 if epoch != self._epoch or self._closed:
@@ -576,9 +586,13 @@ class BrainBit(HardwareDriver):
                     self._epoch += 1
                     stopped, self._worker = self._worker, None
                     payload.update(devices=[], device=None)
-                self._update(**{key: value for key, value in payload.items()
-                                if key in ("state", "available", "text", "device", "devices")},
-                             busy=False)
+                values = {key: value for key, value in payload.items()
+                          if key in ("state", "available", "text", "device", "devices")}
+                if connection_failed:
+                    message = ("BrainBit was found, but the SDK could not complete its Bluetooth connection. "
+                               "Restart the headset and check the Windows Bluetooth adapter, then discover again.")
+                    values.update(state="error", text=message, error=message)
+                self._update(**values, busy=False)
             if stopped is not None:
                 stopped.close()
             return self.status()

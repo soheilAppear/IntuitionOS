@@ -191,6 +191,24 @@ html, body {
 .gesture-toggle.active { color: #5eead4; border-color: rgba(45,212,191,0.5); background: rgba(45,212,191,0.09); }
 .gesture-toggle.busy { color: #fbbf24; }
 .gesture-toggle.error { color: #fca5a5; border-color: rgba(239,68,68,0.4); }
+.camera-privacy {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 3px 6px;
+  border: 1px solid rgba(255,255,255,0.13);
+  border-radius: 5px;
+  color: #9ca3af;
+  font: 700 9px 'Cascadia Code', 'Consolas', monospace;
+  white-space: nowrap;
+  -webkit-app-region: no-drag;
+}
+/* Unknown ownership stays yellow too: a lost status channel never proves OFF. */
+.camera-privacy.in-use, .camera-privacy.uncertain {
+  color: #fbbf24;
+  border-color: rgba(251,191,36,0.65);
+  background: rgba(251,191,36,0.12);
+}
 .gesture-strip {
   display: none;
   padding: 8px 16px;

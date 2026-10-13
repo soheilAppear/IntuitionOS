@@ -71,9 +71,10 @@ async function requestBrainbit(action = 'status', deviceId) {
     request.on('close', () => {
       if (!settled) finish(new Error('BrainBit response interrupted'));
     });
+    // Connect must outlast the backend's 40-second SDK deadline and cleanup.
     // A fixed deadline also bounds a server that keeps sending partial chunks.
     timeout = setTimeout(() => fail(new Error('BrainBit request timed out')),
-      method === 'GET' ? 5000 : 30000);
+      method === 'GET' ? 5000 : action === 'connect' ? 50000 : 30000);
     request.end(body);
   });
 }

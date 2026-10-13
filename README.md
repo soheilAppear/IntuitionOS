@@ -37,18 +37,20 @@ The [branch consolidation report](docs/2026-09-07-main-consolidation.md) records
 the merge into `main` and subsequent bug fixes. The original 2025 prototype is
 preserved in the [historical archive](archive/README.md).
 
-For optional BrainBit headset connection and the explicitly started, local EEG +
-webcam experiment, see the [BrainBit guide](docs/brainbit.md). The experimental
-preview is disarmed by default. Its default selection mode uses hand movements
-to aim the pointer, keeps finger clicks and drags, and adds a trained rest/select
-EEG pattern for clicking. Separate
-training, held-out validation, and explicit arming are required.
+**EEG update: October 12, 2026.** The combined camera and EEG work continues on
+[`update_10_12_2026_eeg_signal_status`](https://github.com/soheilAppear/IntuitionOS/tree/update_10_12_2026_eeg_signal_status).
+The EEG interface now has one detector: **Fast double blink CNN**, using a
+one-second signal window. One recognized double blink sends one left mouse
+click, including when your hand is outside the camera. Optional camera aiming
+uses the same configured hand tracker and joint overlay as camera-only mode,
+with pinch clicks and dragging retained. The yellow camera indicator covers
+both camera modes and turns off only after capture is released.
 
-The latest combined camera and EEG work is on
-[`update_10_10_2026_eeg_signal_status`](https://github.com/soheilAppear/IntuitionOS/tree/update_10_10_2026_eeg_signal_status).
-It includes the camera branch, both former Codex BrainBit branches, and live EEG
-signal status in the BrainBit panel. `main` and
-`update_9_20_2026_camera_mode_added` remain the earlier milestones.
+Start with the [BrainBit and fast double-blink guide](docs/brainbit.md).
+Training, separate held-out validation, and explicit arming are required; an
+existing validated fast model can be loaded without collecting new examples.
+The previous EEG detectors, EEG swipe experiments, and practice counter have
+been removed. Standalone Hand Mouse and desktop gestures remain available.
 
 ---
 
@@ -70,7 +72,7 @@ A frameless, always-on-top ambient overlay that lives at the top of your screen.
 - Optional BrainBit panel with device connection, EEG live/stale/error status,
   channel count, sample rates, sample age, and acquisition counters
 - Explicitly started hand-camera and EEG waveform preview, with hand aiming,
-  EEG selection, and separate training/validation before desktop control
+  fast double-blink clicks, and separate training/validation before desktop control
 
 ### Terminal (classic)
 
@@ -105,7 +107,7 @@ ollama serve
 # 4. Pull whatever `model:` in config/config.yaml names. Check it first:
 #      Select-String '^model:' config/config.yaml
 #    The two must agree, or your first message returns an HTTP error.
-ollama pull <the model named in config.yaml>
+ollama pull qwen3:4b-instruct-2507-q4_K_M
 
 # 5. Launch
 python start_ui.py
@@ -119,6 +121,16 @@ under `.venv` whichever interpreter started it, and says so when it switches.
 Any Ollama model with tool support works. `config/config.yaml` decides which,
 and the only hard rule is that the name there and the name you pulled must
 match exactly, tag included.
+
+The default is [Qwen3 4B Instruct Q4_K_M](https://ollama.com/library/qwen3:4b-instruct-2507-q4_K_M),
+a 2.5 GB download selected for an RTX 4070 Laptop GPU with 8 GB VRAM.
+`num_ctx: 8192` limits the context allocated by each request, including streaming
+and ordinary chat. Runtime memory also includes the context cache and compute
+buffers, so the download size is not the VRAM requirement. After sending a
+message, use `ollama ps` to check for `100% GPU` and context `8192`. Camera
+tracking and other GPU applications share that memory; stop idle models with
+`ollama stop <model>` if more room is needed. Restart IntuitionOS after changing
+`model` or `num_ctx`.
 
 Two properties matter more than raw size. The tool loop parses a JSON object out
 of each reply, so a model that emits clean structured output beats a larger one
@@ -175,130 +187,55 @@ available. Speech fills an editable draft—it is never submitted automatically.
 See the [recovery report](docs/2026-09-07-hud-recovery.md) for the observed failure,
 fixes, and live checks.
 
-### EEG signal preview (optional BrainBit headset)
+### Fast double-blink clicks with BrainBit
 
-Install the optional SDK into the existing project environment, then launch:
+Install the optional headset SDK and local CNN trainer into the project environment:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-brainbit.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-eeg-cnn.txt
 .\.venv\Scripts\python.exe start_ui.py
 ```
 
-In **BrainBit**, choose **Discover devices**, select the headset, and **Connect**.
-Turn off the normal Hand controls camera. **Experimental hand + EEG** now opens
-with **Control source → EEG selection / click** and **Selection target → Practice
-counter**. Choose **Start preview** to view the hand camera and EEG. Leave **Arm
-hand controls + EEG practice** unchecked for preview only. Viewing signals requires
-neither classifier training nor Ollama; an untrained prediction message does not
-prevent waveforms from appearing.
+1. In **BrainBit**, discover and connect the headset. Wear it with its electrodes
+   and reference in contact. Turn off standalone Hand controls before using the
+   camera in the EEG panel.
+2. Open **Fast double blink**. Leave **Camera mouse** enabled to aim with your
+   hand, or disable it for EEG clicks at your normal mouse/touchpad position.
+   Choose **Start**. Preview starts disarmed and does not require Ollama.
+3. To reuse calibration, choose **Use saved fast CNN**. For a new model, collect
+   eight **No command** and eight **Double blink** training trials using the cues.
+   Each cue gives preparation time followed by a one-second recording. Choose
+   **Train & freeze fast CNN**, then collect eight new trials of each label for
+   validation. Save the model after validation.
+4. Once validation passes, explicitly arm the controls. Point briefly to engage
+   camera aiming; pinch/release clicks and pinch-hold drags still work. A
+   recognized double blink sends **one left click**, even without a visible hand.
+   Open your eyes and let the detector recognize rest before another command.
+5. Press **Escape** to disarm input from any app. Choose **Stop** to release the
+   camera and stop EEG acquisition. Closing a panel does not stop an active camera.
 
-To try selection and a single mouse click with **EEG click method → Eyes closed
-(existing model)**:
+The camera preview draws the same hand joints and connections in both modes.
+The header's yellow **CAMERA ON** indicator follows native capture ownership;
+**HAND ON/OFF** controls only standalone hand tracking. Starting, stopping, and
+unconfirmed release remain distinguishable from a confirmed camera-off state.
 
-1. Collect **8 training trials each for rest and select**, alternating labels.
-   Each trial lasts five seconds. For rest, keep your eyes open and relax. For
-   select, gently close your eyes, count four seconds, then reopen; keep your
-   head and jaw still. Keep the camera running; pointing is not needed during
-   calibration, and pointer movement remains disarmed.
-2. Choose **Train & freeze model**; the phase switches to **Validation**. Collect **8 new
-   trials per label**. Keep acquisition running. Validation determines whether
-   EEG clicks are enabled by the normal model path; hand aiming and finger clicks
-   can be armed independently. Choose **Save EEG model & trials** to retain
-   the model, training features and original validation results locally.
-3. Keep your hand visible in the camera, leave **Practice counter** selected,
-   and explicitly **Arm hand controls + EEG practice**. Point your index finger briefly,
-   then move your hand to aim the pointer. Pinch/release clicks and pinch-hold
-   drags remain active; optional index bend clicks follow your existing Hand
-   controls setting. **Practice affects only EEG: finger clicks and drags still
-   affect the desktop.** EEG selections increment the counter. Keep your hand visible and still
-   during selection. One action needs one second of confident rest, three distinct confident select
-   predictions, then one second of confident rest after reopening your eyes.
-   Holding select cannot repeat an action; an unfinished selection expires after
-   eight seconds and is cancelled without switching off hand controls.
-4. Choose **Mouse left click** when ready. Changing the target disarms; explicitly
-   **Arm hand controls + EEG clicks** again, then point briefly, aim with your hand, and repeat the
-   rest → select → rest cycle. It sends one left click at the current pointer;
-   finger clicks remain available too. Ordinary aiming continues through uncertain
-   EEG; the pointer holds only after a selection is confirmed. Finger gestures take priority and cancel a pending
-   EEG selection so it cannot add a second click. A fresh rest cycle is required
-   before the next EEG selection. Losing hand tracking cancels the selection,
-   releases an owned drag and pauses movement. Show your hand and point briefly
-   to resume at the current cursor position, without another arm-button step.
-   Stale or invalid EEG pauses EEG clicks while hand aiming and finger clicks continue.
-   Press **Escape** to stop and disarm
-   hand movement, finger input, and EEG clicks from any app.
+A temporary EEG amplitude spike pauses blink clicks while camera control stays
+armed. Recovery discards pending blink evidence and requires fresh clean EEG
+and recognized rest. Packet gaps, stale data, flatlines, clipping, loss of the
+Escape guard, and input failures still stop input and show the reason. Hand
+loss pauses aiming and releases a drag; it does not require camera tracking for
+an EEG click. Finger input takes priority over blink commands.
 
-Hand aiming now consumes fresh camera landmarks on a 30 Hz control schedule,
-independently of the slower preview images and EEG predictions. The configured
-RTX 5090 tracker uses full AnyHand-WiLoR on CUDA with a 960-pixel detector;
-see the [measured tracker comparison](docs/hand-tracking.md#october-10-rtx-5090-tuning).
-Actual movement updates still depend on fresh camera inference.
+The CNN evaluates new EEG every 40 ms using a rolling one-second window.
+That window is not a guaranteed physical blink-to-click latency. Live inference
+uses NumPy; PyTorch is needed only for explicit training. Saved weights and
+processed training/validation waveforms remain in Git-ignored
+`data/eeg-fast-cnn-blink-models/`. Older personal archives are left on disk but
+cannot be selected by the current interface.
 
-The default is a two-state signal-pattern experiment, not thought reading: eye,
-muscle, and electrode artifacts can affect classification. **Webcam direction
-(advanced)** and **EEG classifier (advanced swipes)** retain the older direction
-experiments. The [selection guide](docs/brainbit.md#eeg-selection-and-mouse-click)
-explains calibration, timing, and the Escape guard. New control, feature, and
-actuator logic includes inline comments explaining its checks and cleanup.
-
-**EEG live** means recent samples are arriving. It does not certify clean EEG:
-electrode drift, movement, and electrical interference can still affect a stream
-with no packet errors. Use **Stop & disarm (Esc)** before **Contact check (5 s)**,
-then restart preview. The [BrainBit guide](docs/brainbit.md) explains USB Bluetooth
-dongles, status indicators, [signal-quality checks](docs/brainbit.md#checking-signal-quality),
-and the separate calibration workflow. Eyes-closed click features use bounded 4–30 Hz power
-instead of broadband variance, without filtering the displayed raw traces or
-relaxing raw-signal checks. Samples remain in a bounded local memory buffer;
-the app does not save raw EEG recordings.
-
-The integrated controls move the real Windows cursor; a separate practice app is
-not required. In **Eyes closed (existing model)**, **Use saved EEG model** restores the latest local archive into a
-compatible running stream without repeating training. This explicitly selects an
-experimental saved model, including one whose original validation failed. The
-original score and failure stay visible; model selection leaves controls disarmed.
-Choose **Mouse left click**, then explicitly arm the hand controls and EEG clicks.
-
-Model backups stay in the Git-ignored `data/eeg-models/` directory.
-The JSON archive retains model parameters, derived training features, validation
-predictions and the original acquisition context. `core.eeg_model_store.load_decoder`
-checks and restores these values without arming controls. **Use saved EEG model**
-binds only inference to the new compatible acquisition; historical trial evidence
-keeps its original context. See
-[model backup and reuse details](docs/brainbit.md#model-backups-and-reuse).
-
-For a brief blink command, choose **EEG click method → Deliberate double blink**
-in the same panel. It uses a separate local model and retains your eyes-closed
-training and validation. **Collect remaining training** guides the unfinished
-**8 No command + 8 Double blink training trials**, with a three-second preparation
-countdown before each cue. Existing accepted trials are kept. Read normally and
-allow natural single blinks for No command; blink twice gently when prompted for
-Double blink, then keep your eyes open. Each trial lasts about five seconds.
-Wait while the cue says **Finishing signal collection**. A rejected trial pauses the sequence without
-clearing accepted data; **Cancel queued trials** stops future cues and lets the
-current trial finish. Manual trial buttons remain available.
-
-Training retains every accepted example, allows small timing differences, and
-learns from consistent whole double-blink trials: at least 6 of 8, or 75% when
-more are collected. After both classes reach eight and before freezing,
-**Collect another double-blink trial** lets you add clearer examples without
-resetting the existing data, up to 80 accepted training trials total. Fresh validation
-is still required after training.
-
-Choose **Train & freeze model**, then explicitly choose **Collect remaining
-validation** for **8 new trials of each**. Include normal reading, single blinks,
-and gentle jaw/head motion in no-command validation. Keep the preview running
-through training and validation.
-
-After validation passes, choose **Mouse left click** and **Arm hand controls + EEG
-clicks**. Your hand moves the Windows cursor; one recognized deliberate double
-blink produces one left click. Finger clicks and drags remain active. A single
-blink is not a command, and this method needs no sustained eyes-closed hold or
-rest/select/rest cycle. **Save double-blink model & trials** saves its learned pulse
-waveform features and validation metadata separately as `double-blink-*.json`.
-Loading a blink model does not bypass failed validation. Method changes disarm
-without clearing either model. See the [double-blink workflow](docs/brainbit.md#deliberate-double-blink-clicks)
-for calibration details. This is learned eye-movement waveform detection;
-automated tests do not establish your headset's end-to-end response time.
+See the [BrainBit guide](docs/brainbit.md) for calibration, recovery, data handling,
+and tests, and [hand tracking](docs/hand-tracking.md) for camera model choices.
 
 ### Terminal
 
@@ -1102,7 +1039,8 @@ Edit `config/config.yaml`:
 
 ```yaml
 backend: ollama
-model: gpt-oss:20b         # must match what you pulled with `ollama pull`
+model: qwen3:4b-instruct-2507-q4_K_M # must match what you pulled with `ollama pull`
+num_ctx: 8192             # per-request context; larger values use more GPU memory
 temperature: 0.2
 max_tokens: 600
 timezone: America/New_York # reminders are parsed in this zone, stored as UTC
@@ -1162,7 +1100,7 @@ gestures:
   camera_index: 0     # first webcam; raise this if you have several
   desktop_mode: auto # auto = smooth when supported; shortcut = measured steps
   travel_palms: 1.2  # 0.8–3.0; smaller values need less hand travel
-  tracker_backend: wilor # NVIDIA GPU; alternatives: mediapipe, rtmpose
+  tracker_backend: mediapipe # CPU tracking for the laptop; optional GPU trackers: wilor, rtmpose
   model_complexity: 1 # MediaPipe only: 1 = full; 0 = light
 ```
 

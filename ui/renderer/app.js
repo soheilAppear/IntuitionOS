@@ -30,7 +30,9 @@
  */
 
 const { ipcRenderer } = require('electron');
-const { readCameraPreview } = require('./camera-preview.cjs');
+const { readCameraPreview, readCameraPrivacy } = require('./camera-preview.cjs');
+const { createCameraPrivacyIndicator } = require('./camera-privacy.cjs');
+const { drawHandOverlay } = require('./hand-overlay.cjs');
 const { requestBrainbit } = require('./brainbit-http.cjs');
 const { createMultimodalPanel } = require('./multimodal-panel.cjs');
 
@@ -296,6 +298,7 @@ function updateConnectionUI() {
   renderBrainbitUI();
   syncBrainbitPolling();
   multimodalPanel.connectionChanged();
+  cameraPrivacy.connectionChanged();
 }
 
 /** Change only the mode; a pending action still needs its own explicit answer. */
@@ -406,6 +409,7 @@ function handleMessage(msg) {
       onBrainbitStatus(msg);
       break;
     case 'multimodal_status':
+      cameraPrivacy.accept(msg.camera_privacy);
       multimodalPanel.acceptStatus(msg);
       break;
     case 'gesture':
@@ -457,6 +461,7 @@ function handleMessage(msg) {
 // ── Handlers ──
 
 function onStatus(msg) {
+  cameraPrivacy.accept(msg.camera_privacy || msg.multimodal?.camera_privacy);
   if (msg.voice) onVoiceStatus(msg.voice);
   if (msg.gestures) onGestureStatus(msg.gestures);
   if (msg.brainbit) onBrainbitStatus(msg.brainbit);
@@ -710,11 +715,13 @@ confirmDeny.addEventListener('click',  () => answerConfirm(false));
 // ── Camera hand tracking ──
 
 function onGestureStatus(msg) {
+  cameraPrivacy.accept(msg.camera_privacy); // Aggregate includes the separately owned EEG camera.
   if (msg.click_sound) onClickSound(msg.click_sound);
   if (typeof msg.running !== 'boolean') return;
   const previousState = gestureStatus?.state;
   gestureStatus = { ...msg, state: msg.state || (msg.running ? 'running' : 'off') };
-  cameraMayBeRunning = msg.running || ['starting', 'stopping'].includes(gestureStatus.state);
+  cameraMayBeRunning = msg.running || ['starting', 'stopping'].includes(gestureStatus.state)
+    || msg.camera_resource?.release_confirmed === false;
   if ((requestedGestures === true && ['starting', 'running', 'error', 'unavailable'].includes(gestureStatus.state))
       || (requestedGestures === false && ['off', 'stopping', 'error', 'unavailable'].includes(gestureStatus.state))) {
     requestedGestures = null;
@@ -747,6 +754,7 @@ function onGestureStatus(msg) {
 /** Reflect backend acknowledgement; losing a socket does not turn off its camera. */
 function gestureCleanupPending(status = gestureStatus) {
   return status?.tracker_cleanup_pending === true
+    || status?.camera_resource?.cleanup_pending === true || status?.camera_cleanup_pending === true
     || status?.navigation_cleanup_pending === true || status?.desktop?.cleanup_pending === true;
 }
 
@@ -768,14 +776,14 @@ function updateGestureUI() {
   gestureToggle.classList.toggle('active', !!running);
   gestureToggle.classList.toggle('busy', busy);
   gestureToggle.classList.toggle('error', !!problem);
-  gestureLabel.textContent = !known ? 'CAMERA ?'
+  gestureLabel.textContent = !known ? 'HAND ?'
     : requestedGestures === false && cleanupPending ? 'CLEANING…'
     : requestedGestures === false || state === 'stopping' ? 'STOPPING…'
     : requestedGestures === true || state === 'starting' ? 'STARTING…'
-    : running ? 'CAMERA ON'
+    : running ? 'HAND ON'
     : cleanupPending ? 'Retry cleanup'
-    : state === 'unavailable' ? 'CAMERA N/A'
-    : problem ? 'CAMERA ERROR' : 'CAMERA OFF';
+    : state === 'unavailable' ? 'HAND N/A'
+    : problem ? 'HAND ERROR' : 'HAND OFF';
   gestureToggle.title = !connected ? 'Camera status unknown: backend disconnected'
     : !known ? 'Waiting for camera status'
     : pending ? 'Waiting for camera acknowledgement…'
@@ -1353,9 +1361,6 @@ brainbitDisconnect.addEventListener('click', () => runBrainbitAction('disconnect
 brainbitRefresh.addEventListener('click', () => runBrainbitAction('refresh'));
 
 // Preview pulls reuse the recognizer's camera. Opening this panel never starts it.
-const HAND_CONNECTIONS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
-  [5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],
-  [13,17],[0,17],[17,18],[18,19],[19,20]];
 const HAND_POSE_NAMES = { open_palm: 'Open palm', fist: 'Fist', point: 'One finger',
   pinch: 'Pinch', two_finger: 'Two fingers', four_finger: 'Four fingers',
   thumbs_up: 'Thumbs up', none: 'Pose unclear' };
@@ -1424,30 +1429,7 @@ function renderGesturePreview(snapshot, epoch) {
     const width = gesturePreviewCanvas.width, height = gesturePreviewCanvas.height;
     context.clearRect(0, 0, width, height);
     context.drawImage(picture, 0, 0, width, height);
-    const region = snapshot.control_region;
-    if (snapshot.input_mode === 'mouse' && Array.isArray(region) && region.length === 4
-        && region.every(v => Number.isFinite(v) && v >= 0 && v <= 1)
-        && region[0] < region[2] && region[1] < region[3]) {
-      context.strokeStyle = '#93c5fd'; context.lineWidth = 1; context.setLineDash([5, 5]);
-      context.strokeRect(region[0] * width, region[1] * height,
-        (region[2] - region[0]) * width, (region[3] - region[1]) * height);
-      context.setLineDash([]); context.fillStyle = '#bfdbfe'; context.font = '12px sans-serif';
-      context.fillText('Pointer area', region[0] * width + 6, region[1] * height + 16);
-    }
-    const points = snapshot.landmarks;
-    if (snapshot.tracked && Array.isArray(points) && points.length === 21
-        && points.every(p => Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1]))) {
-      context.strokeStyle = '#5eead4'; context.lineWidth = 2;
-      context.beginPath();
-      for (const [a, b] of HAND_CONNECTIONS) {
-        context.moveTo(points[a][0] * width, points[a][1] * height);
-        context.lineTo(points[b][0] * width, points[b][1] * height);
-      }
-      context.stroke(); context.fillStyle = '#fef3c7';
-      for (const p of points) {
-        context.beginPath(); context.arc(p[0] * width, p[1] * height, 3, 0, Math.PI * 2); context.fill();
-      }
-    }
+    drawHandOverlay(context, snapshot, width, height); // Same image-aligned joints in both camera views.
     const raw = HAND_POSE_NAMES[snapshot.raw_pose] || 'Pose unclear';
     const effective = snapshot.effective_pose || snapshot.pose;
     const mouseStateNames = { mouse_pointer: 'Pointer active', mouse_arming: 'Hold to start',
@@ -1801,7 +1783,11 @@ function esc(str) {
 }
 
 // ── Boot ──
+const cameraPrivacy = createCameraPrivacyIndicator({ element: document.getElementById('camera-privacy'),
+  request: readCameraPrivacy, isConnected, schedule: setTimeout, cancel: clearTimeout, now: Date.now });
+document.addEventListener('visibilitychange', () => cameraPrivacy.refresh());
 const multimodalPanel = createMultimodalPanel({ document, isConnected,
+  onCameraPrivacy: data => cameraPrivacy.accept(data),
   isCameraRunning: () => gestureStatus?.running === true || requestedGestures === true
     || ['starting', 'stopping'].includes(gestureStatus?.state),
   isBrainbitConnected: () => brainbitReady && brainbitStatus?.state === 'connected',

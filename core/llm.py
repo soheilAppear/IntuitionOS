@@ -6,6 +6,10 @@ import os
 import requests
 
 
+DEFAULT_MODEL = "qwen3:4b-instruct-2507-q4_K_M"
+DEFAULT_NUM_CTX = 8192
+
+
 class LLMError(RuntimeError):
     """A failure to get a reply, distinguishable from a reply that says "error".
 
@@ -18,12 +22,16 @@ class LLMError(RuntimeError):
 
 class LLMClient:
     def __init__(self, backend: str, model: str, temperature: float, max_tokens: int,
-                 connect_timeout: float = 5.0, read_timeout: float = 120.0):
+                 connect_timeout: float = 5.0, read_timeout: float = 120.0,
+                 *, num_ctx: int = DEFAULT_NUM_CTX):
         # Save fields
         self.backend = backend
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        # Bound the KV cache per request instead of inheriting a machine-wide
+        # Ollama context setting that may exhaust a laptop GPU's memory.
+        self.num_ctx = num_ctx
         # Split connect from read (Appendix A #14): a machine with no Ollama at
         # all should fail in seconds, while a 20B model on consumer hardware is
         # allowed to think for as long as it needs.
@@ -59,7 +67,11 @@ class LLMClient:
         payload = {
             "model": self.model,
             "messages": messages,
-            "options": {"temperature": self.temperature, "num_predict": self.max_tokens},
+            "options": {
+                "temperature": self.temperature,
+                "num_predict": self.max_tokens,
+                "num_ctx": self.num_ctx,
+            },
             "stream": stream,
         }
         if json_mode:

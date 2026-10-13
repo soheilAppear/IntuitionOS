@@ -1,0 +1,256 @@
+[
+  {
+    "revision": 0,
+    "state": "stopped",
+    "running": false,
+    "cleanup_pending": false,
+    "reason": "Preview is off. Start explicitly to acquire camera and EEG.",
+    "error": null,
+    "control_mode": "eeg_click",
+    "eeg_control": {
+      "armed": false,
+      "method": "cnn_blink_fast",
+      "target": "mouse",
+      "window_seconds": 1.0,
+      "trial_seconds": 1.0,
+      "click_cooldown_seconds": 1.0,
+      "can_arm": false,
+      "reason": "Collect labelled training trials, freeze the model, then collect held-out validation trials.",
+      "last_disarm_reason": null,
+      "signal_quality_paused": false,
+      "signal_quality_reason": null,
+      "can_eeg_click": false,
+      "camera_required": true,
+      "camera_mouse_enabled": true,
+      "saved_model_source": null,
+      "guard_ready": false,
+      "prediction": null,
+      "decoder": {
+        "state": "collecting",
+        "labels": [
+          "rest",
+          "select"
+        ],
+        "feature_profile": "cnn_blink_fast_endpoint_v1",
+        "detector_version": 1,
+        "trained": false,
+        "passed_validation": false,
+        "arm_eligible": false,
+        "experimental": true,
+        "can_train": false,
+        "training_counts": {
+          "rest": 0,
+          "select": 0
+        },
+        "train_counts": {
+          "rest": 0,
+          "select": 0
+        },
+        "validation_counts": {
+          "rest": 0,
+          "select": 0
+        },
+        "min_per_class": 8,
+        "total": 0,
+        "max_training_trials": 48,
+        "context": null,
+        "inference_context_bound": false,
+        "validation_scope": "held_out_one_second_trials",
+        "parameter_count": 5270,
+        "window_seconds": 1.0,
+        "trial_seconds": 1.0,
+        "cooldown_seconds": 1.0,
+        "fresh_context_seconds": 0.0,
+        "prediction_interval_seconds": 0.04,
+        "ready_for_blink": false,
+        "suppressed_evidence_remaining_seconds": 0.0,
+        "evaluation": {
+          "complete": false,
+          "passed": false,
+          "confusion": {
+            "rest": {
+              "rest": 0,
+              "select": 0,
+              "uncertain": 0
+            },
+            "select": {
+              "rest": 0,
+              "select": 0,
+              "uncertain": 0
+            }
+          },
+          "accuracy": null,
+          "per_class": {
+            "rest": {
+              "support": 0,
+              "recall": 0,
+              "precision": 0.0
+            },
+            "select": {
+              "support": 0,
+              "recall": 0,
+              "precision": 0.0
+            }
+          },
+          "abstentions": 0,
+          "balanced_accuracy": null,
+          "rest_false_activations": 0,
+          "rest_trials": 0,
+          "rest_false_activation_rate": null
+        },
+        "feature_processing": "One-second four-channel waveform, pair-averaged to 125 Hz; DC/linear-drift removal and robust scaling; causal dilated endpoint CNN. Requires fresh calibration for this profile.",
+        "disclaimer": "Held-out results classify one-second trials, not measured physical blink-completion latency. Continuous false-click rate, overlapping-window behavior, and latency require live assessment. CNN scores are not calibrated probabilities."
+      },
+      "pending": null,
+      "neutral_ready": false,
+      "hand_pointer": {
+        "required": false,
+        "enabled": true,
+        "ready": false,
+        "state": "mouse_paused",
+        "hint": "Arm hand aiming explicitly."
+      },
+      "click_count": 0,
+      "finger_click_count": 0,
+      "last_result": null
+    },
+    "camera": {
+      "running": null,
+      "tracked": null,
+      "sequence": null,
+      "age_ms": null,
+      "fps": null,
+      "timing": {},
+      "owned": false
+    },
+    "eeg": {},
+    "timing_note": "Voluntary double-blink waveform detection, not intent decoding. EEG timing uses approximate host timestamps; held-out trial accuracy does not measure physical click latency."
+  },
+  {
+    "revision": 0,
+    "state": "stopped",
+    "running": false,
+    "cleanup_pending": false,
+    "reason": "Preview is off. Start explicitly to acquire camera and EEG.",
+    "error": null,
+    "control_mode": "eeg_click",
+    "eeg_control": {
+      "armed": false,
+      "method": "cnn_blink_fast",
+      "target": "mouse",
+      "window_seconds": 1.0,
+      "trial_seconds": 1.0,
+      "click_cooldown_seconds": 1.0,
+      "can_arm": false,
+      "reason": "Collect labelled training trials, freeze the model, then collect held-out validation trials.",
+      "last_disarm_reason": null,
+      "signal_quality_paused": false,
+      "signal_quality_reason": null,
+      "can_eeg_click": false,
+      "camera_required": false,
+      "camera_mouse_enabled": false,
+      "saved_model_source": null,
+      "guard_ready": false,
+      "prediction": null,
+      "decoder": {
+        "state": "collecting",
+        "labels": [
+          "rest",
+          "select"
+        ],
+        "feature_profile": "cnn_blink_fast_endpoint_v1",
+        "detector_version": 1,
+        "trained": false,
+        "passed_validation": false,
+        "arm_eligible": false,
+        "experimental": true,
+        "can_train": false,
+        "training_counts": {
+          "rest": 0,
+          "select": 0
+        },
+        "train_counts": {
+          "rest": 0,
+          "select": 0
+        },
+        "validation_counts": {
+          "rest": 0,
+          "select": 0
+        },
+        "min_per_class": 8,
+        "total": 0,
+        "max_training_trials": 48,
+        "context": null,
+        "inference_context_bound": false,
+        "validation_scope": "held_out_one_second_trials",
+        "parameter_count": 5270,
+        "window_seconds": 1.0,
+        "trial_seconds": 1.0,
+        "cooldown_seconds": 1.0,
+        "fresh_context_seconds": 0.0,
+        "prediction_interval_seconds": 0.04,
+        "ready_for_blink": false,
+        "suppressed_evidence_remaining_seconds": 0.0,
+        "evaluation": {
+          "complete": false,
+          "passed": false,
+          "confusion": {
+            "rest": {
+              "rest": 0,
+              "select": 0,
+              "uncertain": 0
+            },
+            "select": {
+              "rest": 0,
+              "select": 0,
+              "uncertain": 0
+            }
+          },
+          "accuracy": null,
+          "per_class": {
+            "rest": {
+              "support": 0,
+              "recall": 0,
+              "precision": 0.0
+            },
+            "select": {
+              "support": 0,
+              "recall": 0,
+              "precision": 0.0
+            }
+          },
+          "abstentions": 0,
+          "balanced_accuracy": null,
+          "rest_false_activations": 0,
+          "rest_trials": 0,
+          "rest_false_activation_rate": null
+        },
+        "feature_processing": "One-second four-channel waveform, pair-averaged to 125 Hz; DC/linear-drift removal and robust scaling; causal dilated endpoint CNN. Requires fresh calibration for this profile.",
+        "disclaimer": "Held-out results classify one-second trials, not measured physical blink-completion latency. Continuous false-click rate, overlapping-window behavior, and latency require live assessment. CNN scores are not calibrated probabilities."
+      },
+      "pending": null,
+      "neutral_ready": false,
+      "hand_pointer": {
+        "required": false,
+        "enabled": false,
+        "ready": false,
+        "state": "mouse_paused",
+        "hint": "Arm hand aiming explicitly."
+      },
+      "click_count": 0,
+      "finger_click_count": 0,
+      "last_result": null
+    },
+    "camera": {
+      "running": null,
+      "tracked": null,
+      "sequence": null,
+      "age_ms": null,
+      "fps": null,
+      "timing": {},
+      "owned": false
+    },
+    "eeg": {},
+    "timing_note": "Voluntary double-blink waveform detection, not intent decoding. EEG timing uses approximate host timestamps; held-out trial accuracy does not measure physical click latency."
+  }
+]

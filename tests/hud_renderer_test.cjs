@@ -46,6 +46,7 @@ function renderer({ connected = true } = {}) {
   document.createTextNode = text => Object.assign(new Element('#text'), { textContent: text });
   const sent = [];
   const cameraRequests = [];
+  const privacyRequests = [];
   const brainbitRequests = [];
   const sockets = [];
   const timers = [];
@@ -70,7 +71,9 @@ function renderer({ connected = true } = {}) {
       : name === './camera-preview.cjs' ? { readCameraPreview: () => new Promise((resolve, reject) => {
         cameraRequests.push({ url: 'http://127.0.0.1:7432/gestures/preview', method: 'GET',
           resolve: async response => response.ok ? resolve(await response.json()) : reject(new Error('Unavailable')), reject });
-      }) }
+      }), readCameraPrivacy: () => new Promise((resolve, reject) => privacyRequests.push({ resolve, reject })) }
+      : ['./camera-privacy.cjs', './hand-overlay.cjs'].includes(name)
+        ? require(path.join(__dirname, '../ui/renderer', name))
       : name === './brainbit-http.cjs' ? { requestBrainbit: (action, deviceId) => new Promise((resolve, reject) => {
         brainbitRequests.push({ action, deviceId, resolve, reject });
       }) }
@@ -104,7 +107,7 @@ function renderer({ connected = true } = {}) {
     sockets.at(-1).open();
   };
   return {
-    elements, sent, context, input, change, key, message, show, reconnect, sockets, cameraRequests, brainbitRequests, images, drawing, timers,
+    elements, sent, context, input, change, key, message, show, reconnect, sockets, cameraRequests, privacyRequests, brainbitRequests, images, drawing, timers,
     voiceToggle: () => ipcHandlers['voice-toggle'](),
     nativeMessage: (name, value) => ipcHandlers[name]({}, value), ipcSent,
     get socket() { return sockets.at(-1); },
@@ -127,6 +130,38 @@ function previewFrame(extra = {}) {
     fps: 25, model_name: 'MediaPipe Hands Full', state: 'desktop', progress: -0.6,
     hint: 'Next desktop; make a fist to release', last_cancel_reason: '', ...extra };
 }
+
+test('persistent camera privacy reports EEG ownership while standalone hand controls and both previews are off', async () => {
+  const r = renderer();
+  const privacy = { state: 'on', in_use: true, release_confirmed: false, owners: ['eeg'], revision: 2, instance_id: 'backend1' };
+  r.message({ type: 'gesture_status', running: false, state: 'off', available: true, camera_privacy: privacy });
+  assert.equal(r.elements.get('gesture-label').textContent, 'HAND OFF');
+  assert.equal(r.elements.get('camera-privacy').textContent, 'CAMERA ON');
+  assert.ok(r.elements.get('camera-privacy').classList.contains('in-use'));
+  r.elements.get('gesture-guide').open = false;
+  r.elements.get('gesture-preview-toggle').checked = false;
+  r.elements.get('gesture-preview-toggle').dispatch('change');
+  assert.equal(r.cameraRequests.length, 0); // Privacy polling requests no image and no start.
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(r.privacyRequests.length, 1);
+  r.privacyRequests[0].resolve({ camera_privacy: { ...privacy, state: 'off', in_use: false,
+    release_confirmed: true, owners: [], revision: 1 } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(r.elements.get('camera-privacy').textContent, 'CAMERA ON');
+  r.socket.close();
+  assert.equal(r.elements.get('camera-privacy').textContent, 'CAMERA ?');
+  assert.ok(r.elements.get('camera-privacy').classList.contains('uncertain'));
+});
+
+test('failed native capture release offers Stop cleanup instead of reopening the camera', async () => {
+  const r = renderer();
+  r.message({ type: 'gesture_status', running: false, state: 'error', available: true,
+    camera_resource: { state: 'release_failed', in_use: true, release_confirmed: false, cleanup_pending: true } });
+  assert.equal(r.elements.get('gesture-label').textContent, 'Retry cleanup');
+  assert.equal(r.elements.get('gesture-model').disabled, true);
+  r.elements.get('gesture-toggle').dispatch('click');
+  assert.deepEqual(r.cameraRequests[0].body, { enabled: false });
+});
 
 test('preview is opt in and does not start or double-open a camera', async () => {
   const r = renderer();
@@ -437,7 +472,7 @@ test(`${backend} selection preserves the MediaPipe tier and never starts the cam
   } }) });
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(r.elements.get('gesture-model').value, backend);
-  assert.equal(r.elements.get('gesture-label').textContent, 'CAMERA OFF');
+  assert.equal(r.elements.get('gesture-label').textContent, 'HAND OFF');
   assert.equal(r.cameraRequests.length, 1);
   assert.ok(!r.sent.some(m => m.type === 'input'));
   r.elements.get('gesture-model').value = '1';
@@ -621,7 +656,7 @@ test('click sound can be muted live without stopping pointer control', async () 
   r.cameraRequests[0].resolve({ ok: true, json: async () => ({ click_sound: { enabled: false, available: true } }) });
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(r.elements.get('hand-click-sound').textContent, 'Sound off');
-  assert.equal(r.elements.get('gesture-label').textContent, 'CAMERA ON');
+  assert.equal(r.elements.get('gesture-label').textContent, 'HAND ON');
   r.message({ type: 'gesture_click', id: 'session:1', source: 'pinch' });
   assert.equal(r.elements.get('hand-click-feedback').textContent, 'Clicked · pinch');
   assert.equal(r.cameraRequests.length, 1);
@@ -692,13 +727,13 @@ test('camera toggle waits for status and acknowledgement without submitting or e
   r.message({ type: 'gesture_status', available: true, running: true, state: 'running', text: 'Watching for gestures.' });
   assert.equal(button.attributes['aria-checked'], 'true');
   assert.equal(button.attributes['aria-busy'], 'false');
-  assert.equal(r.elements.get('gesture-label').textContent, 'CAMERA ON');
+  assert.equal(r.elements.get('gesture-label').textContent, 'HAND ON');
   button.dispatch('click');
   assert.deepEqual(r.cameraRequests.at(-1).body, { enabled: false });
   assert.equal(button.attributes['aria-checked'], 'true', 'camera stays visibly on until release is acknowledged');
   r.message({ type: 'gesture_status', available: true, running: false, state: 'off', text: 'Gestures are off.' });
   assert.equal(button.attributes['aria-checked'], 'false');
-  assert.equal(r.elements.get('gesture-label').textContent, 'CAMERA OFF');
+  assert.equal(r.elements.get('gesture-label').textContent, 'HAND OFF');
 });
 
 test('camera startup can be cancelled and stopping blocks a second start', () => {
@@ -754,7 +789,7 @@ for (const [cleanupType, cleanupFields] of [
       tracker_backend: 'rtmpose', input_mode: 'mouse',
     } }) });
     await new Promise(resolve => setImmediate(resolve));
-    assert.equal(r.elements.get('gesture-label').textContent, 'CAMERA OFF');
+    assert.equal(r.elements.get('gesture-label').textContent, 'HAND OFF');
     assert.equal(r.elements.get('gesture-model').disabled, false);
     assert.equal(r.elements.get('gesture-desktop-mode').disabled, false);
     assert.equal(r.elements.get('gesture-travel').disabled, false);
@@ -781,7 +816,7 @@ test('camera availability errors are visible and recoverable startup errors allo
   r.message({ type: 'gesture_status', available: true, running: false, state: 'off', text: 'Gestures are off.' });
   assert.equal(button.attributes['aria-busy'], 'false');
   assert.match(r.elements.get('gesture-status').textContent, /Camera is in use/);
-  assert.equal(r.elements.get('gesture-label').textContent, 'CAMERA ERROR');
+  assert.equal(r.elements.get('gesture-label').textContent, 'HAND ERROR');
 });
 
 test('disconnect keeps camera state unknown and reconnect never replays its toggle', () => {
@@ -789,14 +824,14 @@ test('disconnect keeps camera state unknown and reconnect never replays its togg
   r.message({ type: 'status', gestures: { available: true, running: true, state: 'running', text: 'Watching for gestures.' } });
   r.elements.get('gesture-toggle').dispatch('click');
   r.socket.close();
-  assert.equal(r.elements.get('gesture-label').textContent, 'CAMERA ?');
+  assert.equal(r.elements.get('gesture-label').textContent, 'HAND ?');
   assert.match(r.elements.get('gesture-status').textContent, /may still be running/);
   const count = r.cameraRequests.length;
   r.reconnect();
   assert.equal(r.cameraRequests.length, count);
   assert.equal(r.elements.get('gesture-toggle').attributes['aria-disabled'], 'true');
   r.message({ type: 'status', gestures: { available: true, running: false, state: 'off', text: 'Gestures are off.' } });
-  assert.equal(r.elements.get('gesture-label').textContent, 'CAMERA OFF');
+  assert.equal(r.elements.get('gesture-label').textContent, 'HAND OFF');
   assert.ok(!r.elements.get('gesture-strip').classList.contains('visible'));
 });
 
@@ -808,7 +843,7 @@ test('camera request failure clears pending controls without pretending the came
   await new Promise(resolve => setImmediate(resolve));
   r.message({ type: 'gesture_status', available: true, running: true, state: 'running' });
   assert.equal(vm.runInContext('requestedGestures', r.context), null);
-  assert.equal(r.elements.get('gesture-label').textContent, 'CAMERA ON');
+  assert.equal(r.elements.get('gesture-label').textContent, 'HAND ON');
   assert.match(r.elements.get('gesture-status').textContent, /could not be confirmed/);
 });
 
@@ -830,7 +865,7 @@ test('camera stop uses its own request while a command reply is pending', async 
     available: true, running: false, state: 'off', text: 'The camera is released.',
   } }) });
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(r.elements.get('gesture-label').textContent, 'CAMERA OFF');
+  assert.equal(r.elements.get('gesture-label').textContent, 'HAND OFF');
   assert.ok(r.elements.get('thinking-indicator').classList.contains('active'));
 });
 
@@ -846,7 +881,7 @@ test('a late camera response cannot overwrite fresh status after reconnection', 
     available: true, running: true, state: 'running',
   } }) });
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(r.elements.get('gesture-label').textContent, 'CAMERA OFF');
+  assert.equal(r.elements.get('gesture-label').textContent, 'HAND OFF');
   assert.equal(r.cameraRequests.length, 1, 'reconnect must not replay the camera start');
 });
 

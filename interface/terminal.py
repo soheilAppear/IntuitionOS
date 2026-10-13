@@ -22,7 +22,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 
-from core.llm import LLMClient
+from core.llm import DEFAULT_MODEL, DEFAULT_NUM_CTX, LLMClient
 from core.file_intents import try_file_intent
 from core.memory import Memory
 from core.retrieval import Retriever
@@ -397,9 +397,10 @@ def bootstrap():
 
     llm = LLMClient(
         cfg.get("backend", "ollama"),
-        cfg.get("model", "gpt-oss:20b"),
+        cfg.get("model", DEFAULT_MODEL),
         cfg.get("temperature", 0.2),
         cfg.get("max_tokens", 600),
+        num_ctx=int(cfg.get("num_ctx", DEFAULT_NUM_CTX)),
     )
     bcfg = cfg.get("brain", {}) or {}
     rcfg = cfg.get("retrieval", {}) or {}

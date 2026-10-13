@@ -247,15 +247,52 @@ def test_curled_pinch_to_fist_cancels_without_click(mouse, held, thumb_separated
 def test_gradual_pinch_keeps_arming_and_clicks_once_after_release(mouse):
     controller, device = mouse
     arm(controller)
-    controller.update(pinch_distance(0.7), 0.25)
-    frozen = list(device.events)
-    assert controller.update(pinch_distance(0.5), 0.30)["state"] == "mouse_pointer"
-    assert controller.update(pinch_distance(0.4), 0.35)["state"] == "mouse_pointer"
-    assert device.events == frozen
-    assert controller.update(pinch_distance(0.3), 0.40)["state"] == "mouse_pinch"
-    assert controller.update(pinch_distance(0.45), 0.45)["state"] == "mouse_pinch"
-    assert controller.update(pinch_distance(0.6), 0.50)["state"] == "mouse_clicked"
+    at = settle_pointer(controller)
+    original = controller._cursor
+    controller.update(pinch_distance(0.7), at + 0.05)
+    assert controller.update(pinch_distance(0.5), at + 0.10)["state"] == "mouse_pointer"
+    assert controller.update(pinch_distance(0.4), at + 0.15)["state"] == "mouse_pointer"
+    assert controller._cursor == pytest.approx(original, abs=1e-6)
+    assert buttons(device) == []
+    frozen = list(device.events)  # Only actual contact freezes the click target.
+    assert controller.update(pinch_distance(0.3), at + 0.20)["state"] == "mouse_pinch"
+    assert controller.update(pinch_distance(0.45), at + 0.25)["state"] == "mouse_pinch"
+    assert controller.update(pinch_distance(0.6), at + 0.30)["state"] == "mouse_clicked"
     assert device.events == frozen + [("down",), ("up",)]
+
+
+@pytest.mark.parametrize("fps", [18, 30, 60])
+@pytest.mark.parametrize("combined", [False, True])
+def test_near_pinch_noise_does_not_discard_intentional_hand_travel(fps, combined):
+    device = Device()
+    controller = HandMouseController(device_factory=lambda: device, eeg_compatible=combined)
+    arm(controller)
+    at = settle_pointer(controller)
+    original = controller._cursor
+    for frame in range(1, fps + 1):
+        points = pinch_distance(0.54 if frame % 2 else 0.56)
+        points = [[x + 0.09 * frame / fps, y, z] for x, y, z in points]
+        feedback = controller.update(points, at + frame / fps)
+        assert feedback["state"] == "mouse_pointer"
+        if combined:
+            assert feedback["finger_action_active"] is False
+    assert controller._cursor[0] - original[0] > 0.12
+    assert buttons(device) == []
+
+
+def test_near_pinch_motion_still_respects_an_explicit_eeg_target_hold():
+    device = Device()
+    controller = HandMouseController(device_factory=lambda: device, eeg_compatible=True)
+    arm(controller)
+    at = settle_pointer(controller)
+    before = list(device.events)
+    for frame in range(1, 19):
+        points = pinch_distance(0.54 if frame % 2 else 0.56)
+        points = [[x + 0.005 * frame, y, z] for x, y, z in points]
+        controller.update(points, at + frame / 18, hold=True)
+    assert device.events == before
+    controller.update(hand(dx=0.09), at + 1.1, hold=False)
+    assert device.events == before  # Releasing a true hold only reanchors.
 
 
 def test_gradual_pinch_band_does_not_count_toward_drag_hold(mouse):
@@ -1171,6 +1208,7 @@ def test_eeg_compatible_pinch_click_keeps_priority_during_eeg_hold(eeg_mouse, ho
     clicked = controller.update(hand(), 0.35, hold=hold)
     assert clicked["click_id"] == 1 and clicked["click_source"] == "pinch"
     assert clicked["finger_active"] is True and clicked["pointer_ready"] is False
+    assert clicked["finger_action_active"] is True
     assert clicked["button_down"] is False
     assert device.events == before + [("down",), ("up",)]
     assert controller.update(hand(), 0.40, hold=hold)["finger_active"] is False
@@ -1183,9 +1221,11 @@ def test_eeg_compatible_pinch_approach_and_short_release_block_eeg_completion(ee
     approach = controller.update(pinch_distance(0.45), 0.25, hold=True)
     assert approach["state"] == "mouse_pointer"
     assert approach["finger_active"] is True and approach["pointer_ready"] is False
+    assert approach["finger_action_active"] is False
     controller.update(hand("pinch"), 0.30, hold=True)
     released = controller.update(hand(), 0.33, hold=True)
     assert released["finger_active"] is True and released["pointer_ready"] is False
+    assert released["finger_action_active"] is True
     assert "click_id" not in released
     assert released["button_down"] is False and buttons(device) == []
 
@@ -1219,6 +1259,7 @@ def test_eeg_compatible_drag_overrides_hold_then_resumes_without_jump(eeg_mouse)
     controller.update(hand("pinch"), 0.48, hold=True)
     dragging = controller.update(hand("pinch"), 0.64, hold=True)
     assert dragging["button_down"] is True and dragging["finger_active"] is True
+    assert dragging["finger_action_active"] is True
     assert dragging["pointer_ready"] is False
     before = device.events[-1][1:]
     controller.update(hand("pinch", dx=0.06), 0.76, hold=True)
@@ -1230,6 +1271,7 @@ def test_eeg_compatible_drag_overrides_hold_then_resumes_without_jump(eeg_mouse)
     events = list(device.events)
     resumed = controller.update(hand(dx=0.15), 0.92, hold=False)
     assert resumed["pointer_ready"] is True and resumed["finger_active"] is False
+    assert resumed["finger_action_active"] is False
     assert device.events == events
     controller.update(hand(dx=0.15), 0.97)
     assert device.events[-1][1:] == pytest.approx(after)

@@ -16,6 +16,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -54,7 +55,7 @@ from core.command_resolver import (
 from core.episodes import EpisodeLog, PredictionWindow
 from core.predictor import Predictor, PredictorStore
 from core.logger import make_logger
-from core.llm import LLMClient
+from core.llm import DEFAULT_MODEL, DEFAULT_NUM_CTX, LLMClient
 from core.memory import Memory
 from core.retrieval import Retriever
 from core.scheduler import Scheduler
@@ -63,9 +64,7 @@ from core.hand_control import HandControls
 from core.hand_feedback import HandClickSound
 from core.multimodal import MultimodalPreview
 from core.eeg_click import EegClickController  # The explicit EEG mode gets only a lazy, current-pointer left-click actuator.
-from core.eeg_model_store import load_latest_decoder, save_archive  # Inert JSON calibration only; no executable model formats.
-from core.eeg_blink_store import load_latest_decoder as load_latest_blink_decoder, save_archive as save_blink_archive  # Blink evidence has a separate archive and strict decoder validation.
-from core.eeg_blink_store import load_latest_calibration, save_calibration_archive  # Untrained progress uses a distinct schema and cannot authorize input.
+from core.eeg_fast_blink_store import load_latest_decoder as load_latest_fast_cnn_decoder, save_archive as save_fast_cnn_archive  # Only the validated one-second profile is supported.
 from core.hand_mouse import HandMouseController  # Keep hand aiming and finger clicks while coordinating the additional EEG trigger.
 from core.voice import VoiceRecognizer
 from plugins.brainbit import BrainBit
@@ -73,9 +72,7 @@ from plugins.brainbit import BrainBit
 # Shared services are created during lifespan, rather than per HUD connection.
 _state: dict = {}
 # Saved EEG data stays inside this repository's ignored local data directory.
-_EEG_MODEL_DIRECTORY = Path(__file__).resolve().parent.parent / "data" / "eeg-models"
-_EEG_BLINK_MODEL_DIRECTORY = Path(__file__).resolve().parent.parent / "data" / "eeg-blink-models"  # Never overwrite or select the original eyes-closed calibration for blink control.
-_EEG_BLINK_CALIBRATION_DIRECTORY = Path(__file__).resolve().parent.parent / "data" / "eeg-blink-drafts"  # Canonical progress files are separate from frozen model archives.
+_EEG_FAST_CNN_MODEL_DIRECTORY = Path(__file__).resolve().parent.parent / "data" / "eeg-fast-cnn-blink-models"
 _clients: set = set()
 # One prediction window per connection: what the user is typing, and what we put
 # in front of them. Keyed by socket so two HUDs do not credit each other's hints.
@@ -88,6 +85,64 @@ _confirmations: dict = {}
 # A dispatch fills in the outcome of the input currently handled on that socket.
 _active_notes: dict = {}
 _executor = ThreadPoolExecutor(max_workers=4)
+_camera_privacy_lock = threading.Lock()  # Serialize snapshots from HTTP and WebSocket readers.
+_camera_privacy_instance = str(uuid.uuid4())  # A restarted backend starts a new revision sequence.
+_camera_privacy_revision = 0
+_camera_privacy_previous = None
+
+
+def _camera_privacy_info():
+    """Report native camera ownership, independently of visible panels or hands."""
+    global _camera_privacy_revision, _camera_privacy_previous
+    with _camera_privacy_lock:
+        resources = []  # Both camera modes use the same capture-lifetime contract.
+        for owner, key in (("hand", "gestures"), ("eeg", "preview_camera")):
+            camera = _state.get(key)
+            if camera is None:
+                continue  # An unconstructed recognizer cannot own a capture handle.
+            try:
+                resource = camera.status().get("camera_resource")
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                resource = None  # Failed status reads cannot establish that capture stopped.
+            valid = (isinstance(resource, dict) and isinstance(resource.get("state"), str)
+                     and resource["state"] in ("released", "opening", "open", "releasing", "release_failed")
+                     and (resource.get("in_use") is None or type(resource.get("in_use")) is bool)
+                     and type(resource.get("release_confirmed")) is bool
+                     and resource["release_confirmed"] is (resource["state"] == "released")
+                     and (resource["state"] != "released" or resource["in_use"] is False and not resource.get("cleanup_pending"))
+                     and (resource["state"] != "open" or resource["in_use"] is True))
+            if not valid:
+                resource = {"state": "unknown", "in_use": None, "release_confirmed": False}
+            resources.append((owner, resource))
+        owners = [owner for owner, resource in resources if resource.get("release_confirmed") is not True]
+        active = any(resource.get("in_use") is True for _, resource in resources)
+        states = {resource.get("state") for _, resource in resources}
+        released = all(resource.get("state") == "released" and resource.get("in_use") is False
+                       and resource.get("release_confirmed") is True for _, resource in resources)
+        if released:
+            state, in_use = "off", False  # Turn off only after every owner confirms release.
+        elif states - {"released", "opening", "open", "releasing"}:
+            state, in_use = "unknown", True if active else None  # Failed release stays visibly uncertain/on.
+        elif "open" in states:
+            state, in_use = "on", True  # A live capture counts even without a tracked hand.
+        elif "releasing" in states:
+            state, in_use = "stopping", True if active else None  # Stop requests are not release acknowledgments.
+        else:
+            state, in_use = "starting", True if active else None  # Native opening may still be in progress.
+        current = {"state": state, "in_use": in_use, "release_confirmed": released, "owners": owners}
+        if current != _camera_privacy_previous:
+            _camera_privacy_revision += 1  # Let the HUD reject older replies delivered out of order.
+            _camera_privacy_previous = current
+        return {**current, "owners": list(owners), "revision": _camera_privacy_revision,
+                "instance_id": _camera_privacy_instance}
+
+
+def _camera_resource_busy(status):
+    """A failed/unfinished native release still excludes another camera owner."""
+    resource = status.get("camera_resource")
+    return isinstance(resource, dict) and (resource.get("release_confirmed") is not True
+                                          or resource.get("in_use") is not False
+                                          or bool(resource.get("cleanup_pending")))
 
 
 def _load_config():
@@ -137,19 +192,21 @@ def _brainbit_info():
 
 def _multimodal_info():
     preview = _state.get("multimodal")
-    return preview.status() if preview else {
+    info = preview.status() if preview else {
         "state": "unavailable", "running": False, "armed": False,
         "reason": "Restart the backend to enable the combined preview."}
+    return {**info, "camera_privacy": _camera_privacy_info()}  # Keep ownership visible with the EEG panel closed.
 
 
 def _multimodal_busy():
     info = _multimodal_info()
     camera = _state.get("preview_camera")
-    return (info.get("state") in ("starting", "running", "contact", "stopping")
+    return (info.get("state") in ("starting", "running", "stopping")
             or bool(info.get("cleanup_pending"))
             or (camera is not None and (camera.is_running()
                 or camera.status().get("state") in ("starting", "stopping")
-                or camera.status().get("tracker_cleanup_pending"))))
+                or camera.status().get("tracker_cleanup_pending")
+                or _camera_resource_busy(camera.status()))))
 
 
 async def _poll_brainbit(driver):
@@ -287,7 +344,8 @@ def _gesture_info() -> dict:
     gestures = _state.get("gestures")
     if gestures is None:
         return {"state": "unavailable", "available": False, "running": False,
-                "text": "Gesture recognition is unavailable.", "bindings": {}}
+                "text": "Gesture recognition is unavailable.", "bindings": {},
+                "camera_privacy": _camera_privacy_info()}
     info = gestures.status()
     controls = _state.get("hand_controls")
     if controls:
@@ -295,6 +353,7 @@ def _gesture_info() -> dict:
     info["settings"] = dict(_state.get("gesture_settings", {}))
     if _state.get("hand_click_sound"):
         info["click_sound"] = _state["hand_click_sound"].status()
+    info["camera_privacy"] = _camera_privacy_info()  # The EEG recognizer may own the camera while hand controls are off.
     return info
 
 
@@ -397,9 +456,10 @@ async def lifespan(app: FastAPI):
 
     llm = LLMClient(
         cfg.get("backend", "ollama"),
-        cfg.get("model", "gpt-oss:20b"),
+        cfg.get("model", DEFAULT_MODEL),
         cfg.get("temperature", 0.2),
         cfg.get("max_tokens", 600),
+        num_ctx=int(cfg.get("num_ctx", DEFAULT_NUM_CTX)),
     )
     bcfg = cfg.get("brain", {}) or {}
     rcfg = cfg.get("retrieval", {}) or {}
@@ -658,12 +718,11 @@ async def lifespan(app: FastAPI):
         gesture_busy=lambda: (gestures.is_running()
             or gestures.status().get("state") in ("starting", "stopping")
             or gestures.status().get("tracker_cleanup_pending", False)
+            or _camera_resource_busy(gestures.status())
             or hand_controls.status().get("desktop", {}).get("cleanup_pending", False)),
-        dispatch=actions.dispatch,
         click_controller=EegClickController(),  # Construction injects no input; the service owns guarded clicks and cleanup.
         pointer_controller=HandMouseController(eeg_compatible=True, bend_click=gesture_settings["bend_click"]),  # Keep finger clicks and the user's bend setting; report ownership to coordinate EEG.
     )
-    multimodal.set_control_mode("eeg_click")  # Open the simple rest/select practice workflow with all output disarmed.
 
     _state.update(
         {
@@ -2328,6 +2387,18 @@ def _multimodal_local_request(request):
             in ("127.0.0.1", "localhost"))
 
 
+@app.get("/camera/privacy")
+async def camera_privacy(request: Request):
+    """Lightweight capture status for the always-visible HUD indicator."""
+    headers = {"Cache-Control": "no-store"}  # Never let a cached OFF hide a new capture.
+    trusted = ("origin" not in request.headers and request.headers.get("x-intuition-camera") == "1"
+               and request.headers.get("host", "").split(":", 1)[0] in ("127.0.0.1", "localhost"))
+    if not trusted:
+        return JSONResponse({"error": "Camera status is only available through the local HUD."},
+                            status_code=403, headers=headers)
+    return JSONResponse({"camera_privacy": _camera_privacy_info()}, headers=headers)
+
+
 @app.get("/multimodal/status")
 @app.get("/multimodal/preview")
 async def multimodal_status(request: Request):
@@ -2340,73 +2411,110 @@ async def multimodal_status(request: Request):
     # never enter the action dispatcher, WebSocket broadcasts, or journal.
     info = (preview.snapshot() if preview and request.url.path.endswith("/preview")
             else _multimodal_info())
-    info = _saved_eeg_metadata(info)
+    info = _saved_eeg_metadata({**info, "camera_privacy": _camera_privacy_info()})
     return JSONResponse(info, headers=headers)
 
 
 def _saved_eeg_metadata(info):
-    """Expose only a saved basename, never feature vectors or filesystem paths."""
-    method = (info.get("eeg_control") or {}).get("method", "eyes_closed")  # Older service snapshots retain the established model profile.
-    saved = _state.get("eeg_saved_blink_model_file" if method == "double_blink" else "eeg_saved_model_file")  # A save acknowledgment belongs only to its own active method.
+    """Return a saved basename without exposing waveforms, weights, or paths."""
+    saved = _state.get("eeg_saved_fast_cnn_model_file")  # The only supported model family.
     if saved and isinstance(info.get("eeg_control"), dict):
         info = {**info, "eeg_control": {**info["eeg_control"], "saved_model_file": saved}}
-    calibration = _state.get("eeg_saved_calibration_file")
-    if calibration and method == "double_blink" and isinstance(info.get("eeg_control"), dict):
-        info = {**info, "eeg_control": {**info["eeg_control"], "saved_calibration_file": calibration}}  # Progress acknowledgment never appears as a trained model or another method's backup.
-    return info
+    return info  # Saving never changes the service's confirmed arm state.
 
 
 def _load_saved_eeg_model(preview):
-    """The client selects no filename; only the fixed local archive directory is read."""
-    if (preview.status().get("eeg_control") or {}).get("method") == "double_blink":
-        decoder, path = load_latest_blink_decoder(_EEG_BLINK_MODEL_DIRECTORY)  # The archive loader verifies the inert BlinkDecoder state.
-        outcome = preview.eeg_use_saved_blink_model(decoder, source=path.name)  # Blink loading has no experimental-validation bypass and never arms input.
-        if not outcome.get("error"):
-            _state.pop("eeg_saved_blink_model_file", None)  # The successfully loaded source supersedes an older blink save acknowledgment.
-        return outcome
-    decoder, path = load_latest_decoder(_EEG_MODEL_DIRECTORY)
-    # Core binds prediction to the live compatible acquisition while retaining historical validation.
-    outcome = preview.eeg_use_saved_model(decoder, use_unvalidated=True, source=path.name)
+    """Load from the fixed local fast-model folder, preserving held-out results."""
+    decoder, path = load_latest_fast_cnn_decoder(_EEG_FAST_CNN_MODEL_DIRECTORY)
+    outcome = preview.eeg_use_saved_cnn_model(decoder, source=path.name)  # Bind explicitly, without arming.
     if not outcome.get("error"):
-        _state.pop("eeg_saved_model_file", None)  # Prefer the loaded source over a previous save acknowledgment.
+        _state.pop("eeg_saved_fast_cnn_model_file", None)  # The loaded source supersedes a prior save notice.
     return outcome
 
 
 def _save_eeg_model(preview):
-    """Export under the decoder lock, then write the inert archive atomically."""
-    if (preview.status().get("eeg_control") or {}).get("method") == "double_blink":
-        state = preview.eeg_export_blink_model()  # Core captures only the blink model while holding its decoder lock.
-        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        path = save_blink_archive(state, _EEG_BLINK_MODEL_DIRECTORY / f"double-blink-{stamp}.json")
-        _state["eeg_saved_blink_model_file"] = path.name  # Report only the local basename, scoped to this model type.
-        return _saved_eeg_metadata(preview.status())
-    archive = preview.eeg_export_model()
+    """Snapshot the frozen model under its lock, then save bounded inert JSON."""
+    state = preview.eeg_export_cnn_model()  # Copy weights and evidence without modifying calibration.
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    path = save_archive(archive, _EEG_MODEL_DIRECTORY / f"model-{stamp}.json")
-    _state["eeg_saved_model_file"] = path.name
+    path = save_fast_cnn_archive(state, _EEG_FAST_CNN_MODEL_DIRECTORY / f"fast-cnn-blink-{stamp}.json")
+    _state["eeg_saved_fast_cnn_model_file"] = path.name  # Never return the absolute personal-data path.
     return _saved_eeg_metadata(preview.status())
 
 
-def _save_eeg_progress(preview):
-    """Save only accepted blink calibration, without freezing or replacing its model."""
-    if (preview.status().get("eeg_control") or {}).get("method") != "double_blink":
-        raise ValueError("Choose double_blink before saving its calibration progress.")
-    state = preview.eeg_export_blink_calibration()  # Core rechecks the active profile while capturing its accepted features under lock.
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    path = save_calibration_archive(state, _EEG_BLINK_CALIBRATION_DIRECTORY / f"calibration-{stamp}.json")
-    _state["eeg_saved_calibration_file"] = path.name  # Expose only a basename, never the draft's features or filesystem location.
-    return _saved_eeg_metadata(preview.status())
+def _sync_cnn_camera_settings(preview):
+    """Reuse the existing tracker configuration before CNN camera ownership.
+
+    Call off the event loop while gesture_lock excludes other camera starts and
+    settings changes. Neither recognizer nor mouse actuator is constructed here.
+    """
+    gestures = _state.get("gestures")
+    camera = getattr(preview, "camera", None)
+    pointer = getattr(preview, "pointer_controller", None)
+    if gestures is None or camera is None or pointer is None:
+        return "CNN camera mouse is unavailable; restart the backend."
+    if _state.get("preview_camera", camera) is not camera:
+        return "Preview camera ownership is inconsistent; restart the backend."
+    ordinary = gestures.status()
+    controls = _state.get("hand_controls")
+    if (gestures.is_running() or ordinary.get("state") in ("starting", "stopping")
+            or ordinary.get("tracker_cleanup_pending") or ordinary.get("navigation_cleanup_pending")
+            or _camera_resource_busy(ordinary)
+            or controls is not None and controls.status().get("desktop", {}).get("cleanup_pending")):
+        return "Turn off normal Hand controls and finish releasing their input before enabling CNN camera mouse."
+    camera_status = camera.status()
+    if camera.is_running() or camera_status.get("state") in ("starting", "stopping"):
+        return "Stop the preview camera before changing its tracker settings."
+    if (camera_status.get("tracker_cleanup_pending") or camera_status.get("navigation_cleanup_pending")
+            or _camera_resource_busy(camera_status)):
+        return "Finish releasing the preview tracker before enabling CNN camera mouse."
+    # Standalone callbacks must never be copied: the service's one guarded
+    # pointer controller remains the sole hand-input actuator for this camera.
+    if getattr(camera, "bindings", None) != {} or any(getattr(camera, name, None) is not None
+            for name in ("on_gesture", "on_motion", "on_click", "on_progress", "on_status")):
+        return "The preview camera must have empty gesture bindings and no input callbacks."
+    backend = getattr(gestures, "tracker_backend", ordinary.get("tracker_backend"))
+    complexity = getattr(gestures, "model_complexity", ordinary.get("model_complexity"))
+    index = getattr(gestures, "camera_index", None)
+    bend = getattr(gestures, "bend_click", ordinary.get("bend_click"))
+    if (backend not in ("mediapipe", "rtmpose", "wilor") or type(complexity) is not int
+            or complexity not in (0, 1) or type(index) is not int or type(bend) is not bool):
+        return "Current Hand controls have an invalid tracker, camera, or click configuration."
+    result = camera.configure(tracker_backend=backend, model_complexity=complexity, input_mode="desktop")
+    if not isinstance(result, dict) or result.get("error"):
+        return str(result.get("error")) if isinstance(result, dict) else "Preview tracker configuration was not confirmed."
+    # GestureRecognizer exposes the camera index as a construction setting.
+    # All starts share gesture_lock, so it remains off after configure succeeds.
+    camera.camera_index = index
+    if getattr(pointer, "bend_click", None) != bend:
+        result = pointer.set_bend_click(bend)
+        if not isinstance(result, dict) or result.get("error"):
+            return str(result.get("error")) if isinstance(result, dict) else "Hand click preference was not confirmed."
+    return None
 
 
-def _load_eeg_progress(preview):
-    """Explicitly resume a validated draft through the service's current-session checks."""
-    if (preview.status().get("eeg_control") or {}).get("method") != "double_blink":
-        raise ValueError("Choose double_blink before loading its calibration progress.")
-    decoder, path = load_latest_calibration(_EEG_BLINK_CALIBRATION_DIRECTORY)  # Only calibration-*.json is eligible; maintenance wrappers remain untouched.
-    outcome = preview.eeg_use_saved_blink_calibration(decoder, source=path.name)  # Core preserves provenance and never implicitly arms or starts a cue.
-    if not outcome.get("error"):
-        _state.pop("eeg_saved_calibration_file", None)  # The loaded source now describes the active draft instead of an older save acknowledgment.
-    return outcome
+def _start_or_enable_cnn_camera(preview, operation, method, args, camera_request_epoch=None):
+    """Synchronize only a stopped CNN camera; preserve idempotent live starts."""
+    if camera_request_epoch is not None and not preview.camera_request_is_current(camera_request_epoch):
+        return {**preview.status(), "error": "Camera mouse request was superseded by a newer request or Stop."}
+    status = preview.status()
+    control = status.get("eeg_control") or {}
+    enabling = operation == "eeg_camera" and args == (True,)
+    configured_start = operation == "start" and control.get("camera_mouse_enabled") is True
+    already_live = (operation == "start" and status.get("state") in ("starting", "running")
+                    or enabling and control.get("camera_mouse_enabled") is True
+                    and status.get("state") in ("starting", "running"))
+    if (enabling or configured_start) and not already_live:
+        try:
+            error = _sync_cnn_camera_settings(preview)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            error = "CNN camera settings could not be synchronized: " + str(exc)
+        if error:
+            return {**preview.status(), "error": error}
+    if camera_request_epoch is not None:
+        if not preview.camera_request_is_current(camera_request_epoch):
+            return {**preview.status(), "error": "Camera mouse request was superseded by a newer request or Stop."}
+        return method(*args, request_epoch=camera_request_epoch)
+    return method(*args)
 
 
 @app.post("/multimodal/{operation}")
@@ -2415,39 +2523,26 @@ async def multimodal_operation(operation: str, request: Request):
     if not _multimodal_local_request(request):
         return JSONResponse({"error": "Combined preview controls require the local HUD."},
                             status_code=403, headers=headers)
-    operations = {"start": "start", "stop": "stop", "contact": "check_contact",
-                  "arm": "arm", "calibrate": "mark_trial", "reset_calibration": "reset_calibration",
-                  "control_mode": "set_control_mode", "eeg_trial": "eeg_trial",
+    # An explicit allowlist leaves no route back to retired detectors or practice actions.
+    operations = {"start": "start", "stop": "stop", "eeg_trial": "eeg_trial",
                   "eeg_train": "eeg_train", "eeg_reset": "eeg_reset",
-                  "eeg_arm": "eeg_arm", "eeg_guard": "eeg_guard",
-                  "eeg_method": "eeg_method",  # Choosing a calibration method remains separate from starting, loading, or arming.
-                  "eeg_load_saved": "eeg_use_saved_model", "eeg_save": "eeg_export_model",
-                  "eeg_save_progress": "eeg_export_blink_calibration", "eeg_load_progress": "eeg_use_saved_blink_calibration",  # Progress operations remain explicit and separate from frozen-model selection.
-                  "eeg_target": "eeg_target"}  # Expose only the service's explicit practice/mouse destination setter.
+                  "eeg_arm": "eeg_arm", "eeg_guard": "eeg_guard", "eeg_camera": "eeg_camera",
+                  "eeg_load_saved": "eeg_use_saved_cnn_model", "eeg_save": "eeg_export_cnn_model"}
     if operation not in operations:
         return JSONResponse({"error": "Unknown combined preview operation."}, status_code=404, headers=headers)
     try:
         payload = await request.json()
     except (ValueError, UnicodeError):
         payload = None
-    expected = {"arm": {"enabled"}, "calibrate": {"label"}, "control_mode": {"mode"},
-                "eeg_trial": {"label", "phase"}, "eeg_arm": {"enabled"},
-                "eeg_guard": {"token"}, "eeg_target": {"target"}, "eeg_method": {"method"}}.get(operation, set())  # Reject extra click arguments at the boundary.
+    expected = {"eeg_trial": {"label", "phase"}, "eeg_arm": {"enabled"},
+                "eeg_camera": {"enabled"}, "eeg_guard": {"token"}}.get(operation, set())
     if operation == "eeg_arm" and isinstance(payload, dict) and payload.get("enabled") is True:
-        expected = {"enabled", "guard_token"}
-    valid = isinstance(payload, dict) and set(payload) == expected
-    if valid and operation in ("arm", "eeg_arm"):
-        valid = type(payload["enabled"]) is bool
-    if valid and operation == "calibrate":
-        valid = payload["label"] in ("left", "right")
-    if valid and operation == "control_mode":
-        valid = payload["mode"] in ("webcam", "eeg", "eeg_click")  # Keep legacy modes while explicitly admitting the binary workflow.
-    if valid and operation == "eeg_target":  # Destination selection cannot carry coordinates, button names, or arbitrary actions.
-        valid = payload["target"] in ("practice", "mouse")  # The core setter also disarms before accepting a new destination.
-    if valid and operation == "eeg_method":
-        valid = isinstance(payload["method"], str) and payload["method"] in ("eyes_closed", "double_blink")  # Accept only the two declared calibration profiles.
+        expected = {"enabled", "guard_token"}  # Only explicit arm accepts an Escape lease.
+    valid = isinstance(payload, dict) and set(payload) == expected  # Reject extra paths, actions, or coordinates.
+    if valid and operation in ("eeg_arm", "eeg_camera"):
+        valid = type(payload["enabled"]) is bool  # Numbers cannot impersonate booleans.
     if valid and operation == "eeg_trial":
-        valid = payload["label"] in ("left", "right", "rest", "select") and payload["phase"] in ("train", "validate")  # The core enforces labels for the active decoder.
+        valid = payload["label"] in ("rest", "select") and payload["phase"] in ("train", "validate")
     token = (payload.get("token") if operation == "eeg_guard" else payload.get("guard_token")) if valid else None
     if valid and (operation == "eeg_guard" or operation == "eeg_arm" and payload["enabled"]):
         # The token binds explicit arming to the desktop main process's live
@@ -2461,29 +2556,31 @@ async def multimodal_operation(operation: str, request: Request):
     if preview is None:
         return JSONResponse({**_multimodal_info(), "error": "Restart the backend to enable the combined preview."},
                             status_code=503, headers=headers)
-    if operation in ("eeg_load_saved", "eeg_save", "eeg_load_progress", "eeg_save_progress"):
+    if operation in ("eeg_load_saved", "eeg_save"):
         # Empty payload validation above prevents arbitrary paths, model data, or an implicit arm.
         try:
-            action = {"eeg_load_saved": _load_saved_eeg_model, "eeg_save": _save_eeg_model,
-                      "eeg_load_progress": _load_eeg_progress, "eeg_save_progress": _save_eeg_progress}[operation]
+            action = {"eeg_load_saved": _load_saved_eeg_model, "eeg_save": _save_eeg_model}[operation]
             outcome = await asyncio.to_thread(action, preview)
         except (OSError, ValueError, TypeError) as exc:
             outcome = {**preview.status(), "error": f"Saved EEG model: {exc}"}
         return JSONResponse(_saved_eeg_metadata(outcome), status_code=409 if outcome.get("error") else 200, headers=headers)
     method = getattr(preview, operations[operation])
     args = ((payload["enabled"], payload.get("guard_token")) if operation == "eeg_arm" else
-            (payload["enabled"],) if operation == "arm" else
-            (payload["label"],) if operation == "calibrate" else
-            (payload["mode"],) if operation == "control_mode" else
-            (payload["method"],) if operation == "eeg_method" else  # Forward only the chosen profile; it carries no arm or click permission.
-            (payload["target"],) if operation == "eeg_target" else  # Forward only the validated destination, never an immediate click request.
+            (payload["enabled"],) if operation == "eeg_camera" else
             (payload["label"], payload["phase"]) if operation == "eeg_trial" else
             (payload["token"],) if operation == "eeg_guard" else ())
+    # Ticket every acquisition Start, including EEG-only starts, before waiting
+    # for the shared device lock. A later Stop must cancel all queued starts.
+    camera_request_epoch = None
+    if operation in ("eeg_camera", "start"):
+        camera_request_epoch = preview.camera_request_epoch()
     # Serialize acquisition starts against normal camera starts. Stop/disarm
-    # bypass that lock so they remain available during blocked SDK startup.
-    if operation in ("start", "contact"):
+    # and camera-disable bypass this lock during blocked SDK startup.
+    if operation == "start" or operation == "eeg_camera" and payload["enabled"]:
         async with _state["gesture_lock"]:
-            outcome = await asyncio.to_thread(method, *args)
+            outcome = await asyncio.to_thread(_start_or_enable_cnn_camera, preview, operation, method, args, camera_request_epoch)
+    elif operation == "eeg_camera":
+        outcome = await asyncio.to_thread(method, *args, request_epoch=camera_request_epoch)
     else:
         outcome = await asyncio.to_thread(method, *args)
     return JSONResponse(_saved_eeg_metadata(outcome), status_code=409 if outcome.get("error") else 200, headers=headers)

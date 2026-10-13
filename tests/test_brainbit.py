@@ -1,6 +1,8 @@
 """Hardware-free adapter, IPC and cancellation coverage."""
 
 import json
+import math
+import statistics
 import sys
 import threading
 import time
@@ -151,6 +153,25 @@ def test_busy_is_immediate_and_disconnect_cancels_stale_completion(driver):
     assert driver.status()["state"] == "disconnected"
 
 
+def test_sdk_returning_disconnected_is_a_connection_error_and_releases_worker(driver, monkeypatch):
+    driver.call("discover")
+    worker = FakeWorker.instances[-1]
+    monkeypatch.setattr(worker, "request", lambda *_args, **_kwargs: {
+        "result": snapshot("disconnected")})
+
+    result = driver.call("connect", device_id="temporary-choice")
+
+    assert result["state"] == "error"
+    assert "SDK could not complete" in result["error"]
+    assert result["text"] == result["error"]
+    assert not result["busy"]
+    assert result["device"] is None and result["devices"] == []
+    assert worker.closed
+    assert driver.call("discover")["state"] == "disconnected"
+    assert "error" not in driver.status()
+    assert driver.call("connect", device_id="temporary-choice")["state"] == "connected"
+
+
 def test_close_cancels_operation_and_never_restarts(driver):
     driver.call("discover")
     worker = FakeWorker.instances[-1]
@@ -284,3 +305,75 @@ def test_real_ipc_crash_and_oversized_frame_fail_promptly(code):
     finally:
         worker.close()
     assert worker._process.poll() is not None
+
+
+def _snapshot_cache(driver, monkeypatch):
+    """Populate only the adapter cache through its normal sanitized event path."""
+    monkeypatch.setattr(brainbit.time, "monotonic", lambda: 100.0)
+    channels = [{"num": i, "name": name, "metadata": {"tags": ["test"]}}
+                for i, name in enumerate(("O1", "O2", "T3", "T4"))]
+    driver._acq.update(state="running", mode="signal", session_id="snapshot-copy-test")
+    packets = [{"counter": 1000 + i, "marker": {"flags": [i], "nested": {"labels": ["signal"]}},
+                "samples": [(i - 625) * 1e-8, (-1) ** i * 3e-6,
+                            None if i % 111 == 0 else 2e-6, 7e-6 + i % 11 * 1e-7],
+                "host_received_monotonic": 100.0 - 4.996 + i / 250,
+                "estimated_monotonic": 100.0 - 5.006 + i / 250}
+               for i in range(1250)]
+    for start in range(0, len(packets), 100):
+        driver._acquisition_event(driver._epoch, {
+            "session_id": "snapshot-copy-test", "channels": channels, "nominal_hz": 250,
+            "units": "V", "nonfinite": 12, "channel_mismatches": 2, "queue_drops": 3,
+            "packets": packets[start:start + 100]})
+    driver._contact_precheck = {"values": [10000, 20000, 30000, 40000], "channels": channels,
+                                "host_received_monotonic": 90.0, "units": "ohm"}
+    return packets
+
+
+@pytest.mark.parametrize("full_rate", [False, True])
+def test_acquisition_packet_and_metadata_copies_are_detached(driver, monkeypatch, full_rate):
+    originals = _snapshot_cache(driver, monkeypatch)
+    read = driver.acquisition_signal_window if full_rate else driver.acquisition_snapshot
+    first, second = read(), read()
+    assert first == second
+    first["samples"][0]["samples"][0] = 999
+    first["samples"][0]["marker"]["nested"]["labels"].append("changed")
+    first["samples"][0]["marker"]["flags"].clear()
+    first["samples"][-1]["counter"] = 0
+    first["channels"][0]["metadata"]["tags"].clear()
+    first["stats"]["gaps"] = 500
+    first["stats"]["channels"][0]["rms_v"] = 500
+    first["contact_precheck"]["values"][0] = 0
+    first["contact_precheck"]["channels"][0]["metadata"]["tags"].append("changed")
+    first["samples"].clear()
+    assert read() == second
+    assert second["samples"][0]["samples"] == originals[0]["samples"]
+    assert second["samples"][0]["marker"] == originals[0]["marker"]
+    assert len(driver._samples) == 1250 and driver._last_counter == 2249
+
+
+def test_snapshot_copy_preserves_full_window_statistics_and_newest_display(driver, monkeypatch):
+    packets = _snapshot_cache(driver, monkeypatch)
+    full, display = driver.acquisition_signal_window(), driver.acquisition_snapshot()
+    assert full["stats"] == display["stats"]
+    assert full["samples"] == packets
+    assert len(display["samples"]) == 250
+    assert [p["counter"] for p in display["samples"]] == list(range(1000, 2245, 5)) + [2249]
+    assert display["samples"][-1] == full["samples"][-1]
+    assert full["stats"]["age_seconds"] == 0
+    assert full["stats"]["received_rate_hz"] == pytest.approx(250)
+    assert {key: full["stats"][key] for key in ("gaps", "duplicates", "nonfinite", "channel_mismatches", "queue_drops")} == {
+        "gaps": 0, "duplicates": 0, "nonfinite": 12, "channel_mismatches": 2, "queue_drops": 3}
+    for index, channel in enumerate(full["stats"]["channels"]):
+        values = [p["samples"][index] for p in packets if p["samples"][index] is not None]
+        assert channel["rms_v"] == pytest.approx(statistics.pstdev(values), abs=1e-15)
+        assert channel["peak_to_peak_v"] == pytest.approx(max(values) - min(values), abs=1e-15)
+        assert math.isfinite(channel["rms_v"])
+    assert full["contact_precheck"]["age_seconds"] == 10
+    # Aging changes the published window, never the cached history or issue counters.
+    monkeypatch.setattr(brainbit.time, "monotonic", lambda: 100.5)
+    aged = driver.acquisition_signal_window()
+    expected = [p for p in packets if 100.5 - p["host_received_monotonic"] <= 5]
+    assert aged["samples"] == expected and len(aged["samples"]) < 1250
+    assert aged["stats"]["age_seconds"] == .5
+    assert aged["contact_precheck"]["age_seconds"] == 10.5
+    assert len(driver._samples) == 1250 and driver._acq["stats"]["nonfinite"] == 12

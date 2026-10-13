@@ -227,11 +227,15 @@ class HandMouseController:
             result["pointer_only"] = True
         # Combined control reports enough manual activity for the service to cancel competing EEG input.
         if self.eeg_compatible:
-            # Include approach, button holds, completed clicks, and release frames as finger activity.
-            result["finger_active"] = bool(self._pinch_since is not None or self._pinch_approaching
-                                           or self._bend_since is not None or self._owned_left
-                                           or self._finger_pose_active or self._finger_release_frame
-                                           or state == "mouse_clicked")
+            # A near-pinch has not started a click gesture; its stable proximal
+            # anchor can still aim while the fingertips move toward contact.
+            # CNN clicks do not require a pointing pose, so expose actual action
+            # ownership separately from the legacy target-engagement signal.
+            result["finger_action_active"] = bool(self._pinch_since is not None
+                                                  or self._bend_since is not None or self._owned_left
+                                                  or self._finger_pose_active or self._finger_release_frame
+                                                  or state == "mouse_clicked")
+            result["finger_active"] = result["finger_action_active"] or self._pinch_approaching
             # Button ownership stays visible even if a failed release leaves the controller errored.
             result["button_down"] = self._owned_left
             # EEG may complete only on a tracked, engaged target without a competing finger gesture.
@@ -668,21 +672,15 @@ class HandMouseController:
             # closes must not shift the click target.
             return self._feedback("mouse_pinch", "Release to click; keep pinching to drag")
 
-        if self._armed and pinch_shape and pinch_distance <= 0.55:
-            # Gradually closing the fingers must not disarm in the hysteresis
-            # band. Freeze the target while approaching, but start no click/drag
-            # timer until the fingers actually cross the pinch threshold.
-            self._bend_since = None
-            self._pinch_approaching = True
-            hint = (f"{rearm_action.capitalize()} before another click" if self._bend_latched
-                    else "Bring thumb and index together to click")
-            return self._feedback("mouse_pointer", hint)
-
-        if pinch_distance <= 0.55:
-            return self._freeze(now, "Separate thumb and index before clicking")
+        self._pinch_approaching = bool(self._armed and pinch_shape and pinch_distance <= 0.55)
         if self._pinch_approaching:
-            self._pinch_approaching = False
-            self._reanchor(landmarks)
+            # Continue aiming from the proximal anchor until actual contact.
+            # Freezing/reanchoring on either side of this band discarded hand
+            # travel whenever landmark noise crossed the boundary repeatedly.
+            # Distal fingertip closure does not change the proximal anchor.
+            self._bend_since = None
+        elif pinch_distance <= 0.55:
+            return self._freeze(now, "Separate thumb and index before clicking")
         # Ordinary Hand Mouse keeps the same activation behavior after its pinch checks.
         pending = self._engage_pointer(wrist, scale, straight, others_curled, now)
         if pending is not None:
@@ -697,7 +695,7 @@ class HandMouseController:
             self._resume_at_physical_cursor = False
             # Returning before click and movement paths guarantees that reacquisition itself emits no input.
             return self._feedback("mouse_pointer", "Hand found; move your hand to aim or pinch to click", 1.0)
-        if self.bend_click and hook and not self._bend_latched:
+        if self.bend_click and hook and not self._bend_latched and not self._pinch_approaching:
             if self._bend_since is None:
                 self._bend_since = now
             duration = now - self._bend_since
@@ -733,5 +731,6 @@ class HandMouseController:
             return self._feedback("mouse_pointer", "Move your hand; pinch to click or hold to drag", 1.0)
         self._move(self._pointer_target(landmarks), dt)
         hint = (f"Move your hand; {rearm_action} before another click" if self._bend_latched
+                else "Move your hand; bring thumb and index together to click" if self._pinch_approaching
                 else "Move your hand; pinch to click or hold to drag")
         return self._feedback("mouse_pointer", hint, 1.0)

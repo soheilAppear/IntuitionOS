@@ -63,6 +63,7 @@ def test_json_generation_preserves_messages_and_requests_json_without_thinking(c
     assert payload["format"] == "json" and payload["think"] is False
     assert payload["messages"] == message and payload["model"] == "test-model"
     assert payload["options"]["num_predict"] == 600
+    assert payload["options"]["num_ctx"] == 8192
     assert payload["stream"] is stream
     assert calls[0][1]["timeout"] == (5.0, 120.0)
     if stream:
@@ -75,6 +76,15 @@ def test_ordinary_chat_does_not_inherit_json_or_thinking_options(client, http, s
     assert client.chat([], on_token=(lambda piece: None) if stream else None) == "some prose"
     assert "format" not in calls[0][1]["json"]
     assert "think" not in calls[0][1]["json"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("method", ["chat", "chat_json"])
+def test_custom_context_limit_reaches_every_request(http, stream, method):
+    client = LLMClient("ollama", "test-model", 0.2, 600, num_ctx=4096)
+    calls = http(Response(body=finished(), frames=[finished()]))
+    getattr(client, method)([], on_token=(lambda piece: None) if stream else None)
+    assert calls[0][1]["json"]["options"]["num_ctx"] == 4096
 
 
 @pytest.mark.parametrize("stream", [False, True])
